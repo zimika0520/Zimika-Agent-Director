@@ -2971,6 +2971,98 @@ class ProjectToolTests(unittest.TestCase):
         ):
             self.assertIn(expected, page, expected)
 
+    def test_render_storyboard_resolves_scoped_dialogue_cue_sheet_dependency(self) -> None:
+        import render_storyboard
+
+        project = self.root / "scoped-storyboard"
+        plan_path = project / "10_AI视频执行包/E001_分镜计划V1.json"
+        cue_path = project / "08_连续性与质检/台词声音表_B01_V1.json"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        cue_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_id": "P-SCOPED",
+                    "episode_id": "E001",
+                    "target_duration_seconds": 3,
+                    "total_duration_seconds": 3,
+                    "hard_blocks": ["不新增剧情"],
+                    "asset_budget": {},
+                    "units": [
+                        {
+                            "unit_id": "SP-E001-U001",
+                            "sequence": 1,
+                            "scene_id": "1-1",
+                            "narrative_task": "管家索要钥匙",
+                            "duration_seconds": 3,
+                            "action_start": "管家伸手",
+                            "action_end": "阿宁握紧钥匙",
+                            "characters_on_screen": [],
+                            "dialogue": [{"cue_id": "Q001", "lip_sync": True}],
+                            "sound": [],
+                            "negative_constraints": ["无字幕"],
+                            "generation_strategy": "text_to_video",
+                            "state_chain": {"chain_id": "CHAIN-1", "enter": {"characters": {}}, "exit": {"characters": {}}},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        cue_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_id": "P-SCOPED",
+                    "records": [
+                        {
+                            "cue_id": "Q001",
+                            "speaker_name": "管家",
+                            "text": "把钥匙交出来。",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (project / "project_state.json").write_text(
+            json.dumps(
+                {
+                    "name": "作用域台词表测试",
+                    "artifacts": {
+                        "ai_shot_plan:E001": [
+                            {
+                                "version": 1,
+                                "status": "confirmed",
+                                "path": "10_AI视频执行包/E001_分镜计划V1.json",
+                                "depends_on": [
+                                    {"artifact_key": "dialogue_cue_sheet:B01", "version": 1}
+                                ],
+                            }
+                        ],
+                        "dialogue_cue_sheet:B01": [
+                            {
+                                "version": 1,
+                                "status": "confirmed",
+                                "path": "08_连续性与质检/台词声音表_B01_V1.json",
+                                "depends_on": [],
+                            }
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        output = render_storyboard.render(project, "E001")
+        page = output.read_text(encoding="utf-8")
+        self.assertIn("<b>管家</b>:把钥匙交出来。", page)
+        self.assertNotIn("<b>?</b>:Q001", page)
+
     def test_ai_shot_plan_gate_and_execution_plan_full_pass(self) -> None:
         self.create_ready_project()
         self.register_ai_layer_prerequisites()

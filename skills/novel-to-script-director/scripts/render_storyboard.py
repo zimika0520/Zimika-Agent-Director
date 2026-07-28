@@ -62,6 +62,32 @@ def read_artifact(project_path: Path, record: dict[str, Any] | None) -> Any:
     return text
 
 
+def confirmed_dependency(
+    state: dict[str, Any],
+    record: dict[str, Any] | None,
+    artifact_prefix: str,
+) -> dict[str, Any] | None:
+    """优先返回目标制品精确绑定的已确认依赖,再回退到无作用域 key。"""
+    if isinstance(record, dict):
+        for dependency in record.get("depends_on", []):
+            if not isinstance(dependency, dict):
+                continue
+            key = dependency.get("artifact_key")
+            version = dependency.get("version")
+            if not isinstance(key, str) or not (
+                key == artifact_prefix or key.startswith(artifact_prefix + ":")
+            ):
+                continue
+            for candidate in state.get("artifacts", {}).get(key, []):
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("version") == version
+                    and candidate.get("status") == "confirmed"
+                ):
+                    return candidate
+    return latest_confirmed(state, artifact_prefix)
+
+
 def collect_anchors(state: dict[str, Any], project_path: Path, prefix: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for key in sorted(state.get("artifacts", {})):
@@ -114,7 +140,10 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
     if not isinstance(plan, dict):
         raise SystemExit(f"没有已确认的 {plan_key},无法渲染;先完成分镜计划并过边界门禁")
 
-    cue_sheet = read_artifact(project_path, latest_confirmed(state, "dialogue_cue_sheet"))
+    cue_sheet = read_artifact(
+        project_path,
+        confirmed_dependency(state, plan_record, "dialogue_cue_sheet"),
+    )
     cues: dict[str, dict[str, Any]] = {}
     if isinstance(cue_sheet, dict):
         for cue in cue_sheet.get("records", []):
