@@ -207,12 +207,28 @@
   "schema_version": 1,
   "project_id": "项目UUID",
   "expected_episodes": 60,
-  "target_runtime": "每集目标时长或内容量",
+  "target_duration_seconds": 90,
+  "duration_policy": {
+    "tolerance_ratio": 0.2,
+    "dialogue_chars_per_second": [3.5, 4.5],
+    "inflation_redline_ratio": 0.3
+  },
+  "target_runtime": "每集目标时长或内容量（人工备注，不参与校验）",
   "handoff_target": "可直接进入导演拆镜"
 }
 ```
 
 `expected_episodes` 必须是大于 0 的整数。`validate-handoff` 和 `build-handoff` 的同名参数只能与已确认项目规格核对，不得用较小参数绕过全剧集数。
+
+`target_duration_seconds` 是可选的单集目标时长覆盖值，必须是大于 0 的整数秒。未声明时使用默认 60 秒；声明后以项目值为权威。AI 分镜计划必须写出当前生效值，剧本校验也据此给出对白秒数预警。默认建议约 15 个分镜单元，该数量仅用于规划提示，不作为机械阻断门禁。
+
+`duration_policy` 可选，用于覆盖推算参数，缺省值见下；非法值会被拒绝确认。
+
+- `tolerance_ratio`：分镜计划单元合计时长的允许偏差，0 到 1 之间，缺省 `0.1`（±10%）。
+- `dialogue_chars_per_second`：中文配音字/秒推算区间 `[下限, 上限]`，必须递增且为正数，缺省 `[3.5, 4.5]`。该区间是样本推算值，不是行业标准，仅作预警。
+- `inflation_redline_ratio`：防扩写红线，0 到 1 之间，缺省 `0.3`。
+
+`target_runtime` 是人工备注自由文本，不参与任何机器校验，保留仅为兼容旧项目。
 
 ## 全剧分集地图
 
@@ -489,3 +505,13 @@
 质检阶段核对健康度：临近 `expected_payoff` 仍为 `open` 的伏笔、已 `resolved` 又被重复揭示的伏笔，均列入质检报告；全剧交付前不允许存在计划内未回收且无处理说明的伏笔。
 
 **全局滚动摘要** `rolling_summary`：按批次登记新版本的 Markdown/文本制品，建议 ≤2000 字；是有损压缩的工作记忆，事实以事件索引与连续性台账为准，冲突时以后者纠正摘要。
+
+
+## 通用语义追踪与制作可执行性（schema v2）
+
+- `source_event_index` 的 schema v2 必须为事件和 beat 提供唯一顺序，并通过 `episode_scopes` 声明每集允许使用的首尾 beat。
+- AI 分镜单元必须使用 `source_beat_refs`，顺序不得倒退或越过当前集来源边界；引用 beat 的 `protected_fact_ids` 必须进入 `preserved_fact_ids`。
+- 新增事实必须写入 `new_fact_claims` 并绑定有效改编决策，不能用布尔值自报“忠实”。
+- 台词声音表用 `delivery_mode` 区分 `on_screen`、`off_screen`、`voice_over`、`phone_audio`、`screen_video`；非现场人物不得进入 `characters_on_screen`。
+- 每个分镜单元必须提供 `action_flow`、`time_span_mode` 和完整 `shot_language`。动作前置状态、最短时长、对白字数和屏幕文字后期方案由工具实际校验。
+- 边界报告的最终结论由目标制品的机器校验结果计算；报告自填 `passed` 不能覆盖阻断错误。

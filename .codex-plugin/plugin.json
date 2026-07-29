@@ -1,6 +1,6 @@
 {
   "name": "ai-director",
-  "version": "0.8.0+claude.20260728",
+  "version": "0.8.3",
   "description": "An AI screenwriter/director workflow for direct source import, optional official-page review, lightweight full-series backbones, batch-scoped source-detail gates, independently validated batch packages, and cross-batch continuity-checked series assembly; optional model-agnostic and Seedance text execution plans.",
   "author": {
     "name": "Shinchan-crayon"

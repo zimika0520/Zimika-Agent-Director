@@ -173,6 +173,18 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
         if scene not in scene_order:
             scene_order.append(scene)
     scene_slot = {scene: index % len(SCENE_SLOTS_LIGHT) for index, scene in enumerate(scene_order)}
+    used_character_ids = {
+        char.get("character_id")
+        for unit in units
+        for char in unit.get("characters_on_screen", [])
+        if isinstance(char, dict) and isinstance(char.get("character_id"), str)
+    }
+    used_scene_anchor_keys = {
+        unit.get("scene_anchor_ref", {}).get("artifact_key")
+        for unit in units
+        if isinstance(unit.get("scene_anchor_ref"), dict)
+        and isinstance(unit["scene_anchor_ref"].get("artifact_key"), str)
+    }
 
     buckets = {"le2": 0, "mid": 0, "gt4": 0}
     for unit in units:
@@ -266,6 +278,14 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
         )
         sounds = "、".join(str(item) for item in unit.get("sound", []) or []) or "无"
         chain = unit.get("state_chain") or {}
+        screen_video = "、".join(str(item) for item in unit.get("screen_video_characters", []) or []) or "无"
+        screen_text = unit.get("screen_text")
+        screen_text_html = ""
+        if isinstance(screen_text, dict) and screen_text.get("required_text"):
+            screen_text_html = (
+                f'<div class="row">屏幕文字:{esc(screen_text.get("required_text"))} '
+                f'<span class="chip">{esc(screen_text.get("render_mode"))}</span></div>'
+            )
         cards.append(f"""
 <article class="card" style="border-left-color:var(--scene-{slot})">
   <header>
@@ -277,8 +297,10 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
   </header>
   <div class="row task">{esc(unit.get('narrative_task'))}</div>
   <div class="row">动作:{esc(unit.get('action_start'))} <span class="arrow">→</span> {esc(unit.get('action_end'))}</div>
-  <div class="row">人物:{characters}</div>
+  <div class="row">现场人物:{characters}</div>
+  <div class="row">屏幕视频人物:{esc(screen_video)}</div>
   <div class="row">台词:{dialogue_html}</div>
+  {screen_text_html}
   <div class="row">声音:{esc(sounds)} <span class="muted">| 链 {esc(chain.get('chain_id'))}</span></div>
   <div class="row neg">禁止:<ul>{negatives}</ul></div>
   {rationale}
@@ -405,7 +427,7 @@ footer {{ margin-top: 30px; font-size: 11px; color: var(--muted); }}
 <h1>{esc(project_name)} · {esc(episode)} 故事板</h1>
 <div class="meta">ai_shot_plan v{esc(version)} · {len(units)} 个视觉单元 · {deviation_html}</div>
 <div class="stats"><span>切点分布:≤2秒 {buckets['le2']} 个 · 2–4秒 {buckets['mid']} 个 · <b>&gt;4秒 {buckets['gt4']} 个</b></span>
-<span>资产预算:主场景≤{esc(budget.get('max_scene_anchors', '—'))} · 出场角色≤{esc(budget.get('max_speaking_characters', '—'))}(实际:{len(scene_order)} 场景锚点 in use)</span></div>
+<span>资产预算:场景锚点 {len(used_scene_anchor_keys)}/≤{esc(budget.get('max_scene_anchors', '—'))} · 出镜角色 {len(used_character_ids)}/≤{esc(budget.get('max_speaking_characters', '—'))} · 场景ID {len(scene_order)}</span></div>
 
 <h2>节奏时间轴</h2>
 <div class="tl-wrap"><div class="tl">{''.join(timeline_blocks)}</div>{''.join(ticks)}</div>

@@ -2,7 +2,7 @@
 
 把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.0+claude.20260728`
+当前版本：`0.8.3`
 
 ## 它能做什么
 
@@ -92,6 +92,30 @@ python3 skills/novel-to-script-director/scripts/project_tool.py init \
   --expected-episodes 60
 ```
 
+`--expected-episodes` 记入 `expected_episodes_hint`，只用于在 `project_spec` 确认前先定义批次；交付校验仍以已确认 `project_spec` 的 `expected_episodes` 为权威。
+
+### 声明单集目标时长（可选）
+
+默认生成策略为单集约 60 秒、允许上下浮动 10%、建议约 15 个分镜单元。若项目需要其他时长，可在 `project_spec` JSON 中显式写入 `target_duration_seconds` 覆盖默认值：
+
+```json
+{
+  "schema_version": 1,
+  "project_id": "项目UUID",
+  "expected_episodes": 60,
+  "target_duration_seconds": 90
+}
+```
+
+AI 分镜计划必须写出当前生效的目标时长（未显式声明时为默认 60 秒，显式声明时为项目值）；缺失或不符都会阻断确认。剧本校验也会按“中文配音约3.5—4.5字/秒”给出净对白秒数预警。可选 `duration_policy` 覆盖容差与推算参数，默认偏差容差为 ±10%，详见 `references/production-data-schemas.md`。
+
+单独校验某集剧本的时长预算：
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py validate-script \
+  /path/to/E001.md --target-duration-seconds 90
+```
+
 ### 定义批次
 
 ```bash
@@ -145,7 +169,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8 完整测试：`82/82` 通过。
+v0.8.3 完整测试：`105/105` 通过。
 
 ## 更新记录
 

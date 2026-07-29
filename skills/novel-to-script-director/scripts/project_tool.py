@@ -40,6 +40,18 @@ RIGHTS_UNCLEAR_NOTICE = (
 SOURCE_KINDS = ("self_owned", "storyline", "published_novel")
 DEFAULT_SOURCE_KIND = "self_owned"
 
+# 默认生成策略：用户未明确指定时，按约 60 秒、±10%、约 15 个分镜单元规划。
+# project_spec 中的显式值优先于默认值。
+DEFAULT_TARGET_DURATION_SECONDS = 60
+DEFAULT_DURATION_TOLERANCE_RATIO = 0.1
+DEFAULT_RECOMMENDED_SHOT_UNITS = 15
+# 中文配音约 3.5—4.5 字/秒，是样本推算值而非行业标准，只用于预警不作实测结论。
+DEFAULT_DIALOGUE_CHARS_PER_SECOND = (3.5, 4.5)
+# 单场时长比例带：单集目标时长 ÷ 场数 后允许的上下浮动，取自文档示例
+#（90 秒 3 场 → 每场约 20—45 秒，即均值 30 秒的 2/3 到 3/2）。
+SCENE_DURATION_BAND = (2 / 3, 3 / 2)
+DEFAULT_INFLATION_REDLINE_RATIO = 0.3
+
 # 入料体检（init/add-source 时的来源体检卡）。体检只提示，不阻塞。
 INTAKE_CHECK_FILENAME = "入料体检.json"
 INTAKE_ANALYZABLE_SUFFIXES = {".txt", ".md", ".markdown"}
@@ -1337,6 +1349,61 @@ def validate_ratio_option(option_name: str, value: float) -> None:
         raise ToolError(f"{option_name} 必须是 0 到 1 之间的有限数字")
 
 
+def duration_policy_issues(payload: dict[str, Any]) -> list[str]:
+    """校验项目规格的时长契约字段，返回人类可读的问题描述列表。
+
+    全部字段可选：项目未声明目标时长时返回空列表，下游使用 60 秒默认值。
+    显式项目规格始终优先于默认生成策略。
+    """
+    problems: list[str] = []
+    target = payload.get("target_duration_seconds")
+    if target is not None and (type(target) is not int or target <= 0):
+        problems.append("target_duration_seconds 必须是大于0的整数秒（单集目标时长）")
+
+    policy = payload.get("duration_policy")
+    if policy is None:
+        return problems
+    if not isinstance(policy, dict):
+        problems.append("duration_policy 必须是对象")
+        return problems
+
+    for field in ("tolerance_ratio", "inflation_redline_ratio"):
+        value = policy.get(field)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            problems.append(f"duration_policy.{field} 必须是 0 到 1 之间的数字")
+            continue
+        try:
+            validate_ratio_option(f"duration_policy.{field}", value)
+        except ToolError as exc:
+            problems.append(str(exc))
+
+    rate = policy.get("dialogue_chars_per_second")
+    if rate is not None:
+        if (
+            not isinstance(rate, list)
+            or len(rate) != 2
+            or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in rate)
+        ):
+            problems.append("duration_policy.dialogue_chars_per_second 必须是 [下限, 上限] 两个数字")
+        elif not all(math.isfinite(item) and item > 0 for item in rate) or rate[0] > rate[1]:
+            problems.append("duration_policy.dialogue_chars_per_second 必须是递增的正数区间")
+    return problems
+
+
+def validate_project_spec_duration(
+    project_path: Path, record: dict[str, Any]
+) -> None:
+    """approve 前校验项目规格的时长契约；字段非法时拒绝确认。"""
+    payload = load_project_spec_payload(project_path, record)
+    if payload is None:
+        return
+    problems = duration_policy_issues(payload)
+    if problems:
+        raise ToolError("项目规格时长契约非法：" + "；".join(problems))
+
+
 def default_source_policy() -> dict[str, Any]:
     return {
         "source_kind": DEFAULT_SOURCE_KIND,
@@ -1792,6 +1859,7 @@ def command_init(args: argparse.Namespace) -> int:
         },
         "sources": source_records,
         "source_policy": source_policy,
+        "expected_episodes_hint": args.expected_episodes,
         "batches": {},
         "artifacts": {},
         "approvals": [],
@@ -1812,7 +1880,13 @@ def command_init(args: argparse.Namespace) -> int:
         "source_count": len(source_records),
         "sources": source_records,
         "source_policy": source_policy,
+        "expected_episodes_hint": args.expected_episodes,
     }
+    if args.expected_episodes is not None:
+        result["next_step"] = (
+            "目标集数只作建档提示；权威值仍以已确认 project_spec 的 expected_episodes 为准，"
+            "确认前后不一致时以 project_spec 为准"
+        )
     if args.garble_threshold is not None:
         result["deprecated_options"] = ["--garble-threshold"]
     print_json(result)
@@ -1904,15 +1978,28 @@ def command_define_batch(args: argparse.Namespace) -> int:
     if len(episode_ids) != len(set(episode_ids)):
         raise ToolError("批次集号不能重复")
     expected_episodes = project_expected_episodes(project_path, state)
+    episode_scope_source = "project_spec"
     if expected_episodes is None:
-        raise ToolError("无法从项目规格读取 expected_episodes，不能定义批次")
+        # project_spec 仍是交付门禁的唯一权威；这里只让规划期的批次划分
+        # 回退到 init 登记的目标集数提示，避免建档后无法定义批次。
+        expected_episodes = state_expected_episodes_hint(state)
+        episode_scope_source = "init_hint"
+    if expected_episodes is None:
+        raise ToolError(
+            "无法读取目标集数：请先登记并确认含 expected_episodes 的 project_spec，"
+            "或在 init 时提供 --expected-episodes"
+        )
     out_of_range = [
         value for value in episode_ids if int(value[1:]) > expected_episodes
     ]
     if out_of_range:
+        scope_label = (
+            f"项目规格 expected_episodes（{expected_episodes}）"
+            if episode_scope_source == "project_spec"
+            else f" init 登记的目标集数提示（{expected_episodes}）"
+        )
         raise ToolError(
-            "批次包含超出项目规格 expected_episodes 的集号："
-            + "、".join(out_of_range)
+            f"批次包含超出{scope_label}的集号：" + "、".join(out_of_range)
         )
     batches = state.setdefault("batches", {})
     if not isinstance(batches, dict):
@@ -1951,15 +2038,25 @@ def command_define_batch(args: argparse.Namespace) -> int:
         },
     )
     save_state(project_path, state)
-    print_json(
-        {
-            "ok": True,
-            "batch_id": batch_id,
-            "episode_ids": episode_ids,
-            "defined_at": defined_at,
-            "note": args.note or "",
-        }
-    )
+    result = {
+        "ok": True,
+        "batch_id": batch_id,
+        "episode_ids": episode_ids,
+        "defined_at": defined_at,
+        "note": args.note or "",
+        "episode_scope_source": episode_scope_source,
+    }
+    if episode_scope_source == "init_hint":
+        result["warnings"] = [
+            {
+                "code": "episode_scope_from_init_hint",
+                "message": (
+                    f"尚无已确认 project_spec，本次按 init 登记的目标集数提示（{expected_episodes}）"
+                    "校验批次范围；交付门禁仍要求已确认 project_spec 的 expected_episodes"
+                ),
+            }
+        ]
+    print_json(result)
     return 0
 
 
@@ -2191,7 +2288,13 @@ def command_approve(args: argparse.Namespace) -> int:
                 f"确认前所有依赖必须是最新版且已获有效确认：{dep_key}@{dep_version}"
             )
     if selected_type == "episode_script":
-        script_result = validate_script_file(selected_path)
+        script_result = validate_script_file(
+            selected_path,
+            target_duration_seconds=project_target_duration_seconds(project_path, state),
+            chars_per_second=dialogue_chars_per_second(
+                project_duration_policy(project_path, state)
+            ),
+        )
         if not script_result["valid"]:
             codes = "、".join(item["code"] for item in script_result["errors"])
             raise ToolError(f"分集剧本结构校验未通过，不能确认：{codes}")
@@ -2222,6 +2325,8 @@ def command_approve(args: argparse.Namespace) -> int:
         rights_notice = validate_project_spec_rights(project_path, selected)
         if rights_notice is not None and rights_notice_already_shown(state):
             rights_notice = None
+        # 时长契约字段非法时拒绝确认；字段缺省表示项目不做时长门禁。
+        validate_project_spec_duration(project_path, selected)
     if selected_type == "series_map":
         series_map_payload = load_json_artifact_payload(
             project_path, args.artifact_key, selected, []
@@ -2660,6 +2765,12 @@ def dependency_payload_of_type(
     return None
 
 
+def state_expected_episodes_hint(state: dict[str, Any]) -> int | None:
+    """init --expected-episodes 登记的目标集数提示；只用于规划期，不作交付权威。"""
+    value = state.get("expected_episodes_hint")
+    return value if type(value) is int and value > 0 else None
+
+
 def project_expected_episodes(project_path: Path, state: dict[str, Any]) -> int | None:
     candidates = latest_records_of_type(state, "project_spec")
     if len(candidates) != 1:
@@ -2676,6 +2787,70 @@ def project_expected_episodes(project_path: Path, state: dict[str, Any]) -> int 
         return None
     expected = payload.get("expected_episodes") if isinstance(payload, dict) else None
     return expected if type(expected) is int and expected > 0 else None
+
+
+def confirmed_project_spec_payload(
+    project_path: Path, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """当前唯一一份最新项目规格的 JSON payload；无法解析时返回 None。"""
+    candidates = latest_records_of_type(state, "project_spec")
+    if len(candidates) != 1:
+        return None
+    _, record = candidates[0]
+    return load_project_spec_payload(project_path, record)
+
+
+def project_target_duration_seconds(
+    project_path: Path, state: dict[str, Any]
+) -> int:
+    """返回单集目标时长；显式项目规格优先，否则使用 60 秒默认值。"""
+    payload = confirmed_project_spec_payload(project_path, state)
+    value = payload.get("target_duration_seconds") if isinstance(payload, dict) else None
+    return value if type(value) is int and value > 0 else DEFAULT_TARGET_DURATION_SECONDS
+
+
+def project_duration_source(project_path: Path, state: dict[str, Any]) -> str:
+    payload = confirmed_project_spec_payload(project_path, state)
+    value = payload.get("target_duration_seconds") if isinstance(payload, dict) else None
+    return "explicit_project_spec" if type(value) is int and value > 0 else "default_60_seconds"
+
+
+def project_duration_policy(
+    project_path: Path, state: dict[str, Any]
+) -> dict[str, Any]:
+    """项目规格的时长策略；缺省值来自 script-format-and-quality.md 的既有约定。"""
+    payload = confirmed_project_spec_payload(project_path, state)
+    policy = payload.get("duration_policy") if isinstance(payload, dict) else None
+    return policy if isinstance(policy, dict) else {}
+
+
+def duration_tolerance_ratio(policy: dict[str, Any]) -> float:
+    """分镜计划合计时长的允许偏差；缺省为 0.1（±10%）。"""
+    value = policy.get("tolerance_ratio")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return DEFAULT_DURATION_TOLERANCE_RATIO
+    if not math.isfinite(value) or value < 0 or value > 1:
+        return DEFAULT_DURATION_TOLERANCE_RATIO
+    return float(value)
+
+
+def dialogue_chars_per_second(policy: dict[str, Any]) -> tuple[float, float]:
+    """中文配音字/秒推算区间；缺省 3.5—4.5 是样本推算值，不是行业标准。"""
+    value = policy.get("dialogue_chars_per_second")
+    if (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(
+            not isinstance(item, bool)
+            and isinstance(item, (int, float))
+            and math.isfinite(item)
+            and item > 0
+            for item in value
+        )
+        and value[0] <= value[1]
+    ):
+        return float(value[0]), float(value[1])
+    return DEFAULT_DIALOGUE_CHARS_PER_SECOND
 
 
 def validate_series_map_payload(
@@ -3313,6 +3488,242 @@ def validate_model_capability_profile_payload(
     return errors
 
 
+def source_beat_index(event_index: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Build a project-agnostic beat index from source_event_index schema v2."""
+    result: dict[str, dict[str, Any]] = {}
+    units = event_index.get("units") if isinstance(event_index, dict) else None
+    if not isinstance(units, list):
+        return result
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        for event in unit.get("events", []) if isinstance(unit.get("events"), list) else []:
+            if not isinstance(event, dict) or type(event.get("ordinal")) is not int:
+                continue
+            event_ordinal = event["ordinal"]
+            for beat in event.get("beats", []) if isinstance(event.get("beats"), list) else []:
+                if not isinstance(beat, dict):
+                    continue
+                beat_id = beat.get("beat_id")
+                beat_ordinal = beat.get("ordinal")
+                if not isinstance(beat_id, str) or type(beat_ordinal) is not int:
+                    continue
+                result[beat_id] = {
+                    "order": (event_ordinal, beat_ordinal),
+                    "protected_fact_ids": set(beat.get("protected_fact_ids", []))
+                    if isinstance(beat.get("protected_fact_ids"), list)
+                    else set(),
+                }
+    return result
+
+
+def validate_shot_plan_source_contract(
+    event_index: dict[str, Any] | None,
+    story_facts: dict[str, Any] | None,
+    payload: dict[str, Any],
+    episode_id: str,
+) -> list[dict[str, Any]]:
+    """Validate source ordering, episode boundary and fact coverage from structured data."""
+    errors: list[dict[str, Any]] = []
+    event_schema = event_index.get("schema_version", 1) if isinstance(event_index, dict) else 1
+    plan_schema = payload.get("schema_version", 1)
+    strict_contract = (
+        isinstance(event_schema, int) and not isinstance(event_schema, bool) and event_schema >= 2
+    ) or (
+        isinstance(plan_schema, int) and not isinstance(plan_schema, bool) and plan_schema >= 2
+    )
+    if not strict_contract:
+        return errors
+    beats = source_beat_index(event_index)
+    if not beats:
+        errors.append(issue("shotplan_source_beat_index_missing", "AI分镜计划必须绑定带 beats 的原著事件索引"))
+        return errors
+    scopes = event_index.get("episode_scopes") if isinstance(event_index, dict) else None
+    scope = scopes.get(episode_id) if isinstance(scopes, dict) else None
+    if not isinstance(scope, dict):
+        errors.append(issue("shotplan_source_scope_missing", "原著事件索引必须声明当前集 episode_scope", episode_id=episode_id))
+        return errors
+    first_id = scope.get("first_beat_id")
+    last_id = scope.get("last_beat_id")
+    if first_id not in beats or last_id not in beats:
+        errors.append(issue("shotplan_source_scope_invalid", "episode_scope 的首尾 beat 必须存在", episode_id=episode_id))
+        return errors
+    lower, upper = beats[first_id]["order"], beats[last_id]["order"]
+    if lower > upper:
+        errors.append(issue("shotplan_source_scope_reversed", "episode_scope 首尾顺序无效", episode_id=episode_id))
+        return errors
+    facts = story_facts.get("facts") if isinstance(story_facts, dict) else None
+    known_fact_ids = {
+        item.get("fact_id")
+        for item in facts
+        if isinstance(item, dict) and isinstance(item.get("fact_id"), str)
+    } if isinstance(facts, list) else set()
+    previous_order = lower
+    for index, unit in enumerate(payload.get("units", []), 1):
+        if not isinstance(unit, dict):
+            continue
+        refs = unit.get("source_beat_refs")
+        if not isinstance(refs, list) or not refs or not all(isinstance(value, str) for value in refs):
+            errors.append(issue("shotplan_source_beats_missing", "每个分镜单元必须引用 source_beat_refs", unit_index=index))
+            continue
+        unknown = sorted(set(refs) - set(beats))
+        if unknown:
+            errors.append(issue("shotplan_source_beat_unknown", "分镜引用了不存在的来源 beat", unit_index=index, unknown=unknown))
+            continue
+        orders = [beats[value]["order"] for value in refs]
+        if min(orders) < lower or max(orders) > upper:
+            errors.append(issue("shotplan_source_boundary_exceeded", "分镜引用超出当前集允许的原著范围", unit_index=index))
+        if min(orders) < previous_order:
+            errors.append(issue("shotplan_source_order_violation", "分镜来源顺序发生倒退或调序", unit_index=index))
+        previous_order = max(previous_order, max(orders))
+        required_facts: set[str] = set()
+        for ref in refs:
+            required_facts.update(beats[ref]["protected_fact_ids"])
+        preserved = unit.get("preserved_fact_ids")
+        preserved_set = set(preserved) if isinstance(preserved, list) and all(isinstance(v, str) for v in preserved) else set()
+        if required_facts - preserved_set:
+            errors.append(issue("shotplan_protected_fact_missing", "分镜未覆盖来源 beat 的受保护事实", unit_index=index, missing=sorted(required_facts - preserved_set)))
+        if known_fact_ids and preserved_set - known_fact_ids:
+            errors.append(issue("shotplan_protected_fact_unknown", "分镜引用了未知事实 ID", unit_index=index, unknown=sorted(preserved_set - known_fact_ids)))
+        new_claims = unit.get("new_fact_claims", [])
+        if not isinstance(new_claims, list):
+            errors.append(issue("shotplan_new_fact_claims_invalid", "new_fact_claims 必须是数组", unit_index=index))
+        elif new_claims and not unit.get("decision_ids"):
+            errors.append(issue("shotplan_unauthorized_fact_added", "新增事实必须绑定已批准改编决策", unit_index=index))
+    return errors
+
+
+def validate_unit_character_modes(
+    unit: dict[str, Any], cues_by_id: dict[str, dict[str, Any]], unit_index: int
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    characters = unit.get("characters_on_screen")
+    on_screen_ids = {
+        item.get("character_id")
+        for item in characters
+        if isinstance(item, dict) and isinstance(item.get("character_id"), str)
+    } if isinstance(characters, list) else set()
+    screen_video = unit.get("screen_video_characters", [])
+    screen_video_ids = set(screen_video) if isinstance(screen_video, list) else set()
+    nonvisual_modes = {"os", "vo", "off_screen", "voice_over", "phone_audio", "screen_video", "phone_video"}
+    for entry in unit.get("dialogue", []) if isinstance(unit.get("dialogue"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        cue = cues_by_id.get(entry.get("cue_id"), {})
+        speaker = cue.get("speaker_id") or cue.get("character_id")
+        mode = cue.get("delivery_mode") or cue.get("type")
+        if isinstance(speaker, str) and mode in nonvisual_modes and speaker in on_screen_ids:
+            errors.append(issue("shotplan_nonvisual_character_on_screen", "非现场、电话或视频人物不得进入 characters_on_screen", unit_index=unit_index, character_id=speaker, delivery_mode=mode))
+        if isinstance(speaker, str) and mode in {"screen_video", "phone_video"} and speaker not in screen_video_ids:
+            errors.append(issue("shotplan_screen_video_character_missing", "视频人物必须进入 screen_video_characters", unit_index=unit_index, character_id=speaker))
+    enter = unit.get("state_chain", {}).get("enter", {}) if isinstance(unit.get("state_chain"), dict) else {}
+    state_chars = enter.get("characters") if isinstance(enter, dict) else None
+    if isinstance(state_chars, dict):
+        absent_re = re.compile(r"未到场|尚未到场|已离开|不在场|未出现")
+        for character_id in on_screen_ids:
+            state = state_chars.get(character_id)
+            position = state.get("position") if isinstance(state, dict) else None
+            if isinstance(position, str) and absent_re.search(position):
+                errors.append(issue("shotplan_character_presence_conflict", "人物进入状态表明不在场，却被列为现场出镜", unit_index=unit_index, character_id=character_id, position=position))
+    return errors
+
+
+def validate_unit_feasibility(
+    unit: dict[str, Any],
+    cues_by_id: dict[str, dict[str, Any]],
+    rate: tuple[float, float],
+    unit_index: int,
+    strict_contract: bool = True,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    duration = unit.get("duration_seconds")
+    spoken_chars = 0
+    for entry in unit.get("dialogue", []) if isinstance(unit.get("dialogue"), list) else []:
+        cue = cues_by_id.get(entry.get("cue_id"), {}) if isinstance(entry, dict) else {}
+        text = cue.get("text") or cue.get("delivered_text")
+        if isinstance(text, str):
+            spoken_chars += len(re.sub(r"\s+", "", text))
+        if cue.get("preservation_mode") == "exact":
+            source_text = cue.get("source_text")
+            if not isinstance(source_text, str) or text != source_text:
+                errors.append(issue("protected_dialogue_changed", "exact 关键台词必须与来源原文一致", unit_index=unit_index, cue_id=cue.get("cue_id")))
+    if isinstance(duration, (int, float)) and duration > 0 and spoken_chars > duration * rate[1]:
+        errors.append(issue("shotplan_dialogue_capacity_exceeded", "按最快语速计算，对白仍超过当前镜头时长", unit_index=unit_index, spoken_chars=spoken_chars, duration=duration))
+    flow = unit.get("action_flow")
+    if not isinstance(flow, dict):
+        if strict_contract:
+            errors.append(issue("shotplan_action_flow_missing", "分镜单元必须提供结构化 action_flow", unit_index=unit_index))
+    else:
+        enter_states = flow.get("enter_states")
+        steps = flow.get("steps")
+        exit_states = flow.get("exit_states")
+        if not isinstance(enter_states, list) or not all(isinstance(v, str) for v in enter_states):
+            errors.append(issue("shotplan_action_enter_states_invalid", "action_flow.enter_states 必须是字符串数组", unit_index=unit_index))
+            enter_states = []
+        if not isinstance(steps, list) or not steps:
+            errors.append(issue("shotplan_action_steps_missing", "action_flow.steps 必须是非空数组", unit_index=unit_index))
+            steps = []
+        available = set(enter_states)
+        used_step_ids: set[str] = set()
+        minimum_duration = 0.0
+        for step_index, step in enumerate(steps, 1):
+            if not isinstance(step, dict):
+                errors.append(issue("shotplan_action_step_invalid", "动作步骤必须是对象", unit_index=unit_index, step_index=step_index))
+                continue
+            step_id = step.get("step_id")
+            if not isinstance(step_id, str) or not step_id or step_id in used_step_ids:
+                errors.append(issue("shotplan_action_step_id_invalid", "动作步骤 ID 缺失或重复", unit_index=unit_index, step_index=step_index))
+            else:
+                used_step_ids.add(step_id)
+            requires = step.get("requires", [])
+            produces = step.get("produces", [])
+            if not isinstance(requires, list) or not all(isinstance(v, str) for v in requires):
+                errors.append(issue("shotplan_action_requires_invalid", "动作 requires 必须是字符串数组", unit_index=unit_index, step_index=step_index))
+                requires = []
+            if set(requires) - available:
+                errors.append(issue("shotplan_action_precondition_missing", "动作前置状态未满足", unit_index=unit_index, step_index=step_index, missing=sorted(set(requires) - available)))
+            if not isinstance(produces, list) or not all(isinstance(v, str) for v in produces):
+                errors.append(issue("shotplan_action_produces_invalid", "动作 produces 必须是字符串数组", unit_index=unit_index, step_index=step_index))
+                produces = []
+            available.update(produces)
+            value = step.get("min_duration_seconds", 0)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                minimum_duration += value
+            else:
+                errors.append(issue("shotplan_action_min_duration_invalid", "动作最短时长必须是非负数", unit_index=unit_index, step_index=step_index))
+        if isinstance(exit_states, list) and all(isinstance(v, str) for v in exit_states):
+            if set(exit_states) - available:
+                errors.append(issue("shotplan_action_exit_state_unreached", "动作链未产生声明的离开状态", unit_index=unit_index))
+        else:
+            errors.append(issue("shotplan_action_exit_states_invalid", "action_flow.exit_states 必须是字符串数组", unit_index=unit_index))
+        if isinstance(duration, (int, float)) and minimum_duration > duration:
+            errors.append(issue("shotplan_action_capacity_exceeded", "动作步骤最短时长合计超过镜头时长", unit_index=unit_index, minimum=minimum_duration, duration=duration))
+    time_span_mode = unit.get("time_span_mode")
+    if (strict_contract or time_span_mode is not None) and time_span_mode not in {
+        "continuous", "ellipsis", "montage", "flashback"
+    }:
+        errors.append(issue("shotplan_time_span_mode_invalid", "time_span_mode 必须为 continuous、ellipsis、montage 或 flashback", unit_index=unit_index))
+    screen_text = unit.get("screen_text")
+    if screen_text is not None:
+        if not isinstance(screen_text, dict):
+            errors.append(issue("shotplan_screen_text_invalid", "screen_text 必须是对象或 null", unit_index=unit_index))
+        elif screen_text.get("required_text") and (
+            screen_text.get("render_mode") != "post_production_overlay"
+            or not isinstance(screen_text.get("overlay_asset_id"), str)
+            or not screen_text["overlay_asset_id"].strip()
+        ):
+            errors.append(issue("shotplan_screen_text_overlay_missing", "剧情必要屏幕文字必须提供后期叠加资产", unit_index=unit_index))
+    return errors
+
+
+def computed_boundary_conclusion(target_errors: list[dict[str, Any]], findings: list[Any]) -> str:
+    if target_errors or any(isinstance(item, dict) and item.get("result") == "blocked" for item in findings):
+        return "blocked"
+    if any(isinstance(item, dict) and item.get("result") == "suspected_overreach" for item in findings):
+        return "needs_human_review"
+    return "passed"
+
+
 def validate_ai_shot_plan_payload(
     project_path: Path,
     state: dict[str, Any],
@@ -3389,6 +3800,17 @@ def validate_ai_shot_plan_payload(
         errors.append(issue("shotplan_units_invalid", "units 必须是非空数组"))
         return errors
 
+    story_facts = dependency_payload_of_type(project_path, state, record, "story_facts")
+    errors.extend(validate_shot_plan_source_contract(event_index, story_facts, payload, str(episode_id or scope)))
+    event_schema = event_index.get("schema_version", 1) if isinstance(event_index, dict) else 1
+    plan_schema = payload.get("schema_version", 1)
+    strict_contract = (
+        isinstance(event_schema, int) and not isinstance(event_schema, bool) and event_schema >= 2
+    ) or (
+        isinstance(plan_schema, int) and not isinstance(plan_schema, bool) and plan_schema >= 2
+    )
+    unit_rate = dialogue_chars_per_second(project_duration_policy(project_path, state))
+
     seen_unit_ids: set[str] = set()
     used_cue_ids: list[str] = []
     used_scene_anchor_keys: set[str] = set()
@@ -3417,6 +3839,13 @@ def validate_ai_shot_plan_payload(
         for field in ("narrative_task", "action_start", "action_end"):
             if not isinstance(unit.get(field), str) or not unit[field].strip():
                 errors.append(issue("shotplan_unit_field_missing", f"分镜单元缺少 {field}", unit_index=index, field=field))
+        shot_language = unit.get("shot_language")
+        if not isinstance(shot_language, dict):
+            errors.append(issue("shotplan_shot_language_missing", "分镜单元必须声明 shot_language", unit_index=index))
+            shot_language = {}
+        for field in ("shot_size", "camera_angle", "composition", "camera_movement", "visual_focus", "transition"):
+            if not isinstance(shot_language.get(field), str) or not shot_language[field].strip():
+                errors.append(issue("shotplan_shot_language_field_missing", f"shot_language 缺少 {field}", unit_index=index, field=field))
         duration = unit.get("duration_seconds")
         if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0 or duration > 60:
             errors.append(issue("shotplan_unit_duration_invalid", "duration_seconds 必须是0到60秒之间的数值", unit_index=index))
@@ -3454,6 +3883,18 @@ def validate_ai_shot_plan_payload(
                 errors.append(issue("shotplan_character_id_missing", "出场角色缺少 character_id", unit_index=index, character_index=char_index))
             else:
                 used_character_ids.add(character_id)
+            anchor_ref = character.get("anchor_ref")
+            if (
+                isinstance(character_id, str)
+                and isinstance(anchor_ref, dict)
+                and anchor_ref.get("artifact_key") != f"character_anchor:{character_id}"
+            ):
+                errors.append(issue(
+                    "shotplan_character_identity_mismatch",
+                    "角色 ID 必须绑定同 ID 的角色锚点，禁止跨制品身份漂移",
+                    unit_index=index,
+                    character_id=character_id,
+                ))
             if not isinstance(character.get("appearance_lock"), str) or not character["appearance_lock"].strip():
                 errors.append(issue("shotplan_appearance_lock_missing", "出场角色必须注入 appearance_lock 外形锁摘要", unit_index=index, character_index=char_index))
             anchor_error = anchor_reference_error(state, character.get("anchor_ref"), "character_anchor")
@@ -3498,6 +3939,9 @@ def validate_ai_shot_plan_payload(
                     lip_sync_speakers.add(speaker)
         if lip_sync_count and len(lip_sync_speakers) > 1:
             errors.append(issue("shotplan_multi_lip_sync", "一个分镜单元只允许一名角色清晰对嘴", unit_index=index, speakers=sorted(lip_sync_speakers)))
+
+        errors.extend(validate_unit_character_modes(unit, cues_by_id, index))
+        errors.extend(validate_unit_feasibility(unit, cues_by_id, unit_rate, index, strict_contract))
 
         if not isinstance(unit.get("sound"), list) or not all(
             isinstance(value, str) and value.strip() for value in unit.get("sound", [])
@@ -3544,21 +3988,39 @@ def validate_ai_shot_plan_payload(
     if duplicate_cues:
         errors.append(issue("shotplan_cue_coverage_duplicate", "同一对白 cue 在分镜计划中重复绑定", duplicate=duplicate_cues))
 
+    spec_duration = project_target_duration_seconds(project_path, state)
+    policy = project_duration_policy(project_path, state)
+    tolerance = duration_tolerance_ratio(policy)
     target_duration = payload.get("target_duration_seconds")
+    if target_duration is None and spec_duration is not None:
+        # v0.8.1 及以前省略该字段即可整段跳过时长校验；项目已声明目标时长时必须声明。
+        errors.append(issue(
+            "shotplan_target_duration_missing",
+            "项目规格已声明单集目标时长，AI分镜计划必须写明 target_duration_seconds",
+            project_spec=spec_duration,
+        ))
     if target_duration is not None:
         if type(target_duration) is not int or target_duration <= 0:
             errors.append(issue("shotplan_target_duration_invalid", "target_duration_seconds 必须是正整数（来自项目规格的单集目标时长）"))
         else:
+            if spec_duration is not None and target_duration != spec_duration:
+                errors.append(issue(
+                    "shotplan_target_duration_mismatch",
+                    "AI分镜计划自报的单集目标时长与已确认项目规格不一致",
+                    project_spec=spec_duration,
+                    plan=target_duration,
+                ))
             deviation = abs(total_unit_duration - target_duration) / target_duration
-            if deviation > 0.2 and (
+            if deviation > tolerance and (
                 not isinstance(payload.get("duration_deviation_note"), str)
                 or not payload["duration_deviation_note"].strip()
             ):
                 errors.append(issue(
                     "shotplan_duration_deviation",
-                    "单元合计时长偏离单集目标超过20%，须提供 duration_deviation_note 或返修",
+                    f"单元合计时长偏离单集目标超过{round(tolerance * 100)}%，须提供 duration_deviation_note 或返修",
                     total=round(total_unit_duration, 1),
                     target=target_duration,
+                    tolerance_ratio=tolerance,
                 ))
 
     max_scenes = budget.get("max_scene_anchors")
@@ -4160,6 +4622,9 @@ def validate_structured_development_artifact(
         actual_unit_ids: list[str] = []
         chapter_summary_ids: set[str] = set()
         event_ids: set[str] = set()
+        event_ordinals: set[int] = set()
+        beat_ids: set[str] = set()
+        schema_v2 = type(payload.get("schema_version")) is int and payload.get("schema_version") >= 2
         for index, unit in enumerate(units):
             if not isinstance(unit, dict):
                 errors.append(issue("event_unit_invalid", "事件索引单元必须是对象", unit_index=index))
@@ -4208,6 +4673,37 @@ def validate_structured_development_artifact(
                     errors.append(issue("event_id_duplicate", f"事件 ID 重复：{event_id}"))
                 else:
                     event_ids.add(event_id)
+                if schema_v2:
+                    event_ordinal = event.get("ordinal")
+                    if type(event_ordinal) is not int or event_ordinal < 1 or event_ordinal in event_ordinals:
+                        errors.append(issue("event_ordinal_invalid", "schema v2 事件 ordinal 必须是唯一正整数", unit_index=index, event_index=event_index))
+                    else:
+                        event_ordinals.add(event_ordinal)
+                    beats = event.get("beats")
+                    if not isinstance(beats, list) or not beats:
+                        errors.append(issue("event_beats_missing", "schema v2 事件必须包含非空 beats", unit_index=index, event_index=event_index))
+                        beats = []
+                    local_ordinals: set[int] = set()
+                    for beat_index, beat in enumerate(beats):
+                        if not isinstance(beat, dict):
+                            errors.append(issue("event_beat_invalid", "beat 必须是对象", unit_index=index, event_index=event_index, beat_index=beat_index))
+                            continue
+                        beat_id = beat.get("beat_id")
+                        if not isinstance(beat_id, str) or not beat_id.strip() or beat_id in beat_ids:
+                            errors.append(issue("event_beat_id_invalid", "beat_id 缺失或重复", unit_index=index, event_index=event_index, beat_index=beat_index))
+                        else:
+                            beat_ids.add(beat_id)
+                        beat_ordinal = beat.get("ordinal")
+                        if type(beat_ordinal) is not int or beat_ordinal < 1 or beat_ordinal in local_ordinals:
+                            errors.append(issue("event_beat_ordinal_invalid", "beat ordinal 必须在事件内唯一且为正整数", unit_index=index, event_index=event_index, beat_index=beat_index))
+                        else:
+                            local_ordinals.add(beat_ordinal)
+                        beat_refs = beat.get("source_refs")
+                        if not isinstance(beat_refs, list) or not beat_refs or not all(isinstance(v, str) and v.strip() for v in beat_refs):
+                            errors.append(issue("event_beat_source_refs_invalid", "beat 必须提供来源位置", unit_index=index, event_index=event_index, beat_index=beat_index))
+                        protected = beat.get("protected_fact_ids", [])
+                        if not isinstance(protected, list) or not all(isinstance(v, str) and v.strip() for v in protected):
+                            errors.append(issue("event_beat_protected_facts_invalid", "protected_fact_ids 必须是字符串数组", unit_index=index, event_index=event_index, beat_index=beat_index))
                 required_event_fields = (
                     ("summary",)
                     if granularity == "chapter_summary"
@@ -4245,6 +4741,18 @@ def validate_structured_development_artifact(
                         extra=sorted(pending_set - chapter_summary_ids),
                     )
                 )
+
+        if schema_v2:
+            episode_scopes = payload.get("episode_scopes")
+            if not isinstance(episode_scopes, dict) or not episode_scopes:
+                errors.append(issue("event_episode_scopes_missing", "schema v2 事件索引必须声明 episode_scopes"))
+            else:
+                for episode_id, scope in episode_scopes.items():
+                    if not isinstance(episode_id, str) or not re.fullmatch(r"E\d{3,6}", episode_id):
+                        errors.append(issue("event_episode_scope_id_invalid", "episode_scopes key 必须是规范集号", episode_id=episode_id))
+                        continue
+                    if not isinstance(scope, dict) or scope.get("first_beat_id") not in beat_ids or scope.get("last_beat_id") not in beat_ids:
+                        errors.append(issue("event_episode_scope_invalid", "episode_scope 首尾 beat 必须存在", episode_id=episode_id))
 
     elif artifact_kind == "change_authorization":
         authorizations = payload.get("authorizations")
@@ -4659,6 +5167,13 @@ def validate_structured_development_artifact(
         finding_ids: set[str] = set()
         has_suspected = False
         has_blocked = False
+        covered_semantic_categories: set[str] = set()
+        required_ai_video_categories = {
+            "source_fidelity",
+            "character_scene_consistency",
+            "production_feasibility",
+            "screen_text_postproduction",
+        }
         auto_allowed_categories = {
             "psychology_externalization",
             "dialogue_rewrite",
@@ -4699,6 +5214,9 @@ def validate_structured_development_artifact(
         }
         allowed_categories = {
             "source_fidelity",
+            "character_scene_consistency",
+            "production_feasibility",
+            "screen_text_postproduction",
             *auto_allowed_categories,
             *confirmation_categories,
             *hard_block_categories,
@@ -4720,6 +5238,8 @@ def validate_structured_development_artifact(
             category = finding.get("category")
             if category not in allowed_categories:
                 errors.append(issue("boundary_category_invalid", "内容边界发现项 category 无效", finding_index=index))
+            if category in required_ai_video_categories and result == "passed":
+                covered_semantic_categories.add(category)
             if category in hard_block_categories and result not in {"blocked", "suspected_overreach"}:
                 errors.append(issue("boundary_hard_block_downgraded", "硬性阻断项不能判定为通过或已批准新增", finding_index=index))
             if category in confirmation_categories and result not in {"approved_addition", "blocked", "suspected_overreach"}:
@@ -4791,7 +5311,35 @@ def validate_structured_development_artifact(
                     errors.append(issue("boundary_authorization_refs_mismatch", "已批准新增必须精确列出改编决策绑定的用户授权记录", finding_index=index))
             if result == "suspected_overreach" and finding.get("human_judgment_required") is not True:
                 errors.append(issue("boundary_human_gate_missing", "疑似越界必须标记 human_judgment_required: true", finding_index=index))
-        expected_conclusion = "blocked" if has_blocked else "needs_human_review" if has_suspected else "passed"
+        if artifact_kind == "ai_video_boundary_review":
+            missing_semantic_categories = sorted(required_ai_video_categories - covered_semantic_categories)
+            if missing_semantic_categories:
+                errors.append(issue(
+                    "boundary_semantic_coverage_missing",
+                    "AI分镜边界报告未覆盖全部核心语义检查，不能以 passed 形成假全绿",
+                    missing=missing_semantic_categories,
+                ))
+        target_validation_errors: list[dict[str, Any]] = []
+        if artifact_kind == "ai_video_boundary_review" and isinstance(target_ref, dict):
+            target_key = target_ref.get("artifact_key")
+            target_version = target_ref.get("version")
+            target_record = next((
+                item for item in state.get("artifacts", {}).get(target_key, [])
+                if isinstance(item, dict) and item.get("version") == target_version
+            ), None) if isinstance(target_key, str) else None
+            if isinstance(target_record, dict):
+                target_validation_errors = validate_structured_development_artifact(
+                    project_path, state, target_key, target_record
+                )
+            else:
+                target_validation_errors = [issue("boundary_target_missing", "审核目标制品不存在")]
+            if target_validation_errors:
+                errors.append(issue(
+                    "boundary_target_validation_failed",
+                    "AI分镜目标仍有机器校验错误，边界报告不能判定 passed",
+                    target_errors=target_validation_errors,
+                ))
+        expected_conclusion = computed_boundary_conclusion(target_validation_errors, findings)
         if payload.get("conclusion") != expected_conclusion:
             errors.append(issue("boundary_conclusion_mismatch", f"内容边界报告结论应为 {expected_conclusion}", artifact_key=artifact_key))
 
@@ -4948,6 +5496,17 @@ def validate_state(project_path: Path) -> dict[str, Any]:
                     raise ToolError("source_policy 字段不完整或 content_authority 不是 uploaded_files")
             except ToolError as exc:
                 errors.append(issue("source_policy_invalid", str(exc)))
+
+    episodes_hint = state.get("expected_episodes_hint")
+    if episodes_hint is not None and (
+        type(episodes_hint) is not int or episodes_hint < 1
+    ):
+        errors.append(
+            issue(
+                "expected_episodes_hint_invalid",
+                "expected_episodes_hint 必须是大于0的整数或 null",
+            )
+        )
 
     batches = state.get("batches", {})
     if not isinstance(batches, dict):
@@ -5126,13 +5685,21 @@ def validate_state(project_path: Path) -> dict[str, Any]:
         errors.extend(scoped_batch_outline_source_errors(state, key, record))
 
     # 只校验仍在流转中的最新版分集剧本；失效和历史版本保留追溯但不阻断当前项目。
+    handoff_target_duration = project_target_duration_seconds(project_path, state)
+    handoff_chars_per_second = dialogue_chars_per_second(
+        project_duration_policy(project_path, state)
+    )
     for key, record in latest_records_of_type(state, "episode_script"):
         if record.get("status") not in {"draft", "awaiting_approval", "confirmed"}:
             continue
         script_path = path_from_record(project_path, record.get("path"))
         if script_path is None or not script_path.is_file():
             continue
-        script_result = validate_script_file(script_path)
+        script_result = validate_script_file(
+            script_path,
+            target_duration_seconds=handoff_target_duration,
+            chars_per_second=handoff_chars_per_second,
+        )
         if not script_result["valid"]:
             errors.append(
                 issue(
@@ -5191,6 +5758,12 @@ def validate_state(project_path: Path) -> dict[str, Any]:
             "source_count": len(sources),
             "artifact_key_count": len(artifacts),
             "artifact_version_count": len(artifact_versions),
+        },
+        "generation_policy": {
+            "target_duration_seconds": project_target_duration_seconds(project_path, state),
+            "duration_source": project_duration_source(project_path, state),
+            "tolerance_ratio": duration_tolerance_ratio(project_duration_policy(project_path, state)),
+            "recommended_shot_units": DEFAULT_RECOMMENDED_SHOT_UNITS,
         },
     }
 
@@ -5306,6 +5879,10 @@ def validate_handoff_state(
                         "project_spec_rights_note_invalid",
                         "项目规格 rights_note 必须是字符串（记录授权范围）",
                     )
+                )
+            for problem in duration_policy_issues(project_spec_payload):
+                errors.append(
+                    issue("project_spec_duration_invalid", f"项目规格时长契约非法：{problem}")
                 )
             if type(specified_episode_count) is not int or specified_episode_count < 1:
                 errors.append(
@@ -6481,6 +7058,62 @@ FORBIDDEN_DIRECTOR_INLINE_RE = re.compile(
     r"图片提示词|生图提示词|视频提示词|负面提示词)\s*[：:|｜]",
     re.IGNORECASE,
 )
+# 散文式镜头语言：填表式关键字之外，AI 起草最容易混进动作行的运镜、景别、
+# 机位、焦段、剪辑与硬秒点写法。语义上无法保证百分之百判断（"特写"等词也可能
+# 出现在正常叙事或台词里），所以只报 warning 交人工判断，不阻断校验。
+PROSE_SHOT_LANGUAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "运镜",
+        re.compile(
+            r"镜头(?:缓缓|慢慢|快速|随之|再|又|即|则)?"
+            r"(?:推近|推进|拉远|拉开|摇向|摇过|跟随|跟拍|下摇|上摇|平移|环绕|升起|下降|切到|切向)"
+            r"|(?:推轨|轨道镜|摇臂|斯坦尼康|手持跟拍|升降镜头|环绕镜头|一镜到底|长镜头)"
+        ),
+    ),
+    (
+        "景别",
+        re.compile(
+            r"(?:大特写|特写|近景|中景|全景|远景|大远景|中近景|过肩镜|双人镜)"
+            r"\s*[：:]|"
+            r"(?:切|转|给)(?:一个)?(?:大特写|特写|近景|中景|全景|远景)|"
+            r"(?:以|用)(?:大特写|特写|近景|中景|全景|远景)(?:拍|呈现|展现|表现)"
+        ),
+    ),
+    (
+        "机位",
+        re.compile(
+            r"(?:俯拍|仰拍|俯视镜|仰视镜|正打|反打|过肩拍|主观镜头|客观视角|"
+            r"第一人称镜头|越轴|轴线)"
+        ),
+    ),
+    (
+        "焦段",
+        re.compile(
+            r"\d{1,3}\s*mm(?![a-z])|(?:长焦|广角|鱼眼|变焦|定焦|浅景深|大光圈)"
+            r"(?:压缩|拍|镜头|下)?"
+        ),
+    ),
+    (
+        "剪辑与硬秒点",
+        re.compile(
+            r"(?:切黑|淡入|淡出|叠化|硬切|跳切|闪回镜头|转场镜头|黑屏)|"
+            r"(?:时长|停留|保持|持续)\s*(?:约)?\s*\d+(?:\.\d+)?\s*秒|"
+            r"\d+\s*[-–—~]\s*\d+\s*秒"
+        ),
+    ),
+)
+
+
+def prose_shot_language_hits(line: str) -> list[str]:
+    """返回动作/描述行里疑似散文式镜头语言的类别；台词行由调用方排除。"""
+    cleaned = unicodedata.normalize("NFKC", line).replace("**", "").strip()
+    cleaned = re.sub(r"^(?:[-*>•]\s*)+", "", cleaned)
+    cleaned = re.sub(r"^(?:[△▲※◆]\s*|(?:画面|动作)\s*[：:]\s*)", "", cleaned)
+    return [
+        label
+        for label, pattern in PROSE_SHOT_LANGUAGE_PATTERNS
+        if pattern.search(cleaned)
+    ]
 PLACEHOLDER_RE = re.compile(
     r"\b(?:TBD|TODO|FIXME)\b|"
     r"(?:\[待(?:补|定|确认)[^\]]*\]|【待(?:补|定|确认)[^】]*】)",
@@ -6630,9 +7263,54 @@ def dialogue_match(line: str) -> re.Match[str] | None:
     return match
 
 
-def validate_script_file(script_path: Path, fragment: bool = False) -> dict[str, Any]:
+def spoken_char_count(text: str) -> int:
+    """对白的有效发声字数：剔除空白与标点，只留真正需要读出来的字符。"""
+    cleaned = unicodedata.normalize("NFKC", text)
+    return sum(
+        1
+        for char in cleaned
+        if not char.isspace() and not unicodedata.category(char).startswith("P")
+    )
+
+
+def estimate_dialogue_seconds(
+    char_count: int, rate: tuple[float, float]
+) -> tuple[float, float]:
+    """按字/秒区间把发声字数换算成秒数区间。
+
+    返回 (最快秒数, 最慢秒数)：上限字/秒对应最快，下限字/秒对应最慢。
+    这是推算值，不能冒充配音实测结果。
+    """
+    slow_rate, fast_rate = rate
+    if char_count <= 0:
+        return (0.0, 0.0)
+    return (char_count / fast_rate, char_count / slow_rate)
+
+
+def scene_duration_band(
+    target_seconds: int, scene_count: int
+) -> tuple[float, float] | None:
+    """按“单集目标时长 ÷ 场数”推导单场时长比例区间，不写死绝对秒数。"""
+    if target_seconds <= 0 or scene_count <= 0:
+        return None
+    average = target_seconds / scene_count
+    low, high = SCENE_DURATION_BAND
+    return (average * low, average * high)
+
+
+def validate_script_file(
+    script_path: Path,
+    fragment: bool = False,
+    target_duration_seconds: int | None = None,
+    chars_per_second: tuple[float, float] | None = None,
+) -> dict[str, Any]:
+    """校验单集文学剧本结构。
+
+    target_duration_seconds 省略时完全不做时长推算，输出与不带该参数时逐字段一致。
+    """
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    rate = chars_per_second or DEFAULT_DIALOGUE_CHARS_PER_SECOND
     if not script_path.is_file():
         return {
             "valid": False,
@@ -6669,6 +7347,20 @@ def validate_script_file(script_path: Path, fragment: bool = False) -> dict[str,
                     line=line_number,
                 )
             )
+        elif not dialogue_match(line) and not SCENE_HEADING_RE.match(line):
+            # 台词原文与场次标题不参与散文式判断：角色可以在对白里提到"特写"，
+            # 场次标题的"日/外"等词也不是镜头语言。
+            prose_hits = prose_shot_language_hits(line)
+            if prose_hits:
+                warnings.append(
+                    issue(
+                        "shot_language_suspected",
+                        "疑似散文式镜头语言（"
+                        + "、".join(prose_hits)
+                        + "）；文学剧本只写可见动作，镜头表达应留给 AI 分镜计划，请人工确认",
+                        line=line_number,
+                    )
+                )
         normalized_line = unicodedata.normalize("NFKC", line)
         if PLACEHOLDER_RE.search(normalized_line):
             errors.append(
@@ -6743,6 +7435,7 @@ def validate_script_file(script_path: Path, fragment: bool = False) -> dict[str,
     unused_prop_count = 0
     long_dialogue_run_count = 0
     scene_end_state_count = 0
+    total_spoken_chars = 0
     for scene in scenes:
         location = {"scene": scene["scene_id"], "line": scene["line"]}
         if scene["scene_id"] in seen_scene_ids:
@@ -6852,6 +7545,11 @@ def validate_script_file(script_path: Path, fragment: bool = False) -> dict[str,
                 )
             )
         dialogue_count += len(dialogue_matches)
+        scene_spoken_chars = sum(
+            spoken_char_count(match.group("text")) for _, match in dialogue_matches
+        )
+        scene["spoken_chars"] = scene_spoken_chars
+        total_spoken_chars += scene_spoken_chars
         for number, match in dialogue_matches:
             dialogue_text = match.group("text").strip()
             if len(dialogue_text) < 2:
@@ -6937,7 +7635,58 @@ def validate_script_file(script_path: Path, fragment: bool = False) -> dict[str,
 
     if len(scenes) == 1:
         warnings.append(issue("single_scene", "本集只有一场，请人工确认节奏与内容量"))
-    return {
+
+    # 时长预算：只在项目规格声明了单集目标时长时推算，且一律只预警不阻断。
+    # 字数推算不能冒充配音实读结果，故只报“最快语速下已超时”这一无歧义方向；
+    # 偏短需要动作与转场余量才能判断，项目未给出该参数，只输出数据交人工判断。
+    episode_seconds_fast, episode_seconds_slow = estimate_dialogue_seconds(
+        total_spoken_chars, rate
+    )
+    duration_summary: dict[str, Any] = {
+        "spoken_char_count": total_spoken_chars,
+        "chars_per_second": list(rate),
+        "estimated_dialogue_seconds_range": [
+            round(episode_seconds_fast, 1),
+            round(episode_seconds_slow, 1),
+        ],
+        "estimate_basis": "按字数推算的净对白秒数，未含动作、停顿与转场余量，非配音实测",
+        "target_duration_seconds": target_duration_seconds,
+    }
+    if target_duration_seconds is not None and target_duration_seconds > 0:
+        if episode_seconds_fast > target_duration_seconds:
+            warnings.append(
+                issue(
+                    "episode_dialogue_budget_over",
+                    f"净对白按最快语速{rate[1]}字/秒推算已需约{round(episode_seconds_fast, 1)}秒，"
+                    f"超过单集目标{target_duration_seconds}秒，且尚未计入动作、停顿与转场；"
+                    "建议在大纲层压缩，不要把超载留到成稿返修",
+                    estimated_seconds=round(episode_seconds_fast, 1),
+                    target=target_duration_seconds,
+                )
+            )
+        band = scene_duration_band(target_duration_seconds, len(scenes))
+        if band is not None:
+            duration_summary["scene_duration_band_seconds"] = [
+                round(band[0], 1),
+                round(band[1], 1),
+            ]
+            for scene in scenes:
+                scene_fast, scene_slow = estimate_dialogue_seconds(
+                    scene.get("spoken_chars", 0), rate
+                )
+                # 用推算区间与比例带比较：区间整体越界才提示，避免边界抖动造成噪音。
+                if scene_fast > band[1]:
+                    warnings.append(
+                        issue(
+                            "scene_duration_unbalanced",
+                            f"本场净对白推算约{round(scene_fast, 1)}—{round(scene_slow, 1)}秒，"
+                            f"高于按目标时长推导的单场区间{round(band[0], 1)}—{round(band[1], 1)}秒，"
+                            "请在大纲层确认场次划分是否失衡",
+                            scene=scene["scene_id"],
+                            line=scene["line"],
+                        )
+                    )
+    result = {
         "valid": not errors,
         "validation_scope": "script_structure",
         "production_ready": False,
@@ -6967,6 +7716,18 @@ def validate_script_file(script_path: Path, fragment: bool = False) -> dict[str,
             for scene in scenes
         ],
     }
+    if target_duration_seconds is not None:
+        # 只在调用方声明了目标时长时输出，未声明时返回结构与改动前完全一致。
+        result["duration_estimate"] = duration_summary
+        for entry, scene in zip(result["scenes"], scenes):
+            scene_fast, scene_slow = estimate_dialogue_seconds(
+                scene.get("spoken_chars", 0), rate
+            )
+            entry["estimated_dialogue_seconds_range"] = [
+                round(scene_fast, 1),
+                round(scene_slow, 1),
+            ]
+    return result
 
 
 def cue_type_from_line(line: str) -> str:
@@ -7825,7 +8586,14 @@ def command_validate_breakdowns(args: argparse.Namespace) -> int:
 
 def command_validate_script(args: argparse.Namespace) -> int:
     script_path = Path(args.path).expanduser().resolve()
-    result = validate_script_file(script_path, fragment=args.fragment)
+    target_duration = getattr(args, "target_duration_seconds", None)
+    if target_duration is not None and target_duration <= 0:
+        raise ToolError("--target-duration-seconds 必须是大于0的整数秒")
+    result = validate_script_file(
+        script_path,
+        fragment=args.fragment,
+        target_duration_seconds=target_duration,
+    )
     print_json(result)
     return 0 if result["valid"] else 1
 
@@ -7968,7 +8736,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--expected-episodes",
         type=int,
-        help="可选目标集数提示；不用于检查上传文件完整度",
+        help=(
+            "目标集数提示，记入 expected_episodes_hint，供 project_spec 确认前定义批次使用；"
+            "不用于检查上传文件完整度，交付门禁仍以已确认 project_spec 为权威"
+        ),
     )
     init_parser.add_argument(
         "--source-kind",
@@ -8147,6 +8918,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_script_parser.add_argument("path", help="UTF-8 剧本文件")
     validate_script_parser.add_argument(
         "--fragment", action="store_true", help="按试写片段校验，不强制要求整集钩子"
+    )
+    validate_script_parser.add_argument(
+        "--target-duration-seconds",
+        type=int,
+        help="单集目标时长（秒）；提供后按字数推算净对白秒数并给出预警，省略则不做时长推算",
     )
     validate_script_parser.set_defaults(handler=command_validate_script)
 

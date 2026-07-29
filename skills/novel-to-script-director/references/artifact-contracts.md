@@ -45,7 +45,7 @@
 
 - 目标用途与交付对象
 - 受众平台（如用户指定）
-- 总集数、单集目标时长或内容量
+- 总集数、单集目标时长或内容量。用户未指定时按单集约 60 秒、上下浮动 10%、约 15 个分镜单元规划；项目规格可用 `target_duration_seconds`（正整数秒）和 `duration_policy` 显式覆盖。
 - 改编尺度与来源说明
 - 可选 `rights_mode`：`owned`（默认，自有版权）、`licensed`（第三方授权，可用可选字符串 `rights_note` 记录授权范围）或 `unclear`。缺省字段按 `owned` 语义处理，旧规格不需要补字段。非法枚举值会被校验器拒绝确认；`unclear` 不阻塞，只在 `show`/`approve` 时提示用户确认权利状态一次。权利状态只登记用户声明，插件不联网检索正文、不外部核实、不等待授权。
 - 必须保留、允许调整、禁止改变
@@ -323,3 +323,13 @@ v0.8 轻量 `backbone` 使用 `contract_version: 2`，每集只强制合法 `epi
 `BatchPackage` 只把上述要求收窄到已定义批次的集号范围，不降低单批质检、制作就绪复核、内容边界、连续性或版本绑定标准，也不能据此声称全剧已经交付完成。
 
 v0.8 默认 `FinalPackage` 由全局规划制品、全部当前批次 ZIP/清单/连续性快照、跨批连续性审核和 `series_delivery_manifest` 汇总而成，不重新展开复制每集制品。修改一个批次只让该批次、跨批审核、汇总清单和最终包失效，其他批次包保持有效。旧 `build-handoff --expected-episodes N` 仍可兼容调用，但会返回弃用提示。
+
+
+## 通用语义追踪与制作可执行性（schema v2）
+
+- `source_event_index` 的 schema v2 必须为事件和 beat 提供唯一顺序，并通过 `episode_scopes` 声明每集允许使用的首尾 beat。
+- AI 分镜单元必须使用 `source_beat_refs`，顺序不得倒退或越过当前集来源边界；引用 beat 的 `protected_fact_ids` 必须进入 `preserved_fact_ids`。
+- 新增事实必须写入 `new_fact_claims` 并绑定有效改编决策，不能用布尔值自报“忠实”。
+- 台词声音表用 `delivery_mode` 区分 `on_screen`、`off_screen`、`voice_over`、`phone_audio`、`screen_video`；非现场人物不得进入 `characters_on_screen`。
+- 每个分镜单元必须提供 `action_flow`、`time_span_mode` 和完整 `shot_language`。动作前置状态、最短时长、对白字数和屏幕文字后期方案由工具实际校验。
+- 边界报告的最终结论由目标制品的机器校验结果计算；报告自填 `passed` 不能覆盖阻断错误。

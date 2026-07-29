@@ -2782,7 +2782,8 @@ class ProjectToolTests(unittest.TestCase):
         self.create_ready_project()
         self.register_ai_layer_prerequisites()
         plan = self.shot_plan_payload()
-        plan["target_duration_seconds"] = 30
+        plan["target_duration_seconds"] = 60
+        plan.pop("duration_deviation_note", None)
         version = self.register_artifact(
             "ai_shot_plan:E001",
             "10_AI视频执行包/E001_超差分镜计划V1.json",
@@ -2794,8 +2795,6 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(code, 2, payload)
         self.assertIn("shotplan_duration_deviation", payload["error"])
-
-    # ------- AI 视频三层结构（模型能力档案 / AI分镜计划 / 执行计划） -------
 
     def register_ai_layer_prerequisites(self) -> None:
         self.register_and_approve(
@@ -2870,8 +2869,8 @@ class ProjectToolTests(unittest.TestCase):
             "C002": {"position": "堵住院门", "facing": "面向阿宁", "wardrobe": "灰袍", "props": [], "injuries": "无", "knowledge": "不知官差将至"},
         }}
         characters = [
-            {"character_id": "C001", "anchor_ref": {"artifact_key": "character_anchor:C001", "version": 1}, "appearance_lock": "黑发少女，青布衫", "wardrobe": "青布衫"},
-            {"character_id": "C002", "anchor_ref": {"artifact_key": "character_anchor:C002", "version": 1}, "appearance_lock": "灰袍老者", "wardrobe": "灰袍"},
+            {"character_id": "C001", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C001", "version": 1}, "appearance_lock": "黑发少女，青布衫", "wardrobe": "青布衫"},
+            {"character_id": "C002", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C002", "version": 1}, "appearance_lock": "灰袍老者", "wardrobe": "灰袍"},
         ]
         return {
             "schema_version": 1,
@@ -2882,6 +2881,15 @@ class ProjectToolTests(unittest.TestCase):
                 for value in self.shot_plan_dependencies()
             ],
             "hard_blocks": ["不得提前揭示门外官差身份", "不得展示钥匙对应的箱柜内部"],
+            "target_duration_seconds": 60,
+            "duration_deviation_note": "最小测试夹具仅覆盖两个分镜单元",
+            "source_fidelity": {
+                "source_order_preserved": True,
+                "within_source_endpoint": True,
+                "protected_facts_preserved": True,
+                "unsupported_story_facts": [],
+                "dialogue_intent_preserved": True,
+            },
             "asset_budget": {"max_scene_anchors": 2, "max_speaking_characters": 4},
             "units": [
                 {
@@ -2889,6 +2897,8 @@ class ProjectToolTests(unittest.TestCase):
                     "sequence": 1,
                     "scene_id": "1-1",
                     "narrative_task": "管家当面索要钥匙",
+                    "shot_language": {"shot_size": "中景", "camera_angle": "平视", "composition": "双人对峙", "camera_movement": "固定", "visual_focus": "钥匙", "transition": "直接切入"},
+                    "production_feasibility": {"dialogue_fits_duration": True, "action_fits_duration": True, "physical_preconditions_complete": True, "time_span_supported": True, "screen_text_post_plan_complete": True},
                     "duration_seconds": 3,
                     "action_start": "阿宁攥钥匙退到门槛外",
                     "action_end": "管家伸手拦住去路",
@@ -2907,6 +2917,8 @@ class ProjectToolTests(unittest.TestCase):
                     "sequence": 2,
                     "scene_id": "1-1",
                     "narrative_task": "阿宁拒交钥匙，冲突升级",
+                    "shot_language": {"shot_size": "近景", "camera_angle": "平视", "composition": "阿宁前景管家后景", "camera_movement": "轻推", "visual_focus": "藏钥匙的手", "transition": "动作衔接"},
+                    "production_feasibility": {"dialogue_fits_duration": True, "action_fits_duration": True, "physical_preconditions_complete": True, "time_span_supported": True, "screen_text_post_plan_complete": True},
                     "duration_seconds": 4,
                     "action_start": "阿宁把钥匙藏到袖后",
                     "action_end": "管家堵住院门",
@@ -2939,6 +2951,38 @@ class ProjectToolTests(unittest.TestCase):
             },
             "passed",
             file_tag="AI分镜",
+        )
+        self.update_artifact_json(
+            "ai_video_boundary_review:E001",
+            lambda payload: payload["findings"].extend([
+                {
+                    "finding_id": "BR-AI-E001-002",
+                    "category": "character_scene_consistency",
+                    "result": "passed",
+                    "location": "E001/U001-U002",
+                    "description": "现场人物、角色锚点和状态链一致。",
+                    "evidence": "C001/C002 均绑定同 ID 锚点且标记 on_screen。",
+                    "source_refs": ["EV-0001"],
+                },
+                {
+                    "finding_id": "BR-AI-E001-003",
+                    "category": "production_feasibility",
+                    "result": "passed",
+                    "location": "E001/U001-U002",
+                    "description": "对白、动作和镜头语言满足制作要求。",
+                    "evidence": "两个单元均声明完整 shot_language 与 production_feasibility。",
+                    "source_refs": ["EV-0001"],
+                },
+                {
+                    "finding_id": "BR-AI-E001-004",
+                    "category": "screen_text_postproduction",
+                    "result": "passed",
+                    "location": "E001/U001-U002",
+                    "description": "本测试集不存在剧情必要屏幕文字。",
+                    "evidence": "screen_text_post_plan_complete=true。",
+                    "source_refs": ["EV-0001"],
+                },
+            ]),
         )
         self.approve_artifact("ai_video_boundary_review:E001", review_version)
         self.approve_artifact("ai_shot_plan:E001", plan_version)
@@ -3134,7 +3178,7 @@ class ProjectToolTests(unittest.TestCase):
             {"cue_id": "Q002", "lip_sync": True},
         ]
         plan["units"][0]["characters_on_screen"] = [
-            {"character_id": "C001", "anchor_ref": {"artifact_key": "character_anchor:C001", "version": 1}, "appearance_lock": "", "wardrobe": "青布衫"},
+            {"character_id": "C001", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C001", "version": 1}, "appearance_lock": "", "wardrobe": "青布衫"},
         ]
         plan["units"][1]["dialogue"] = []
         plan["units"][1]["duration_seconds"] = 6
@@ -3308,6 +3352,392 @@ class ProjectToolTests(unittest.TestCase):
         code, payload = self.run_cli("show", str(self.project), "--summary")
         self.assertEqual(code, 0, payload)
         self.assertNotIn("rights_notice", payload)
+
+    # ------- 时长契约（项目规格 / 分镜计划绑定 / 剧本秒数预算） -------
+
+    def register_spec_with_duration(self, duration_fields: dict, file_tag: str) -> int:
+        spec: dict = {
+            "schema_version": 1,
+            "project_id": self.state()["project_id"],
+            "expected_episodes": 2,
+        }
+        spec.update(duration_fields)
+        return self.register_artifact(
+            "project_spec",
+            f"01_原著解析/项目规格_{file_tag}.json",
+            json.dumps(spec, ensure_ascii=False),
+        )
+
+    def test_default_generation_policy_is_60_seconds_and_15_shots(self) -> None:
+        self.init_project()
+        result = project_tool.validate_state(self.project)
+        self.assertEqual(
+            result["generation_policy"],
+            {
+                "target_duration_seconds": 60,
+                "duration_source": "default_60_seconds",
+                "tolerance_ratio": 0.1,
+                "recommended_shot_units": 15,
+            },
+        )
+
+    def test_project_spec_accepts_valid_duration_contract(self) -> None:
+        self.init_project()
+        version = self.register_spec_with_duration(
+            {
+                "target_duration_seconds": 90,
+                "duration_policy": {
+                    "tolerance_ratio": 0.15,
+                    "dialogue_chars_per_second": [3.5, 4.5],
+                    "inflation_redline_ratio": 0.25,
+                },
+            },
+            "合法时长",
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(version)
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(
+            project_tool.project_target_duration_seconds(self.project, self.state()), 90
+        )
+
+    def test_project_spec_rejects_invalid_duration_fields(self) -> None:
+        for index, (fields, expected) in enumerate((
+            ({"target_duration_seconds": 0}, "target_duration_seconds"),
+            ({"target_duration_seconds": "90秒"}, "target_duration_seconds"),
+            ({"duration_policy": {"tolerance_ratio": 1.5}}, "tolerance_ratio"),
+            ({"duration_policy": {"dialogue_chars_per_second": [4.5, 3.5]}}, "递增"),
+            ({"duration_policy": "宽松"}, "duration_policy"),
+        )):
+            with self.subTest(fields=fields):
+                if index:
+                    self.tearDown()
+                    self.setUp()
+                self.init_project()
+                version = self.register_spec_with_duration(fields, f"非法{index}")
+                code, payload = self.run_cli(
+                    "approve", str(self.project), "project_spec", "--version", str(version)
+                )
+                self.assertEqual(code, 2, payload)
+                self.assertIn("时长契约非法", payload["error"])
+                self.assertIn(expected, payload["error"])
+
+    def test_project_spec_without_duration_uses_default_generation_policy(self) -> None:
+        """项目规格未声明时长时，统一使用 60 秒默认值。"""
+        self.init_project()
+        version = self.register_spec_with_duration({}, "无时长")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(version)
+        )
+        self.assertEqual(code, 0, payload)
+        state = self.state()
+        self.assertEqual(
+            project_tool.project_target_duration_seconds(self.project, state), 60
+        )
+        self.assertEqual(
+            project_tool.project_duration_source(self.project, state), "default_60_seconds"
+        )
+
+    def set_project_spec_duration(self, **duration_fields) -> None:
+        """把时长字段写入已确认的项目规格文件并同步散列。"""
+        state = self.state()
+        record = state["artifacts"]["project_spec"][-1]
+        path = self.project / record["path"]
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.update(duration_fields)
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        record["sha256"] = project_tool.sha256_file(path)
+        record["size_bytes"] = path.stat().st_size
+        (self.project / project_tool.STATE_FILENAME).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def test_generic_semantic_guards_block_invalid_storyboard(self) -> None:
+        event_index = {
+            "schema_version": 2,
+            "episode_scopes": {"E001": {"first_beat_id": "B001", "last_beat_id": "B003"}},
+            "units": [{
+                "events": [
+                    {"ordinal": 1, "beats": [
+                        {"beat_id": "B001", "ordinal": 1, "protected_fact_ids": ["F001"]},
+                        {"beat_id": "B002", "ordinal": 2, "protected_fact_ids": []},
+                    ]},
+                    {"ordinal": 2, "beats": [
+                        {"beat_id": "B003", "ordinal": 1, "protected_fact_ids": []}
+                    ]},
+                ]
+            }],
+        }
+        story_facts = {"facts": [{"fact_id": "F001"}]}
+        plan = {"units": [
+            {"source_beat_refs": ["B002"], "preserved_fact_ids": [], "new_fact_claims": []},
+            {"source_beat_refs": ["B001"], "preserved_fact_ids": [], "new_fact_claims": ["新增关系"], "decision_ids": []},
+        ]}
+        source_errors = project_tool.validate_shot_plan_source_contract(
+            event_index, story_facts, plan, "E001"
+        )
+        cues = {
+            "Q001": {
+                "cue_id": "Q001", "speaker_id": "CHAR-B", "delivery_mode": "screen_video",
+                "text": "被改写的关键句", "source_text": "必须保留的关键句",
+                "preservation_mode": "exact",
+            }
+        }
+        unit = {
+            "duration_seconds": 1,
+            "characters_on_screen": [{"character_id": "CHAR-B"}],
+            "screen_video_characters": [],
+            "dialogue": [{"cue_id": "Q001"}],
+            "state_chain": {"enter": {"characters": {"CHAR-B": {"position": "尚未到场"}}}},
+            "action_flow": {
+                "enter_states": ["state-a"],
+                "steps": [{
+                    "step_id": "A1", "requires": ["missing-state"],
+                    "produces": ["state-b"], "min_duration_seconds": 2,
+                }],
+                "exit_states": ["state-b"],
+            },
+            "time_span_mode": "continuous",
+            "screen_text": {
+                "required_text": "必须准确显示的文字",
+                "render_mode": "video_model",
+            },
+        }
+        character_errors = project_tool.validate_unit_character_modes(unit, cues, 1)
+        feasibility_errors = project_tool.validate_unit_feasibility(unit, cues, (3.5, 4.5), 1)
+        codes = {item["code"] for item in source_errors + character_errors + feasibility_errors}
+        self.assertTrue({
+            "shotplan_source_order_violation",
+            "shotplan_protected_fact_missing",
+            "shotplan_unauthorized_fact_added",
+            "shotplan_nonvisual_character_on_screen",
+            "shotplan_character_presence_conflict",
+            "protected_dialogue_changed",
+            "shotplan_dialogue_capacity_exceeded",
+            "shotplan_action_precondition_missing",
+            "shotplan_action_capacity_exceeded",
+            "shotplan_screen_text_overlay_missing",
+        }.issubset(codes), codes)
+        self.assertEqual(
+            project_tool.computed_boundary_conclusion(source_errors + character_errors + feasibility_errors, []),
+            "blocked",
+        )
+
+    def test_ai_video_review_cannot_pass_without_semantic_coverage(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_语义覆盖测试V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        review_version = self.register_boundary_review(
+            "ai_video_boundary_review:E001",
+            "ai_shot_plan:E001",
+            plan_version,
+            {
+                "finding_id": "BR-AI-E001-001",
+                "category": "source_fidelity",
+                "result": "passed",
+                "location": "E001",
+                "description": "仅检查来源忠实度。",
+                "evidence": "EV-0001",
+                "source_refs": ["EV-0001"],
+            },
+            "passed",
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "ai_video_boundary_review:E001",
+            "--version", str(review_version),
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("boundary_semantic_coverage_missing", payload["error"])
+
+    def test_shot_plan_requires_executable_shot_contract(self) -> None:
+        unit = {
+            "duration_seconds": 2,
+            "dialogue": [],
+            "action_flow": {
+                "enter_states": ["车内"],
+                "steps": [{
+                    "step_id": "A1",
+                    "requires": ["车内"],
+                    "produces": ["已下车"],
+                    "min_duration_seconds": 3,
+                }],
+                "exit_states": ["已下车"],
+            },
+            "time_span_mode": "continuous",
+        }
+        errors = project_tool.validate_unit_feasibility(unit, {}, (3.5, 4.5), 1)
+        self.assertIn(
+            "shotplan_action_capacity_exceeded", {item["code"] for item in errors}
+        )
+
+    def test_shot_plan_rejects_nonvisual_character_in_on_screen_list(self) -> None:
+        unit = {
+            "characters_on_screen": [{"character_id": "C001"}],
+            "screen_video_characters": [],
+            "dialogue": [{"cue_id": "Q001"}],
+            "state_chain": {"enter": {"characters": {}}},
+        }
+        cues = {
+            "Q001": {
+                "cue_id": "Q001",
+                "speaker_id": "C001",
+                "delivery_mode": "phone_audio",
+            }
+        }
+        errors = project_tool.validate_unit_character_modes(unit, cues, 1)
+        self.assertIn(
+            "shotplan_nonvisual_character_on_screen", {item["code"] for item in errors}
+        )
+
+    def test_shot_plan_blocks_failed_source_fidelity_guard(self) -> None:
+        event_index = {
+            "schema_version": 2,
+            "episode_scopes": {"E001": {"first_beat_id": "B001", "last_beat_id": "B002"}},
+            "units": [{
+                "events": [{
+                    "ordinal": 1,
+                    "beats": [
+                        {"beat_id": "B001", "ordinal": 1, "protected_fact_ids": []},
+                        {"beat_id": "B002", "ordinal": 2, "protected_fact_ids": []},
+                    ],
+                }],
+            }],
+        }
+        plan = {
+            "schema_version": 2,
+            "units": [
+                {"source_beat_refs": ["B002"], "preserved_fact_ids": [], "new_fact_claims": []},
+                {"source_beat_refs": ["B001"], "preserved_fact_ids": [], "new_fact_claims": []},
+            ],
+        }
+        errors = project_tool.validate_shot_plan_source_contract(
+            event_index, {"facts": []}, plan, "E001"
+        )
+        self.assertIn(
+            "shotplan_source_order_violation", {item["code"] for item in errors}
+        )
+
+    def test_shot_plan_must_declare_duration_when_spec_declares_it(self) -> None:
+        """核心回归：省略 target_duration_seconds 曾可整段跳过时长校验。"""
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        self.set_project_spec_duration(target_duration_seconds=90)
+        plan = self.shot_plan_payload()
+        plan.pop("target_duration_seconds", None)
+        version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_缺时长分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "ai_shot_plan:E001", "--version", str(version)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("shotplan_target_duration_missing", payload["error"])
+
+    def test_shot_plan_duration_must_match_project_spec(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        self.set_project_spec_duration(target_duration_seconds=90)
+        plan = self.shot_plan_payload()
+        plan["target_duration_seconds"] = 30
+        plan["duration_deviation_note"] = "自报值与项目规格不一致，偏差说明不能替代绑定"
+        version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_错时长分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "ai_shot_plan:E001", "--version", str(version)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("shotplan_target_duration_mismatch", payload["error"])
+
+    def test_shot_plan_without_spec_duration_uses_default_60_seconds(self) -> None:
+        """项目规格未声明时长时，分镜仍必须绑定默认 60 秒目标。"""
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        plan["target_duration_seconds"] = 30
+        version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_默认时长分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "ai_shot_plan:E001", "--version", str(version)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("shotplan_target_duration_mismatch", payload["error"])
+
+    def test_custom_tolerance_ratio_tightens_duration_deviation(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        total = sum(unit["duration_seconds"] for unit in plan["units"])
+        # 取一个偏差约 12% 的目标：默认 10% 会拦截，显式 5% 同样应拦截。
+        target = max(1, round(total / 0.88))
+        self.set_project_spec_duration(
+            target_duration_seconds=target,
+            duration_policy={"tolerance_ratio": 0.05},
+        )
+        plan["target_duration_seconds"] = target
+        plan.pop("duration_deviation_note", None)
+        version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_严容差分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "ai_shot_plan:E001", "--version", str(version)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("shotplan_duration_deviation", payload["error"])
+
+    def test_script_dialogue_budget_warns_without_blocking(self) -> None:
+        script = self.root / "超载剧本.md"
+        script.write_text(GOOD_SCRIPT, encoding="utf-8")
+        # 目标时长设得远低于净对白推算秒数，必然触发超载预警。
+        result = project_tool.validate_script_file(script, target_duration_seconds=3)
+        codes = {item["code"] for item in result["warnings"]}
+        self.assertIn("episode_dialogue_budget_over", codes)
+        self.assertTrue(result["valid"])  # 只预警不阻断
+        self.assertNotIn(
+            "episode_dialogue_budget_over",
+            {item["code"] for item in result["errors"]},
+        )
+        estimate = result["duration_estimate"]
+        self.assertGreater(estimate["spoken_char_count"], 0)
+        self.assertIn("非配音实测", estimate["estimate_basis"])
+
+    def test_script_duration_estimate_absent_without_target(self) -> None:
+        """不传目标时长时输出与改动前逐字段一致，且不产生任何时长预警。"""
+        script = self.root / "常规剧本.md"
+        script.write_text(GOOD_SCRIPT, encoding="utf-8")
+        baseline = project_tool.validate_script_file(script)
+        self.assertNotIn("duration_estimate", baseline)
+        self.assertEqual(
+            sorted(baseline["scenes"][0]), ["heading", "line", "scene_id"]
+        )
+        codes = {item["code"] for item in baseline["warnings"]}
+        self.assertNotIn("episode_dialogue_budget_over", codes)
+        self.assertNotIn("scene_duration_unbalanced", codes)
+        # 目标时长充裕时同样不应报警（防假阳性）
+        relaxed = project_tool.validate_script_file(script, target_duration_seconds=600)
+        relaxed_codes = {item["code"] for item in relaxed["warnings"]}
+        self.assertNotIn("episode_dialogue_budget_over", relaxed_codes)
+        self.assertNotIn("scene_duration_unbalanced", relaxed_codes)
 
     def test_init_defaults_to_direct_self_owned_import(self) -> None:
         code, payload = self.run_cli(
@@ -3520,6 +3950,150 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(
             tracking["by_stage"]["source_analysis"]["machine_time_seconds"], 130.0
         )
+
+    def test_init_expected_episodes_hint_enables_batch_before_project_spec(self) -> None:
+        code, payload = self.run_cli(
+            "init", str(self.project), "--name", "提示项目",
+            "--source", str(self.source), "--expected-episodes", "6",
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["expected_episodes_hint"], 6)
+        self.assertEqual(self.state()["expected_episodes_hint"], 6)
+
+        code, payload = self.run_cli("define-batch", str(self.project), "B01", "E001", "E002")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["episode_scope_source"], "init_hint")
+        self.assertEqual(
+            {item["code"] for item in payload["warnings"]},
+            {"episode_scope_from_init_hint"},
+        )
+
+        code, payload = self.run_cli("define-batch", str(self.project), "B02", "E007")
+        self.assertEqual(code, 2, payload)
+        self.assertIn("init 登记的目标集数提示", payload["error"])
+        self.assertTrue(project_tool.validate_state(self.project)["valid"])
+
+    def test_confirmed_project_spec_overrides_init_hint(self) -> None:
+        code, payload = self.run_cli(
+            "init", str(self.project), "--name", "提示项目",
+            "--source", str(self.source), "--expected-episodes", "6",
+        )
+        self.assertEqual(code, 0, payload)
+        self.register_and_approve(
+            "project_spec",
+            "01_原著解析/项目规格V1.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_id": self.state()["project_id"],
+                    "expected_episodes": 4,
+                    "target_runtime": "按项目实读复核",
+                    "handoff_target": "可直接进入导演拆镜",
+                },
+                ensure_ascii=False,
+            ),
+        )
+        # project_spec 是交付权威：它比 init 提示更小时，超出部分必须被拒绝。
+        code, payload = self.run_cli("define-batch", str(self.project), "B01", "E005")
+        self.assertEqual(code, 2, payload)
+        self.assertIn("项目规格", payload["error"])
+
+        code, payload = self.run_cli("define-batch", str(self.project), "B01", "E004")
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["episode_scope_source"], "project_spec")
+        self.assertNotIn("warnings", payload)
+
+    def test_init_without_expected_episodes_still_requires_project_spec(self) -> None:
+        self.init_project()
+        self.assertIsNone(self.state()["expected_episodes_hint"])
+        code, payload = self.run_cli("define-batch", str(self.project), "B01", "E001")
+        self.assertEqual(code, 2, payload)
+        self.assertIn("无法读取目标集数", payload["error"])
+
+    def test_validate_project_rejects_invalid_expected_episodes_hint(self) -> None:
+        self.init_project()
+        state = self.state()
+        state["expected_episodes_hint"] = 0
+        (self.project / project_tool.STATE_FILENAME).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        result = project_tool.validate_state(self.project)
+        self.assertFalse(result["valid"])
+        self.assertIn(
+            "expected_episodes_hint_invalid",
+            {item["code"] for item in result["errors"]},
+        )
+
+    def test_prose_shot_language_warns_without_blocking(self) -> None:
+        for index, prose_line in enumerate(
+            (
+                "△【特写】雨水砸在屋檐上，镜头推近，35mm，时长3秒。",
+                "△镜头缓缓推近阿宁的脸，特写她攥紧钥匙的手。",
+                "△大特写：钥匙上的划痕。",
+                "△俯拍全景，院中青石板上的拖痕清晰可见。",
+                "△切黑。3秒后淡入。",
+                "△手持跟拍，长焦压缩背景。",
+                "△给一个特写，钥匙边缘的缺口。",
+                "△画面停留约3秒后叠化到下一场。",
+                "△以特写呈现她颤抖的手指。",
+                "△主观镜头：阿宁看向墙上的字。",
+            )
+        ):
+            with self.subTest(prose_line=prose_line):
+                script = self.root / f"prose-{index}.md"
+                script.write_text(
+                    GOOD_SCRIPT.replace(
+                        "△阿宁攥着钥匙退到门槛外。",
+                        f"△阿宁攥着钥匙退到门槛外。\n{prose_line}",
+                    ),
+                    encoding="utf-8",
+                )
+                result = project_tool.validate_script_file(script)
+                # 语义判断留给人工：只预警，不阻断已确认流程。
+                self.assertTrue(result["valid"], result)
+                self.assertIn(
+                    "shot_language_suspected",
+                    {item["code"] for item in result["warnings"]},
+                )
+
+    def test_prose_shot_language_does_not_warn_on_clean_script_or_dialogue(self) -> None:
+        clean = self.root / "clean.md"
+        clean.write_text(GOOD_SCRIPT, encoding="utf-8")
+        result = project_tool.validate_script_file(clean)
+        self.assertNotIn(
+            "shot_language_suspected", {item["code"] for item in result["warnings"]}
+        )
+
+        # 角色可以在台词里提到镜头词；台词原文不得被当作镜头语言。
+        in_dialogue = self.root / "in-dialogue.md"
+        in_dialogue.write_text(
+            GOOD_SCRIPT.replace(
+                "管家：把钥匙交出来。",
+                "管家：把钥匙交出来。给我个特写我都认得出来。",
+            ),
+            encoding="utf-8",
+        )
+        result = project_tool.validate_script_file(in_dialogue)
+        self.assertTrue(result["valid"], result)
+        self.assertNotIn(
+            "shot_language_suspected", {item["code"] for item in result["warnings"]}
+        )
+
+        for narrative_line in (
+            "△远景处的城墙在雨里只剩一道轮廓。",
+            "△阿宁盯着那两个字看了很久，手心攥紧。",
+            "△管家绕出柜台，走过来低头看钥匙，脸色一变。",
+        ):
+            with self.subTest(narrative_line=narrative_line):
+                self.assertEqual(project_tool.prose_shot_language_hits(narrative_line), [])
+
+    def test_tabular_director_field_still_blocks_not_just_warns(self) -> None:
+        script = self.root / "tabular.md"
+        script.write_text(GOOD_SCRIPT + "\n景别：特写\n", encoding="utf-8")
+        result = project_tool.validate_script_file(script)
+        self.assertFalse(result["valid"])
+        codes = {item["code"] for item in result["errors"]}
+        self.assertIn("director_field_forbidden", codes)
 
     def test_set_stage_without_time_fields_keeps_summary_clean(self) -> None:
         self.init_project()

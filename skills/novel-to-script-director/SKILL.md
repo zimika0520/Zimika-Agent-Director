@@ -25,7 +25,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 - `ai_video` 目标的最终交付是“分集AI视频执行包”及其上游依据：全剧规划、改编决策台账、分集分场剧本、四类提取表、连续性台账、四类锚点、分集执行计划与质检报告。`human_team` 目标交付“制作就绪剧本包”，至少包括：全剧规划、改编决策台账、分集分场剧本、角色提取表、场景提取表、道具服装台账、台词声音表、连续性台账、质检报告和交付清单。
 - 分集剧本必须写清集标题、场次、地点、日夜、内外景、人物、有效道具、连续可见动作、走位、反应、对白、必要的 VO/OS/声音信息、场尾变化和集尾钩子。
 - 制作团队拿到后可以拆角色、场景、道具、台词并进入导演拆镜，不需要重新补剧情、人物动机或动作因果。
-- 制作就绪文学剧本不混入镜号、景别、机位、运镜、焦段、单镜时长或生成提示词。镜头语言只存在于独立的 AI 视频执行层制品中；`delivery_target` 含 `ai_video` 时执行层默认生成，`human_team` 时仅在用户要求时生成。
+- 制作就绪文学剧本不混入镜号、景别、机位、运镜、焦段、单镜时长或生成提示词。镜头语言只存在于独立的 AI 视频执行层制品中；`delivery_target` 含 `ai_video` 时执行层默认生成，`human_team` 时仅在用户要求时生成。`validate-script` 对“景别：特写”这类填表式混入报 `director_field_forbidden` 错误并阻断；对“镜头推近”“俯拍全景”“切黑后淡入”这类散文式镜头语言报 `shot_language_suspected` 警告，须人工确认改写为可见动作，台词原文与场次标题不参与该判断。
 - AI 视频执行层可以输出锚点、文字导演分镜、短生成单元和结构化视频提示词，但固定 `generate_images: false`、`submit_video_requests: false`；不调用生图、视频、配音或剪辑接口，不嵌入 Base64/data URI，也不把参考素材需求当作已生成资产。
 - 执行层按集解锁：某集剧本通过对应 `episode_boundary_review` 且该集依赖的提取数据与锚点就绪后，即可交付该集执行包，不必等全剧完稿。
 - 图片、故事板图片、角色/场景生图和影音成品不属于本技能。用户提供的既有参考素材只能登记路径、URL或资产 ID，不能由本技能生成。
@@ -81,6 +81,8 @@ python3 <技能目录>/scripts/project_tool.py init \
 
 必须至少提供一份 `--source`，可重复提供。脚本复制原文件并记录散列，不修改原文件。用户粘贴内容时先保存为来源文件再注册。
 
+`--expected-episodes` 记入状态的 `expected_episodes_hint`，只用于在 `project_spec` 确认前先定义批次（此时 `define-batch` 返回 `episode_scope_source: init_hint` 并附警告）。它不是交付权威：`project_spec` 一经确认即覆盖提示，全部交付门禁与校验仍以已确认 `project_spec` 的 `expected_episodes` 为准。未提供该参数时，必须先确认 `project_spec` 才能定义批次。
+
 完整小说、部分章节、TXT、Markdown、Word 或其他可读取文档都直接登记。`self_owned` 与 `storyline` 不询问官网审核；`published_novel` 再询问用户是否审核，默认关闭。用户主动开启时必须提供 HTTP/HTTPS 页面，审核结论只展示，不阻塞原著解析。`--garble-threshold` 仅为旧命令兼容保留，当前版本不触发正文检查。
 
 直接读取 TXT/Markdown。PDF、DOCX 或扫描件使用对应文档读取能力，标准化文本写入 `01_原著解析/`，保留页码、章节或段落定位；无法可靠提取时停止并说明。
@@ -89,7 +91,7 @@ python3 <技能目录>/scripts/project_tool.py init \
 
 ### 1. 项目规格、原著解析与事件索引
 
-- 锁定用途、受众平台、`delivery_target`、流程模式、总集数、单集目标时长、改编尺度、`rights_mode`（用户声明即可，不外部核实）、必须保留、允许调整和禁止改变项。
+- 锁定用途、受众平台、`delivery_target`、流程模式、总集数、单集目标时长、改编尺度、`rights_mode`（用户声明即可，不外部核实）、必须保留、允许调整和禁止改变项。用户未明确指定时，按单集约 60 秒、上下浮动 10%、约 15 个分镜单元规划；项目规格可用 `target_duration_seconds`（正整数秒）和 `duration_policy` 显式覆盖。
 - 将“可直接进入导演拆镜”写入交付要求，不把“可商用”当成没有验收条件的形容词。
 - 建立稳定来源 ID、人物、关系、地点、时间线、事件、因果和异常；事实、推断、未知和改编新增分栏。
 - 逐个可定位原著单元生成全局 `SourceEventIndex`：允许整本使用 `chapter_summary`，仍须逐单元覆盖 `SourceCorpus` 并维护 `upgrade_pending`。当前批次不反复改写全局索引，而是用 `batch_source_scope:B01` 确定所需原著单元，再用 `batch_source_detail:B01` 对这些单元建立完整 `unit_detail`；缺单元、仍为粗粒度或绑定旧版本时不能确认批次大纲。
@@ -225,3 +227,8 @@ python3 <技能目录>/scripts/project_tool.py set-stage \
 - 基于事实回答；样本经验与行业标准分开。没有调研到或不知道的事项直接说明不清楚。
 - 用户提及 Toonflow、Huobao 或要求解释本插件参考依据时，读取 [reference-project-findings.md](references/reference-project-findings.md)；不得从参考项目引入分镜、图片、视频或固定经验参数。
 - 用户要求 Seedance 兼容时只生成独立文字执行层；任何 API Key、Base64 图片/视频数据或实际生成请求都不得写入项目制品、工具输出或会话历史。
+
+
+## 通用来源忠实与分镜门禁
+
+生成和审核不得针对某一本小说硬编码人物、事件或台词。每个项目必须从自己的原著生成事件 beat、来源边界、受保护事实和台词锁；分镜必须引用这些项目内 ID。工具按来源顺序、事实覆盖、人物出现方式、对白时长、动作状态链和屏幕文字后期方案实际校验，不接受 `true` 或 `passed` 作为事实依据。
