@@ -1,4 +1,12 @@
-# 制作就绪剧本制品契约
+#
+
+## 长文本分片与人物视觉锚点补充契约
+
+- 小说总字数不得触发单独流程；章节/事件为主边界，Token和复杂度只作容量上限。
+- 并发工作者只能写独立临时分片，不能同时修改 `project_state.json`、全局时间线、连续性台账或同一人物锚点。
+- `plan-source-partitions` 与 `merge-source-analysis-shards` 均不修改项目状态；合并后的规范文件由单一写入者串行登记。
+- 人物锚点v2是DOCX、HTML和视频提示词共同视觉权威；同一角色不得在不同文件中重新生成外形。
+- 逐集交付绑定当前 `episode_script:E001`、对应边界报告、角色提取表、人物锚点v2、`ai_shot_plan:E001`及对应边界报告。纯排版重导出不改变剧情制品版本。 制作就绪剧本制品契约
 
 ## 原著语料库 `SourceCorpus`
 
@@ -86,7 +94,7 @@
 规范 JSON 顶层包含 `schema_version`、`project_id`、精确 `generated_from` 和 `decisions`。每条决策至少包含：
 
 - 稳定 `decision_id`。
-- `operation`：保留、压缩、合并、调序、删除、桥接，以及心理外化、对白重写、场景衔接、时间压缩、动作补全、群众/环境反应、原著事件戏剧化展开或需要用户确认的主要改动类型。
+- `operation`：保留、压缩、合并、调序、删除、桥接，以及心理外化、场景衔接、时间压缩、动作补全、群众/环境反应、原著事件戏剧化展开或需要用户确认的主要改动类型。对白不属于改编操作，直接引用原著语料。
 - 对应 `source_unit_ids` 与 `target_episode_ids`。
 - `rationale`、`protected_facts`、人物弧影响、因果/连续性影响和替代方案。
 - `boundary_class`：原著直接保留用 `source_based`，只增加表达用 `auto_allowed`，改变故事事实用 `user_confirmation_required`。
@@ -211,7 +219,7 @@ v0.8 轻量 `backbone` 使用 `contract_version: 2`，每集只强制合法 `epi
 
 ## 台词声音表 `DialogueCueSheet`
 
-每条记录包含：`cue_id`、集号、场号、角色、类型（对白/VO/OS/环境声/关键音效）、原文、语境、情绪或表演目的。规范 JSON 是校验权威。它用于配音和声音部门提取，不包含配音成品或镜头时长。
+规范 JSON 顶层使用 `contract_version: 2`。每条口述记录包含：`cue_id`、集号、场号、canonical `speaker_id`、类型、`delivery_mode`、原著文本 `text`、`source_unit_id`、`source_locator`、`source_beat_refs`、语境与表演目的。台词表必须直接依赖 `source_event_index`。`text` 必须逐字存在于绑定原著单元；模型不得生成 `source_text`、改写理由、语义分数、人物语气判断、改写审批或对白新增事实字段。环境声与关键音效不受原著逐字匹配约束。
 
 ## 连续性台账 `ContinuityLedger`
 
@@ -327,9 +335,24 @@ v0.8 默认 `FinalPackage` 由全局规划制品、全部当前批次 ZIP/清单
 
 ## 通用语义追踪与制作可执行性（schema v2）
 
-- `source_event_index` 的 schema v2 必须为事件和 beat 提供唯一顺序，并通过 `episode_scopes` 声明每集允许使用的首尾 beat。
+- `source_event_index` 的 schema v2 必须为事件和 beat 提供唯一顺序，并通过 `episode_scopes` 声明每集按原著顺序声明无重复的 `allowed_beat_ids`，并使首尾 beat 与该列表一致。
 - AI 分镜单元必须使用 `source_beat_refs`，顺序不得倒退或越过当前集来源边界；引用 beat 的 `protected_fact_ids` 必须进入 `preserved_fact_ids`。
 - 新增事实必须写入 `new_fact_claims` 并绑定有效改编决策，不能用布尔值自报“忠实”。
 - 台词声音表用 `delivery_mode` 区分 `on_screen`、`off_screen`、`voice_over`、`phone_audio`、`screen_video`；非现场人物不得进入 `characters_on_screen`。
 - 每个分镜单元必须提供 `action_flow`、`time_span_mode` 和完整 `shot_language`。动作前置状态、最短时长、对白字数和屏幕文字后期方案由工具实际校验。
 - 边界报告的最终结论由目标制品的机器校验结果计算；报告自填 `passed` 不能覆盖阻断错误。
+
+### Canonical 身份、空间、声音和尾帧绑定
+
+- 事件索引 schema v2 必须登记 canonical entities，事件参与者、台词 speaker、分镜人物和状态链共用同一 ID。
+- 分镜人物必须绑定 `space_zones` 中的 `space_id`；设备视频人物不得混入现场人物空间。
+- 声音使用结构化 `sound_events`，设备声音限制为当前单元并与电话/视频 cue 显式绑定。
+- `tail_frame_chain` 不得只是标签：同集绑定紧邻上一单元，跨集首镜绑定上一集已确认尾单元。
+
+### 内容来源闭环
+
+- 原著 beat 的 `content_atoms` 是剧情文字的机器权威来源；source atom 逐字匹配原著，决策 atom 逐字匹配已接受决策的 `authorized_content`。
+- 分镜、Seedance执行层和AI视频执行层只消费已验证 atoms，不能重新独立创作剧情文字。
+- `required_fact_ids` 从分集允许 beat 自动计算，`fact_realizations` 必须绑定实际存在的对白、动作、状态变化或屏显载体。
+- `story_time` 和 `temporal_constraints` 是机器时间轴权威；连续镜头不能跨日期，非闪回不能倒退，明确相对时间不能脱离原著约束出现。
+- HTML故事板只渲染由 `content_bindings` 编译出的剧情字段，不再直接信任旧自由文本。

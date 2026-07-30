@@ -359,7 +359,7 @@ class ProjectToolTests(unittest.TestCase):
         )
         normalized_source = self.write_project_file(
             "01_原著解析/标准化正文_第001章.txt",
-            "阿宁守住母亲留下的钥匙。\n",
+            "阿宁守住母亲留下的钥匙。\n管家：把钥匙交出来。\n阿宁：这是母亲留给我的。\n",
         )
         source_corpus = {
             "schema_version": 1,
@@ -383,9 +383,16 @@ class ProjectToolTests(unittest.TestCase):
             ("project_spec@1",),
         )
         source_event_index = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "content_contract_version": 1,
             "project_id": project_id,
             "generated_from": [{"artifact_key": "source_corpus", "version": 1}],
+            "entities": [
+                {"entity_id": "C001", "entity_type": "character", "canonical_name": "阿宁", "aliases": []},
+                {"entity_id": "C002", "entity_type": "character", "canonical_name": "管家", "aliases": []},
+            ],
+            "fact_definitions": [],
+            "temporal_constraints": [],
             "units": [
                 {
                     "source_unit_id": "SRC-CH001",
@@ -394,17 +401,61 @@ class ProjectToolTests(unittest.TestCase):
                     "events": [
                         {
                             "event_id": "EV-0001",
+                            "ordinal": 1,
                             "summary": "阿宁拒绝交出母亲留下的钥匙",
-                            "participants": ["阿宁", "管家"],
+                            "participants": ["C001", "C002"],
                             "cause": "管家索要钥匙",
                             "action": "阿宁把钥匙藏到袖后并拒绝",
                             "outcome": "管家堵住院门",
                             "state_change": "钥匙仍由阿宁持有，冲突升级",
                             "source_refs": ["SRC-CH001"],
+                            "beats": [
+                                {
+                                    "beat_id": "B001",
+                                    "ordinal": 1,
+                                    "source_refs": ["SRC-CH001", "第1章"],
+                                    "protected_fact_ids": [],
+                                    "required_fact_ids": [],
+                                    "content_atoms": [
+                                        {
+                                            "atom_id": "SA-B001-001",
+                                            "kind": "action",
+                                            "text": "阿宁守住母亲留下的钥匙。",
+                                            "source_unit_id": "SRC-CH001",
+                                            "source_locator": "第1章",
+                                            "source_excerpt": "阿宁守住母亲留下的钥匙。",
+                                        },
+                                        {
+                                            "atom_id": "SA-B001-002",
+                                            "kind": "dialogue_context",
+                                            "text": "管家：把钥匙交出来。",
+                                            "source_unit_id": "SRC-CH001",
+                                            "source_locator": "第1章",
+                                            "source_excerpt": "管家：把钥匙交出来。",
+                                        },
+                                        {
+                                            "atom_id": "SA-B001-003",
+                                            "kind": "dialogue_context",
+                                            "text": "阿宁：这是母亲留给我的。",
+                                            "source_unit_id": "SRC-CH001",
+                                            "source_locator": "第1章",
+                                            "source_excerpt": "阿宁：这是母亲留给我的。",
+                                        },
+                                    ],
+                                }
+                            ],
                         }
                     ],
                 }
             ],
+            "episode_scopes": {
+                f"E{number:03d}": {
+                    "allowed_beat_ids": ["B001"],
+                    "first_beat_id": "B001",
+                    "last_beat_id": "B001",
+                }
+                for number in range(1, expected_episodes + 1)
+            },
         }
         self.register_and_approve(
             "source_event_index",
@@ -723,13 +774,19 @@ class ProjectToolTests(unittest.TestCase):
                 "appearances": [{"episode_id": "E001", "scene_id": "1-1", "holder": "C001", "state": "完好"}],
             }],
         }
+        cue_generated_from = [
+            {"artifact_key": "source_corpus", "version": 1},
+            {"artifact_key": "source_event_index", "version": 1},
+            *generated_from,
+        ]
         cue_payload = {
             "schema_version": 1,
+            "contract_version": 2,
             "project_id": project_id,
-            "generated_from": generated_from,
+            "generated_from": cue_generated_from,
             "records": [
-                {"cue_id": "Q001", "episode_id": "E001", "scene_id": "1-1", "speaker_id": "C002", "speaker_name": "管家", "type": "dialogue", "text": "把钥匙交出来。"},
-                {"cue_id": "Q002", "episode_id": "E001", "scene_id": "1-1", "speaker_id": "C001", "speaker_name": "阿宁", "type": "dialogue", "text": "这是母亲留给我的。"},
+                {"cue_id": "Q001", "episode_id": "E001", "scene_id": "1-1", "speaker_id": "C002", "speaker_name": "管家", "type": "dialogue", "delivery_mode": "on_screen", "text": "把钥匙交出来。", "source_unit_id": "SRC-CH001", "source_locator": "第1章", "source_beat_refs": ["B001"]},
+                {"cue_id": "Q002", "episode_id": "E001", "scene_id": "1-1", "speaker_id": "C001", "speaker_name": "阿宁", "type": "dialogue", "delivery_mode": "on_screen", "text": "这是母亲留给我的。", "source_unit_id": "SRC-CH001", "source_locator": "第1章", "source_beat_refs": ["B001"]},
             ],
         }
         versions: dict[str, int] = {}
@@ -739,11 +796,20 @@ class ProjectToolTests(unittest.TestCase):
             ("prop_costume_ledger", "08_连续性与质检/道具服装台账V1.json", item_payload),
             ("dialogue_cue_sheet", "08_连续性与质检/台词声音表V1.json", cue_payload),
         ):
+            dependencies = (
+                "source_corpus@1",
+                "source_event_index@1",
+                "episode_script:E001@1",
+                f"episode_boundary_review:E001@{episode_boundary_version}",
+            ) if key == "dialogue_cue_sheet" else (
+                "episode_script:E001@1",
+                f"episode_boundary_review:E001@{episode_boundary_version}",
+            )
             versions[key] = self.register_and_approve(
                 key,
                 relative,
                 json.dumps(payload, ensure_ascii=False),
-                ("episode_script:E001@1", f"episode_boundary_review:E001@{episode_boundary_version}"),
+                dependencies,
             )
 
         versions["continuity_ledger"] = self.register_and_approve(
@@ -966,11 +1032,16 @@ class ProjectToolTests(unittest.TestCase):
             source_path = self.project / source_record["path"]
             payload = json.loads(source_path.read_text(encoding="utf-8"))
             scoped_key = f"{artifact_kind}:{batch_id}"
+            scoped_dependencies = (
+                "source_corpus@1",
+                "source_event_index@1",
+                *episode_dependencies,
+            ) if artifact_kind == "dialogue_cue_sheet" else episode_dependencies
             scoped_versions[artifact_kind] = self.register_and_approve(
                 scoped_key,
                 f"08_连续性与质检/{batch_id}_{artifact_kind}_V1.json",
                 json.dumps(payload, ensure_ascii=False),
-                episode_dependencies,
+                scoped_dependencies,
             )
 
         quality_bindings = [
@@ -1236,6 +1307,7 @@ class ProjectToolTests(unittest.TestCase):
             )
         return {
             "schema_version": 1,
+            "content_contract_version": 1,
             "project_id": project_id,
             "episode_id": "E001",
             "generated_from": generated_from,
@@ -1278,9 +1350,14 @@ class ProjectToolTests(unittest.TestCase):
                     "scene_id": "1-1",
                     "duration_seconds": 8,
                     "source_refs": ["EV-0001"],
+                    "source_beat_refs": ["B001"],
+                    "preserved_fact_ids": [],
+                    "new_fact_claims": [],
                     "decision_ids": ["AD-0001"],
-                    "start_state": "阿宁持钥匙退到院门外",
-                    "end_state": "管家当面索要钥匙",
+                    "start_state": "管家：把钥匙交出来。",
+                    "end_state": "管家：把钥匙交出来。",
+                    "content_atoms": [{"atom_id": "CA-SD-U001", "origin": "source", "source_atom_id": "SA-B001-002", "text": "管家：把钥匙交出来。"}],
+                    "content_bindings": {"start_state": ["CA-SD-U001"], "end_state": ["CA-SD-U001"], "prompt_text": ["CA-SD-U001"]},
                     "generation_mode": "text_to_video",
                     "reference_asset_ids": [],
                     "continuity": {
@@ -1292,12 +1369,13 @@ class ProjectToolTests(unittest.TestCase):
                         {
                             "shot": 1,
                             "camera": "固定中景",
-                            "visual_action": "阿宁攥着钥匙退到门槛外，管家伸手阻拦。",
+                            "visual_action": "管家：把钥匙交出来。",
+                            "content_atom_refs": ["CA-SD-U001"],
                             "dialogue_cue_ids": ["Q001"],
                             "sound": ["院门外环境声"],
                         }
                     ],
-                    "prompt_text": "固定中景。阿宁攥着钥匙退到门槛外，管家伸手说：\"把钥匙交出来。\"",
+                    "prompt_text": "管家：把钥匙交出来。",
                 },
                 {
                     "unit_id": "SD2-E001-U002",
@@ -1305,9 +1383,14 @@ class ProjectToolTests(unittest.TestCase):
                     "scene_id": "1-1",
                     "duration_seconds": 8,
                     "source_refs": ["EV-0001"],
+                    "source_beat_refs": ["B001"],
+                    "preserved_fact_ids": [],
+                    "new_fact_claims": [],
                     "decision_ids": ["AD-0001", "AD-AUTO-001"],
-                    "start_state": "管家当面索要钥匙",
-                    "end_state": "阿宁仍持钥匙，管家堵住院门",
+                    "start_state": "阿宁：这是母亲留给我的。",
+                    "end_state": "阿宁：这是母亲留给我的。",
+                    "content_atoms": [{"atom_id": "CA-SD-U002", "origin": "source", "source_atom_id": "SA-B001-003", "text": "阿宁：这是母亲留给我的。"}],
+                    "content_bindings": {"start_state": ["CA-SD-U002"], "end_state": ["CA-SD-U002"], "prompt_text": ["CA-SD-U002"]},
                     "generation_mode": "text_to_video",
                     "reference_asset_ids": [],
                     "continuity": {
@@ -1319,15 +1402,30 @@ class ProjectToolTests(unittest.TestCase):
                         {
                             "shot": 1,
                             "camera": "缓慢推进",
-                            "visual_action": "阿宁把钥匙藏到袖后，管家堵住院门。",
+                            "visual_action": "阿宁：这是母亲留给我的。",
+                            "content_atom_refs": ["CA-SD-U002"],
                             "dialogue_cue_ids": ["Q002"],
                             "sound": ["官差叩门声在场外响起"],
                         }
                     ],
-                    "prompt_text": "缓慢推进。阿宁把钥匙藏到袖后说：\"这是母亲留给我的。\"管家堵住院门，场外响起叩门声。",
+                    "prompt_text": "阿宁：这是母亲留给我的。",
                 },
             ],
         }
+
+
+    def test_seedance_prompt_cannot_add_unbound_story_content(self) -> None:
+        beats = {"B001": {"content_atoms": {"SA001": {"atom_id": "SA001", "text": "孩子看向屏幕。"}}}}
+        unit = {
+            "source_beat_refs": ["B001"],
+            "start_state": "孩子夸赞父亲。", "end_state": "母子约定保密。",
+            "content_atoms": [{"atom_id": "CA001", "origin": "source", "source_atom_id": "SA001", "text": "孩子看向屏幕。"}],
+            "content_bindings": {"start_state": ["CA001"], "end_state": ["CA001"], "prompt_text": ["CA001"]},
+            "shots": [{"shot": 1, "visual_action": "母子约定保密。", "content_atom_refs": ["CA001"]}],
+            "prompt_text": "母子约定保密。",
+        }
+        errors = project_tool.validate_seedance_unit_content_contract(unit, beats, {}, 1, True)
+        self.assertIn("seedance_prompt_content_unproven", {item["code"] for item in errors})
 
     def test_seedance_text_plan_requires_boundary_and_validates_full_coverage(self) -> None:
         self.create_ready_project()
@@ -2556,6 +2654,33 @@ class ProjectToolTests(unittest.TestCase):
         summary_result = project_tool.validate_state(self.project)
         self.assertTrue(summary_result["valid"], summary_result)
 
+
+    def test_source_event_index_rejects_unknown_character_id(self) -> None:
+        self.create_ready_project()
+
+        def add_unknown_character(payload: dict) -> None:
+            payload["units"][0]["events"][0]["participants"].append("CHAR-UNKNOWN")
+
+        self.update_artifact_json("source_event_index", add_unknown_character)
+        result = project_tool.validate_state(self.project)
+        self.assertIn(
+            "event_participant_unknown",
+            {item["code"] for item in result["errors"]},
+        )
+
+    def test_source_event_index_schema_v2_requires_canonical_entities(self) -> None:
+        self.create_ready_project()
+
+        def remove_entities(payload: dict) -> None:
+            payload.pop("entities", None)
+
+        self.update_artifact_json("source_event_index", remove_entities)
+        result = project_tool.validate_state(self.project)
+        self.assertIn(
+            "event_entities_missing",
+            {item["code"] for item in result["errors"]},
+        )
+
     def test_source_event_index_requires_exact_upgrade_pending_tracking(self) -> None:
         self.create_ready_project()
 
@@ -2801,14 +2926,37 @@ class ProjectToolTests(unittest.TestCase):
             "style_anchor", "10_AI视频执行包/风格锚点V1.md", "# 风格锚点\n半写实国漫。\n",
             ("adaptation_bible@1",),
         )
-        self.register_and_approve(
-            "character_anchor:C001", "10_AI视频执行包/角色锚点_C001V1.md", "# 阿宁\n黑发少女，青布衫。\n",
-            ("character_roster@1",),
-        )
-        self.register_and_approve(
-            "character_anchor:C002", "10_AI视频执行包/角色锚点_C002V1.md", "# 管家\n灰袍老者。\n",
-            ("character_roster@1",),
-        )
+        for character_id, name, appearance in (
+            ("C001", "阿宁", "黑发少女，青布衫，身材轻盈，五官清秀"),
+            ("C002", "管家", "灰发老者，灰袍，身形微弯，面部轮廓清晰"),
+        ):
+            anchor = {
+                "contract_version": 2,
+                "character_id": character_id,
+                "display_name": name,
+                "role_kind": "stable",
+                "source_appearance": {"source_refs": ["SRC-CH001"], "confirmed_details": [appearance]},
+                "visual_design": {
+                    "auto_completed": True,
+                    "face": appearance,
+                    "hair": appearance,
+                    "body": appearance,
+                    "wardrobe": appearance,
+                    "distinctive_features": [],
+                },
+                "turnaround_prompt": {
+                    "layout": "左侧约三分之一为完整正面头肩肖像；右侧依次并排展示全身正面、侧面和背面",
+                    "consistency_rules": ["四个视图五官、发型、身材比例和服装完全一致"],
+                    "full_text": f"{appearance}。左侧为完整正面头肩肖像，右侧依次并排展示全身正面、侧面和背面。",
+                },
+                "forbidden_story_implications": ["不得暗示原著未公开身份"],
+            }
+            self.register_and_approve(
+                f"character_anchor:{character_id}",
+                f"10_AI视频执行包/角色锚点_{character_id}V1.json",
+                json.dumps(anchor, ensure_ascii=False),
+                ("character_roster@1",),
+            )
         self.register_and_approve(
             "scene_anchor:L001", "10_AI视频执行包/场景锚点_L001V1.md", "# 院门\n灰砖院门，日景。\n",
             ("scene_catalog@1",),
@@ -2869,11 +3017,13 @@ class ProjectToolTests(unittest.TestCase):
             "C002": {"position": "堵住院门", "facing": "面向阿宁", "wardrobe": "灰袍", "props": [], "injuries": "无", "knowledge": "不知官差将至"},
         }}
         characters = [
-            {"character_id": "C001", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C001", "version": 1}, "appearance_lock": "黑发少女，青布衫", "wardrobe": "青布衫"},
-            {"character_id": "C002", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C002", "version": 1}, "appearance_lock": "灰袍老者", "wardrobe": "灰袍"},
+            {"character_id": "C001", "space_id": "courtyard-gate", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C001", "version": 1}, "appearance_lock": "黑发少女，青布衫", "wardrobe": "青布衫"},
+            {"character_id": "C002", "space_id": "courtyard-gate", "presence": "on_screen", "anchor_ref": {"artifact_key": "character_anchor:C002", "version": 1}, "appearance_lock": "灰袍老者", "wardrobe": "灰袍"},
         ]
         return {
             "schema_version": 1,
+            "content_contract_version": 1,
+            "shot_language_contract_version": 2,
             "project_id": self.state()["project_id"],
             "episode_id": "E001",
             "generated_from": [
@@ -2896,18 +3046,27 @@ class ProjectToolTests(unittest.TestCase):
                     "unit_id": "SP-E001-U001",
                     "sequence": 1,
                     "scene_id": "1-1",
-                    "narrative_task": "管家当面索要钥匙",
-                    "shot_language": {"shot_size": "中景", "camera_angle": "平视", "composition": "双人对峙", "camera_movement": "固定", "visual_focus": "钥匙", "transition": "直接切入"},
+                    "narrative_task": "管家：把钥匙交出来。",
+                    "shot_language": {"shot_size": {"start": "medium_shot", "end": "medium_shot"}, "camera_angle": "平视", "composition": "双人对峙", "camera_movement": {"type": "static", "subject": "", "description": "固定中景，阿宁与管家在院门两侧对峙。"}, "visual_focus": "钥匙", "transition": "直接切入"},
                     "production_feasibility": {"dialogue_fits_duration": True, "action_fits_duration": True, "physical_preconditions_complete": True, "time_span_supported": True, "screen_text_post_plan_complete": True},
                     "duration_seconds": 3,
-                    "action_start": "阿宁攥钥匙退到门槛外",
-                    "action_end": "管家伸手拦住去路",
+                    "action_start": "管家：把钥匙交出来。",
+                    "action_end": "管家：把钥匙交出来。",
                     "source_refs": ["EV-0001"],
+                    "source_beat_refs": ["B001"],
+                    "preserved_fact_ids": [],
+                    "new_fact_claims": [],
                     "decision_ids": ["AD-0001"],
+                    "content_atoms": [{"atom_id": "CA-U001-001", "origin": "source", "source_atom_id": "SA-B001-002", "text": "管家：把钥匙交出来。"}],
+                    "content_bindings": {"narrative_task": ["CA-U001-001"], "action_start": ["CA-U001-001"], "action_end": ["CA-U001-001"]},
+                    "fact_realizations": [],
                     "characters_on_screen": characters,
                     "scene_anchor_ref": {"artifact_key": "scene_anchor:L001", "version": 1},
                     "dialogue": [{"cue_id": "Q001", "lip_sync": True}],
-                    "sound": ["院外蝉鸣"],
+                    "space_zones": [{"space_id": "courtyard-gate", "kind": "exterior"}],
+                    "sound_events": [{"sound_id": "S001", "description": "院外蝉鸣", "source_type": "ambient", "space_id": "courtyard-gate", "scope": "unit"}],
+                    "action_flow": {"enter_states": ["阿宁在门槛外", "管家在院门内"], "steps": [{"step_id": "A001", "content_atom_refs": ["CA-U001-001"], "requires": ["阿宁在门槛外", "管家在院门内"], "produces": ["管家伸手拦路"], "min_duration_seconds": 1}], "exit_states": ["管家伸手拦路"]},
+                    "time_span_mode": "continuous",
                     "negative_constraints": ["不出现官差", "无字幕"],
                     "generation_strategy": "text_to_video",
                     "state_chain": {"chain_id": "CHAIN-E001-S01", "enter": state_a, "exit": state_b},
@@ -2916,20 +3075,30 @@ class ProjectToolTests(unittest.TestCase):
                     "unit_id": "SP-E001-U002",
                     "sequence": 2,
                     "scene_id": "1-1",
-                    "narrative_task": "阿宁拒交钥匙，冲突升级",
-                    "shot_language": {"shot_size": "近景", "camera_angle": "平视", "composition": "阿宁前景管家后景", "camera_movement": "轻推", "visual_focus": "藏钥匙的手", "transition": "动作衔接"},
+                    "narrative_task": "阿宁：这是母亲留给我的。",
+                    "shot_language": {"shot_size": {"start": "medium_close_up", "end": "close_up"}, "camera_angle": "平视", "composition": "阿宁前景管家后景", "camera_movement": {"type": "push_in", "subject": "C001", "description": "从阿宁上半身缓慢推近至藏钥匙的手。"}, "visual_focus": "藏钥匙的手", "transition": "动作衔接"},
                     "production_feasibility": {"dialogue_fits_duration": True, "action_fits_duration": True, "physical_preconditions_complete": True, "time_span_supported": True, "screen_text_post_plan_complete": True},
                     "duration_seconds": 4,
-                    "action_start": "阿宁把钥匙藏到袖后",
-                    "action_end": "管家堵住院门",
+                    "action_start": "阿宁：这是母亲留给我的。",
+                    "action_end": "阿宁：这是母亲留给我的。",
                     "source_refs": ["EV-0001"],
+                    "source_beat_refs": ["B001"],
+                    "preserved_fact_ids": [],
+                    "new_fact_claims": [],
                     "decision_ids": ["AD-0001"],
+                    "content_atoms": [{"atom_id": "CA-U002-001", "origin": "source", "source_atom_id": "SA-B001-003", "text": "阿宁：这是母亲留给我的。"}],
+                    "content_bindings": {"narrative_task": ["CA-U002-001"], "action_start": ["CA-U002-001"], "action_end": ["CA-U002-001"]},
+                    "fact_realizations": [],
                     "characters_on_screen": characters,
                     "scene_anchor_ref": {"artifact_key": "scene_anchor:L001", "version": 1},
                     "dialogue": [{"cue_id": "Q002", "lip_sync": True}],
-                    "sound": ["场外叩门声"],
+                    "space_zones": [{"space_id": "courtyard-gate", "kind": "exterior"}],
+                    "sound_events": [{"sound_id": "S002", "description": "场外叩门声", "source_type": "sfx", "space_id": "courtyard-gate", "scope": "unit"}],
+                    "action_flow": {"enter_states": ["管家伸手拦路"], "steps": [{"step_id": "A002", "content_atom_refs": ["CA-U002-001"], "requires": ["管家伸手拦路"], "produces": ["阿宁藏好钥匙", "管家堵住院门"], "min_duration_seconds": 2}], "exit_states": ["阿宁藏好钥匙", "管家堵住院门"]},
+                    "time_span_mode": "continuous",
                     "negative_constraints": ["不出现官差", "无字幕"],
                     "generation_strategy": "tail_frame_chain",
+                    "continuation_from_unit_id": "SP-E001-U001",
                     "state_chain": {"chain_id": "CHAIN-E001-S01", "enter": state_b, "exit": state_b},
                 },
             ],
@@ -2994,7 +3163,13 @@ class ProjectToolTests(unittest.TestCase):
         self.register_ai_layer_prerequisites()
         plan = self.shot_plan_payload()
         plan["hard_blocks"] = ["不得展示钥匙对应的箱柜内部"]
-        plan["units"][0]["prompt_text"] = "固定中景:管家伸手拦住攥钥匙的阿宁。"
+        plan["units"][0]["prompt_text"] = (
+            "动作起点：管家：把钥匙交出来。动作终点：管家：把钥匙交出来。"
+            "现场人物：黑发少女，青布衫；灰袍老者。"
+            "镜头运动：固定中景，阿宁与管家在院门两侧对峙。"
+            "声音：院外蝉鸣。对白：管家：把钥匙交出来。"
+            "禁止：不出现官差；无字幕。"
+        )
         plan_version = self.register_artifact(
             "ai_shot_plan:E001",
             "10_AI视频执行包/E001_分镜计划V1.json",
@@ -3007,13 +3182,108 @@ class ProjectToolTests(unittest.TestCase):
         page = output.read_text(encoding="utf-8")
         for expected in (
             "SP-E001-U001",
-            "管家当面索要钥匙",
+            "管家：把钥匙交出来。",
             "节奏时间轴",
             "不得展示钥匙对应的箱柜内部",
             "通用提示词",
             "character_anchor:C001",
+            "景别：",
+            "中景",
+            "镜头运动：",
+            "固定中景，阿宁与管家在院门两侧对峙。",
         ):
             self.assertIn(expected, page, expected)
+        self.assertNotIn("。。", page)
+
+    def test_prompt_executability_rejects_generic_template(self) -> None:
+        unit = {
+            "prompt_text": "半写实都市国漫；阿宁藏好钥匙；无字幕。",
+            "action_start": "1-1场上一状态完成",
+            "action_end": "阿宁藏好钥匙",
+            "characters_on_screen": [
+                {"character_id": "C001", "appearance_lock": "黑发少女，青布衫"}
+            ],
+            "sound_events": [{"description": "院外蝉鸣"}],
+            "shot_language": {
+                "camera_movement": {"description": "从阿宁上半身推近至藏钥匙的手。"}
+            },
+            "space_zones": [{"space_id": "courtyard-gate", "description": "院门外"}],
+            "negative_constraints": ["不出现官差", "无字幕"],
+            "dialogue": [{"cue_id": "Q001", "lip_sync": True}],
+        }
+        cues = {"Q001": {"speaker_name": "管家", "text": "把钥匙交出来。"}}
+        codes = {
+            item["code"]
+            for item in project_tool.validate_unit_prompt_executability(unit, cues, 1)
+        }
+        self.assertTrue(
+            {
+                "shotplan_prompt_placeholder_state",
+                "shotplan_prompt_appearance_missing",
+                "shotplan_prompt_sound_missing",
+                "shotplan_prompt_dialogue_missing",
+                "shotplan_prompt_camera_missing",
+                "shotplan_prompt_environment_missing",
+                "shotplan_prompt_negative_missing",
+            }.issubset(codes)
+        )
+
+    def test_prompt_executability_accepts_complete_prompt(self) -> None:
+        prompt = (
+            "场景：院门外。现场人物：黑发少女，青布衫。"
+            "动作起点：阿宁站在门槛外。动作终点：阿宁藏好钥匙。"
+            "镜头运动：从阿宁上半身推近至藏钥匙的手。"
+            "声音：院外蝉鸣。对白：管家说‘把钥匙交出来。’"
+            "禁止：不出现官差；无字幕。"
+        )
+        unit = {
+            "prompt_text": prompt,
+            "action_start": "阿宁站在门槛外",
+            "action_end": "阿宁藏好钥匙",
+            "characters_on_screen": [
+                {"character_id": "C001", "appearance_lock": "黑发少女，青布衫"}
+            ],
+            "sound_events": [{"description": "院外蝉鸣"}],
+            "shot_language": {
+                "camera_movement": {"description": "从阿宁上半身推近至藏钥匙的手。"}
+            },
+            "space_zones": [{"space_id": "courtyard-gate", "description": "院门外"}],
+            "negative_constraints": ["不出现官差", "无字幕"],
+            "dialogue": [{"cue_id": "Q001", "lip_sync": True}],
+        }
+        cues = {"Q001": {"speaker_name": "管家", "text": "把钥匙交出来。"}}
+        self.assertEqual(
+            project_tool.validate_unit_prompt_executability(unit, cues, 1), []
+        )
+
+    def test_render_episode_delivery_outputs_exact_pair(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        self.approve_shot_plan_with_review(plan_version)
+        code, payload = self.run_cli(
+            "render-episode-delivery", str(self.project), "E001"
+        )
+        self.assertEqual(code, 0, payload)
+        output_dir = self.project / "09_定稿交付/分集交付/E001"
+        self.assertEqual(
+            sorted(path.name for path in output_dir.iterdir()),
+            ["E001_剧本.docx", "E001_故事板.html"],
+        )
+        with zipfile.ZipFile(output_dir / "E001_剧本.docx") as archive:
+            document_xml = archive.read("word/document.xml").decode("utf-8")
+        self.assertIn("测试项目", document_xml)
+        self.assertIn("人物三视图描述：", document_xml)
+        self.assertIn("阿宁", document_xml)
+        html_text = (output_dir / "E001_故事板.html").read_text(encoding="utf-8")
+        self.assertIn("景别：", html_text)
+        self.assertIn("镜头运动：", html_text)
 
     def test_render_storyboard_resolves_scoped_dialogue_cue_sheet_dependency(self) -> None:
         import render_storyboard
@@ -3107,6 +3377,28 @@ class ProjectToolTests(unittest.TestCase):
         self.assertIn("<b>管家</b>:把钥匙交出来。", page)
         self.assertNotIn("<b>?</b>:Q001", page)
 
+
+    def test_ai_execution_prompt_cannot_add_unbound_story_content(self) -> None:
+        shot_units = {
+            "SP-E001-U001": {
+                "content_atoms": [{"atom_id": "CA001", "text": "温喻驾车离开。"}],
+                "characters_on_screen": [{"character_id": "C001"}],
+            }
+        }
+        task = {
+            "source_unit_ids": ["SP-E001-U001"],
+            "content_atom_refs": ["CA001"],
+            "prompt": {
+                "style_ref": "STYLE-1", "subject": [{"character_id": "C001"}],
+                "action": "温喻抬起手机说让他来。", "camera": "固定中景",
+                "environment": "使用绑定场景锚点", "negative": ["禁止新增剧情"],
+            },
+            "prompt_compiler_version": 1,
+            "prompt_text": "伪造提示词",
+        }
+        errors = project_tool.validate_ai_execution_content_contract(task, shot_units, 1)
+        self.assertIn("aiexec_prompt_content_unproven", {item["code"] for item in errors})
+
     def test_ai_shot_plan_gate_and_execution_plan_full_pass(self) -> None:
         self.create_ready_project()
         self.register_ai_layer_prerequisites()
@@ -3136,6 +3428,7 @@ class ProjectToolTests(unittest.TestCase):
                     "task_id": "VT-E001-T001",
                     "sequence": 1,
                     "source_unit_ids": ["SP-E001-U001", "SP-E001-U002"],
+                    "content_atom_refs": ["CA-U001-001", "CA-U002-001"],
                     "duration_seconds": 7,
                     "generation_mode": "text_to_video",
                     "reference_asset_ids": [],
@@ -3146,19 +3439,23 @@ class ProjectToolTests(unittest.TestCase):
                             {"character_id": "C001", "appearance_lock": "黑发少女，青布衫"},
                             {"character_id": "C002", "appearance_lock": "灰袍老者"},
                         ],
-                        "action": "管家索要钥匙，阿宁藏钥匙拒绝，管家堵门",
+                        "action": "管家：把钥匙交出来。；阿宁：这是母亲留给我的。",
                         "camera": "固定中景切缓慢推进",
-                        "environment": "灰砖院门，日景",
+                        "environment": "使用绑定场景锚点",
                         "dialogue": [{"cue_id": "Q001"}, {"cue_id": "Q002"}],
                         "sound": ["蝉鸣", "叩门声"],
                         "negative": ["不出现官差", "无字幕"],
                     },
-                    "prompt_text": "固定中景：管家说\"把钥匙交出来。\"阿宁把钥匙藏到袖后：\"这是母亲留给我的。\"管家堵住院门。",
+                    "prompt_compiler_version": 1,
+                    "prompt_text": "",
                     "chain": {"chain_id": "CHAIN-E001-S01", "input_state": "STATE-S01-START", "output_state": "STATE-S01-END"},
                 },
             ],
             "total_duration_seconds": 7,
         }
+        execution["tasks"][0]["prompt_text"] = project_tool.compile_ai_execution_prompt_text(
+            execution["tasks"][0]["prompt"]
+        )
         self.register_and_approve(
             "ai_video_execution_plan:E001:seedance-2-0",
             "10_AI视频执行包/E001_执行计划V1.json",
@@ -3453,10 +3750,123 @@ class ProjectToolTests(unittest.TestCase):
             json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+
+
+    def test_source_content_atom_must_match_original_excerpt(self) -> None:
+        self.project.mkdir(parents=True, exist_ok=True)
+        corpus = {"source_units": [{"source_unit_id": "SRC-CH001", "content_path": "source.txt"}]}
+        (self.project / "source.txt").write_text("温喻驾车离开。", encoding="utf-8")
+        event_index = {"units": [{"events": [{"ordinal": 1, "beats": [{
+            "beat_id": "B001", "ordinal": 1,
+            "content_atoms": [{
+                "atom_id": "SA001", "kind": "action", "text": "温喻打开导航。",
+                "source_unit_id": "SRC-CH001", "source_locator": "第1章",
+                "source_excerpt": "温喻驾车离开。",
+            }],
+        }]}]}]}
+        errors = project_tool.validate_source_content_contract(self.project, corpus, event_index)
+        self.assertIn("event_content_atom_text_mismatch", {item["code"] for item in errors})
+
+    def test_source_fact_definition_must_cover_required_fact(self) -> None:
+        event_index = {
+            "fact_definitions": [],
+            "units": [{"events": [{"ordinal": 1, "beats": [{
+                "beat_id": "B001", "ordinal": 1, "required_fact_ids": ["F-AGE"]
+            }]}]}],
+        }
+        errors = project_tool.validate_fact_definition_contract(event_index)
+        self.assertIn("story_required_fact_missing", {item["code"] for item in errors})
+
+    def test_content_contract_rejects_unbound_action_text(self) -> None:
+        beats = {
+            "B001": {
+                "content_atoms": {
+                    "SA001": {"atom_id": "SA001", "text": "温喻驾车离开。"}
+                }
+            }
+        }
+        unit = {
+            "source_beat_refs": ["B001"],
+            "narrative_task": "温喻打开导航。",
+            "action_start": "温喻打开导航。",
+            "action_end": "母亲发来聚餐消息。",
+            "content_atoms": [
+                {"atom_id": "CA001", "origin": "source", "source_atom_id": "SA001", "text": "温喻驾车离开。"}
+            ],
+            "content_bindings": {
+                "narrative_task": ["CA001"],
+                "action_start": ["CA001"],
+                "action_end": ["CA001"],
+            },
+            "action_flow": {"steps": []},
+        }
+        errors = project_tool.validate_unit_content_contract(unit, beats, {}, 1, True)
+        self.assertIn("shotplan_unproven_content", {item["code"] for item in errors})
+
+    def test_required_fact_coverage_rejects_omitted_beat_fact(self) -> None:
+        event_index = {
+            "episode_scopes": {"E001": {"allowed_beat_ids": ["B001", "B002"]}},
+            "fact_definitions": [
+                {"fact_id": "F-AGE", "fact_type": "age", "source_beat_ids": ["B002"]}
+            ],
+            "units": [{"events": [{"ordinal": 1, "beats": [
+                {"beat_id": "B001", "ordinal": 1, "required_fact_ids": []},
+                {"beat_id": "B002", "ordinal": 2, "required_fact_ids": ["F-AGE"]},
+            ]}]}],
+        }
+        plan = {"units": [{"source_beat_refs": ["B001"], "dialogue": [], "fact_realizations": []}]}
+        errors = project_tool.validate_required_fact_coverage(event_index, plan, "E001")
+        self.assertIn("shotplan_required_fact_coverage_missing", {item["code"] for item in errors})
+
+    def test_required_fact_coverage_rejects_missing_carrier(self) -> None:
+        event_index = {
+            "episode_scopes": {"E001": {"allowed_beat_ids": ["B001"]}},
+            "fact_definitions": [
+                {"fact_id": "F-ID", "fact_type": "identity", "source_beat_ids": ["B001"]}
+            ],
+            "units": [{"events": [{"ordinal": 1, "beats": [
+                {"beat_id": "B001", "ordinal": 1, "required_fact_ids": ["F-ID"]},
+            ]}]}],
+        }
+        plan = {"units": [{
+            "source_beat_refs": ["B001"],
+            "dialogue": [],
+            "fact_realizations": [{"fact_id": "F-ID", "carrier": "dialogue_cue", "carrier_id": "Q-NOT-EXISTS"}],
+        }]}
+        errors = project_tool.validate_required_fact_coverage(event_index, plan, "E001")
+        codes = {item["code"] for item in errors}
+        self.assertIn("shotplan_fact_carrier_missing", codes)
+        self.assertIn("shotplan_required_fact_coverage_missing", codes)
+
+    def test_source_timeline_rejects_wrong_relative_day_offset(self) -> None:
+        event_index = {
+            "units": [{"events": [{"ordinal": 1, "beats": [
+                {"beat_id": "B001", "ordinal": 1, "story_time": {"day_index": 0, "day_part": "morning"}},
+                {"beat_id": "B002", "ordinal": 2, "story_time": {"day_index": 1, "day_part": "afternoon"}},
+            ]}]}],
+            "temporal_constraints": [{
+                "constraint_id": "TC001", "anchor_beat_id": "B001", "target_beat_id": "B002",
+                "source_unit_id": "SRC-CH001", "expression_text": "后天下午",
+            }],
+        }
+        errors = project_tool.validate_source_timeline_contract(
+            event_index, {"SRC-CH001": "比赛安排在后天下午。"}
+        )
+        self.assertIn("event_temporal_offset_mismatch", {item["code"] for item in errors})
+
+    def test_shot_plan_timeline_rejects_continuous_multi_day_unit(self) -> None:
+        event_index = {"units": [{"events": [{"ordinal": 1, "beats": [
+            {"beat_id": "B001", "ordinal": 1, "story_time": {"day_index": 0, "day_part": "night"}},
+            {"beat_id": "B002", "ordinal": 2, "story_time": {"day_index": 4, "day_part": "afternoon"}},
+        ]}]}], "temporal_constraints": []}
+        plan = {"units": [{"source_beat_refs": ["B001", "B002"], "time_span_mode": "continuous"}]}
+        errors = project_tool.validate_shot_plan_timeline_contract(event_index, plan, {})
+        self.assertIn("shotplan_continuous_time_jump", {item["code"] for item in errors})
+
     def test_generic_semantic_guards_block_invalid_storyboard(self) -> None:
         event_index = {
             "schema_version": 2,
-            "episode_scopes": {"E001": {"first_beat_id": "B001", "last_beat_id": "B003"}},
+            "episode_scopes": {"E001": {"allowed_beat_ids": ["B001", "B002", "B003"], "first_beat_id": "B001", "last_beat_id": "B003"}},
             "units": [{
                 "events": [
                     {"ordinal": 1, "beats": [
@@ -3480,8 +3890,7 @@ class ProjectToolTests(unittest.TestCase):
         cues = {
             "Q001": {
                 "cue_id": "Q001", "speaker_id": "CHAR-B", "delivery_mode": "screen_video",
-                "text": "被改写的关键句", "source_text": "必须保留的关键句",
-                "preservation_mode": "exact",
+                "text": "必须保留的关键句",
             }
         }
         unit = {
@@ -3513,7 +3922,6 @@ class ProjectToolTests(unittest.TestCase):
             "shotplan_unauthorized_fact_added",
             "shotplan_nonvisual_character_on_screen",
             "shotplan_character_presence_conflict",
-            "protected_dialogue_changed",
             "shotplan_dialogue_capacity_exceeded",
             "shotplan_action_precondition_missing",
             "shotplan_action_capacity_exceeded",
@@ -3522,6 +3930,202 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(
             project_tool.computed_boundary_conclusion(source_errors + character_errors + feasibility_errors, []),
             "blocked",
+        )
+
+    def dialogue_source_contract_fixture(self) -> tuple[dict, dict, dict]:
+        self.create_ready_project()
+        state = self.state()
+        corpus_record = state["artifacts"]["source_corpus"][-1]
+        corpus_path = self.project / corpus_record["path"]
+        corpus_payload = json.loads(corpus_path.read_text(encoding="utf-8"))
+        source_unit = corpus_payload["source_units"][0]
+        source_path = self.project / source_unit["content_path"]
+        source_path.write_text(
+            "管家：把钥匙交出来。\n阿宁：这是母亲留给我的。\n",
+            encoding="utf-8",
+        )
+        source_unit["content_sha256"] = project_tool.sha256_file(source_path)
+        corpus_path.write_text(
+            json.dumps(corpus_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        corpus_record["sha256"] = project_tool.sha256_file(corpus_path)
+        corpus_record["size_bytes"] = corpus_path.stat().st_size
+        (self.project / project_tool.STATE_FILENAME).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        event_record = state["artifacts"]["source_event_index"][-1]
+        event_path = self.project / event_record["path"]
+        event_payload = json.loads(event_path.read_text(encoding="utf-8"))
+        event_payload["schema_version"] = 2
+        event_payload["episode_scopes"] = {
+            "E001": {
+                "allowed_beat_ids": ["B001"],
+                "first_beat_id": "B001",
+                "last_beat_id": "B001",
+            }
+        }
+        event = event_payload["units"][0]["events"][0]
+        event["ordinal"] = 1
+        event["beats"] = [
+            {
+                "beat_id": "B001",
+                "ordinal": 1,
+                "source_refs": ["第1章"],
+                "protected_fact_ids": [],
+            },
+            {
+                "beat_id": "B002",
+                "ordinal": 2,
+                "source_refs": ["第2章"],
+                "protected_fact_ids": [],
+            },
+        ]
+        event_path.write_text(
+            json.dumps(event_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        event_record["sha256"] = project_tool.sha256_file(event_path)
+        event_record["size_bytes"] = event_path.stat().st_size
+        (self.project / project_tool.STATE_FILENAME).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        generated_from = [
+            {"artifact_key": "source_corpus", "version": 1},
+            {"artifact_key": "source_event_index", "version": 1},
+            {"artifact_key": "episode_script:E001", "version": 1},
+            {"artifact_key": "episode_boundary_review:E001", "version": 1},
+        ]
+        record = {
+            "artifact_type": "dialogue_cue_sheet",
+            "depends_on": generated_from,
+        }
+        payload = {
+            "schema_version": 1,
+            "contract_version": 2,
+            "project_id": state["project_id"],
+            "generated_from": generated_from,
+            "records": [
+                {
+                    "cue_id": "Q001",
+                    "episode_id": "E001",
+                    "scene_id": "1-1",
+                    "speaker_id": "C002",
+                    "speaker_name": "管家",
+                    "type": "dialogue",
+                    "delivery_mode": "on_screen",
+                    "text": "把钥匙交出来。",
+                    "source_unit_id": "SRC-CH001",
+                    "source_locator": "第1章",
+                    "source_beat_refs": ["B001"],
+                }
+            ],
+        }
+        return state, record, payload
+
+    def test_dialogue_rewrite_operation_and_boundary_category_are_removed(self) -> None:
+        self.assertNotIn(
+            "dialogue_rewrite", project_tool.ALLOWED_ADAPTATION_OPERATIONS
+        )
+        self.assertNotIn(
+            "dialogue_rewrite", project_tool.AUTO_ALLOWED_BOUNDARY_CATEGORIES
+        )
+
+    def test_dialogue_cue_sheet_accepts_exact_source_without_rewrite_metadata(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet", record, payload
+        )
+        self.assertEqual(errors, [])
+
+
+
+
+    def test_dialogue_cue_sheet_rejects_final_voice_placeholder(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        corpus_record = state["artifacts"]["source_corpus"][-1]
+        corpus_payload = json.loads((self.project / corpus_record["path"]).read_text(encoding="utf-8"))
+        source_path = self.project / corpus_payload["source_units"][0]["content_path"]
+        source_path.write_text(source_path.read_text(encoding="utf-8") + "20XX年六月十七日。\n", encoding="utf-8")
+        payload["records"][0]["text"] = "20XX年六月十七日。"
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet:E001", record, payload
+        )
+        self.assertIn(
+            "dialogue_placeholder_forbidden", {item["code"] for item in errors}
+        )
+
+    def test_dialogue_cue_sheet_rejects_unknown_canonical_speaker(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        payload["records"][0]["speaker_id"] = "C999"
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet:E001", record, payload
+        )
+        self.assertIn(
+            "dialogue_speaker_unknown", {item["code"] for item in errors}
+        )
+
+    def test_shot_plan_rejects_unknown_canonical_character(self) -> None:
+        unit = {
+            "characters_on_screen": [{"character_id": "C999"}],
+            "screen_video_characters": [],
+            "dialogue": [],
+            "state_chain": {"enter": {"characters": {"C999": {"position": "门外"}}}},
+        }
+        errors = project_tool.validate_unit_character_registry(unit, {"C001", "C002"}, 1)
+        self.assertIn(
+            "shotplan_character_unknown", {item["code"] for item in errors}
+        )
+
+    def test_dialogue_cue_sheet_rejects_source_beat_outside_episode_scope(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        payload["records"][0]["source_beat_refs"] = ["B002"]
+        payload["records"][0]["source_locator"] = "第2章"
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet:E001", record, payload
+        )
+        self.assertIn(
+            "dialogue_source_boundary_exceeded", {item["code"] for item in errors}
+        )
+
+    def test_dialogue_cue_sheet_rejects_fake_source_locator(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        payload["records"][0]["source_locator"] = "第99章"
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet:E001", record, payload
+        )
+        self.assertIn(
+            "dialogue_source_locator_mismatch", {item["code"] for item in errors}
+        )
+
+    def test_dialogue_cue_sheet_rejects_rewritten_text(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        payload["records"][0]["text"] = "把钥匙交给我。"
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet", record, payload
+        )
+        self.assertIn(
+            "dialogue_not_exact_source", {item["code"] for item in errors}
+        )
+
+    def test_dialogue_cue_sheet_rejects_legacy_rewrite_fields(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        payload["records"][0].update(
+            {
+                "source_text": "把钥匙交出来。",
+                "preservation_mode": "exact",
+                "adaptation_note": "保持人物语气",
+                "new_fact_claims": [],
+            }
+        )
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet", record, payload
+        )
+        self.assertIn(
+            "dialogue_generated_metadata_forbidden",
+            {item["code"] for item in errors},
         )
 
     def test_ai_video_review_cannot_pass_without_semantic_coverage(self) -> None:
@@ -3555,6 +4159,70 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(code, 2, payload)
         self.assertIn("boundary_semantic_coverage_missing", payload["error"])
+
+
+
+    def test_first_unit_tail_frame_chain_requires_previous_episode_tail(self) -> None:
+        units = [
+            {
+                "unit_id": "SP-E002-U001",
+                "sequence": 1,
+                "generation_strategy": "tail_frame_chain",
+            }
+        ]
+        errors = project_tool.validate_tail_frame_contract(units, {}, "E002")
+        self.assertIn(
+            "shotplan_cross_episode_tail_missing", {item["code"] for item in errors}
+        )
+
+    def test_same_episode_tail_frame_chain_requires_previous_unit_binding(self) -> None:
+        units = [
+            {"unit_id": "SP-E001-U001", "sequence": 1, "generation_strategy": "text_to_video"},
+            {"unit_id": "SP-E001-U002", "sequence": 2, "generation_strategy": "tail_frame_chain"},
+        ]
+        errors = project_tool.validate_tail_frame_contract(units, {}, "E001")
+        self.assertIn(
+            "shotplan_tail_previous_unit_missing", {item["code"] for item in errors}
+        )
+
+    def test_shot_plan_requires_explicit_character_space_partition(self) -> None:
+        unit = {
+            "space_zones": [
+                {"space_id": "car-a", "kind": "vehicle"},
+                {"space_id": "car-b", "kind": "vehicle"},
+            ],
+            "characters_on_screen": [
+                {"character_id": "C001", "space_id": "car-a"},
+                {"character_id": "C002"},
+            ],
+            "sound_events": [],
+        }
+        errors = project_tool.validate_unit_spatial_audio_contract(unit, {}, 1, True)
+        self.assertIn(
+            "shotplan_character_space_missing", {item["code"] for item in errors}
+        )
+
+    def test_phone_video_audio_must_be_scoped_to_current_unit(self) -> None:
+        unit = {
+            "space_zones": [{"space_id": "living-room", "kind": "room"}],
+            "characters_on_screen": [],
+            "sound_events": [
+                {
+                    "sound_id": "S001",
+                    "description": "手机视频里的说话声",
+                    "source_type": "device",
+                    "space_id": "living-room",
+                    "device_id": "phone-1",
+                    "scope": "scene",
+                }
+            ],
+            "dialogue": [{"cue_id": "Q001", "audio_event_id": "S001"}],
+        }
+        cues = {"Q001": {"delivery_mode": "phone_video"}}
+        errors = project_tool.validate_unit_spatial_audio_contract(unit, cues, 1, True)
+        self.assertIn(
+            "shotplan_device_audio_scope_invalid", {item["code"] for item in errors}
+        )
 
     def test_shot_plan_requires_executable_shot_contract(self) -> None:
         unit = {
@@ -3599,7 +4267,7 @@ class ProjectToolTests(unittest.TestCase):
     def test_shot_plan_blocks_failed_source_fidelity_guard(self) -> None:
         event_index = {
             "schema_version": 2,
-            "episode_scopes": {"E001": {"first_beat_id": "B001", "last_beat_id": "B002"}},
+            "episode_scopes": {"E001": {"allowed_beat_ids": ["B001", "B002"], "first_beat_id": "B001", "last_beat_id": "B002"}},
             "units": [{
                 "events": [{
                     "ordinal": 1,
@@ -3622,6 +4290,62 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertIn(
             "shotplan_source_order_violation", {item["code"] for item in errors}
+        )
+
+
+    def test_shot_plan_rejects_beat_not_explicitly_allowed_for_episode(self) -> None:
+        event_index = {
+            "schema_version": 2,
+            "episode_scopes": {
+                "E001": {
+                    "allowed_beat_ids": ["B001", "B003"],
+                    "first_beat_id": "B001",
+                    "last_beat_id": "B003",
+                }
+            },
+            "units": [{
+                "events": [{
+                    "ordinal": 1,
+                    "beats": [
+                        {"beat_id": "B001", "ordinal": 1, "source_refs": ["第1章"], "protected_fact_ids": []},
+                        {"beat_id": "B002", "ordinal": 2, "source_refs": ["第1章"], "protected_fact_ids": []},
+                        {"beat_id": "B003", "ordinal": 3, "source_refs": ["第1章"], "protected_fact_ids": []},
+                    ],
+                }],
+            }],
+        }
+        plan = {
+            "schema_version": 2,
+            "units": [
+                {"source_beat_refs": ["B002"], "preserved_fact_ids": [], "new_fact_claims": []},
+            ],
+        }
+        errors = project_tool.validate_shot_plan_source_contract(
+            event_index, {"facts": []}, plan, "E001"
+        )
+        self.assertIn(
+            "shotplan_source_boundary_exceeded", {item["code"] for item in errors}
+        )
+
+    def test_dialogue_cue_sheet_rejects_source_order_regression(self) -> None:
+        state, record, payload = self.dialogue_source_contract_fixture()
+        event_record = state["artifacts"]["source_event_index"][-1]
+        event_path = self.project / event_record["path"]
+        event_payload = json.loads(event_path.read_text(encoding="utf-8"))
+        event_payload["episode_scopes"]["E001"]["allowed_beat_ids"] = ["B001", "B002"]
+        event_payload["episode_scopes"]["E001"]["last_beat_id"] = "B002"
+        event_path.write_text(json.dumps(event_payload, ensure_ascii=False), encoding="utf-8")
+        event_record["sha256"] = project_tool.sha256_file(event_path)
+        event_record["size_bytes"] = event_path.stat().st_size
+        payload["records"] = [
+            {**payload["records"][0], "cue_id": "Q002", "source_beat_refs": ["B002"], "source_locator": "第2章"},
+            {**payload["records"][0], "cue_id": "Q001", "source_beat_refs": ["B001"], "source_locator": "第1章"},
+        ]
+        errors = project_tool.validate_dialogue_cue_sheet_payload(
+            self.project, state, "dialogue_cue_sheet:E001", record, payload
+        )
+        self.assertIn(
+            "dialogue_source_order_violation", {item["code"] for item in errors}
         )
 
     def test_shot_plan_must_declare_duration_when_spec_declares_it(self) -> None:
@@ -4144,6 +4868,151 @@ class ProjectToolTests(unittest.TestCase):
             )
             self.assertEqual(code, 2, (value, payload))
             self.assertIn("有限数字", payload["error"])
+
+
+    def character_anchor_v2(self) -> dict:
+        return {
+            "contract_version": 2,
+            "character_id": "C001",
+            "display_name": "温喻",
+            "role_kind": "stable",
+            "source_appearance": {
+                "source_refs": ["SRC-CH001:P003"],
+                "confirmed_details": ["二十多岁", "黑色长发"],
+            },
+            "visual_design": {
+                "auto_completed": True,
+                "face": "鹅蛋脸，眉形清晰，五官比例自然",
+                "hair": "黑色长发，发尾自然垂落",
+                "body": "成年女性，身材修长，比例自然",
+                "wardrobe": "现代都市通勤服，低饱和配色",
+                "distinctive_features": [],
+            },
+            "turnaround_prompt": {
+                "layout": "左侧约三分之一为完整正面头肩肖像；右侧依次为全身正面、侧面和背面",
+                "consistency_rules": ["四个视图五官、发型、身材比例和服装完全一致"],
+                "full_text": "温喻完整三视图描述",
+            },
+            "forbidden_story_implications": ["不得暗示未公开身份"],
+        }
+
+    def test_character_anchor_v2_accepts_source_and_visual_design_separation(self) -> None:
+        payload = self.character_anchor_v2()
+        self.assertEqual(project_tool.validate_character_anchor_payload(payload), [])
+
+    def test_character_anchor_v2_rejects_missing_turnaround_layout(self) -> None:
+        payload = self.character_anchor_v2()
+        payload["turnaround_prompt"]["layout"] = ""
+        codes = {
+            item["code"]
+            for item in project_tool.validate_character_anchor_payload(payload)
+        }
+        self.assertIn("character_anchor_turnaround_layout_missing", codes)
+
+    def test_character_anchor_v2_rejects_plot_claim_in_visual_design(self) -> None:
+        payload = self.character_anchor_v2()
+        payload["visual_design"]["distinctive_features"] = [
+            "家族继承人徽记，证明真实身份"
+        ]
+        codes = {
+            item["code"]
+            for item in project_tool.validate_character_anchor_payload(payload)
+        }
+        self.assertIn("character_anchor_visual_story_claim", codes)
+
+    def partition_fixture_paths(self) -> tuple[Path, Path, Path]:
+        corpus = self.write_json(
+            "01_原著解析/source_corpus_partition.json",
+            {
+                "schema_version": 1,
+                "source_units": [
+                    {"source_unit_id": "SU001", "ordinal": 1, "estimated_tokens": 2000, "complexity_points": 5},
+                    {"source_unit_id": "SU002", "ordinal": 2, "estimated_tokens": 2000, "complexity_points": 5},
+                    {"source_unit_id": "SU003", "ordinal": 3, "estimated_tokens": 3000, "complexity_points": 7},
+                ],
+            },
+        )
+        policy = self.write_json(
+            "01_原著解析/partition_policy.json",
+            {
+                "policy": {
+                    "max_input_tokens": 7000,
+                    "reserved_output_tokens": 2000,
+                    "chars_per_token_estimate": 1.8,
+                    "max_complexity_points": 20,
+                    "concurrency_mode": "bounded",
+                    "max_parallel_tasks": "auto",
+                    "single_state_writer": True,
+                }
+            },
+        )
+        plan = self.project / "tmp/source-analysis/run-001/partition-plan.json"
+        return corpus, policy, plan
+
+    def test_plan_source_partitions_does_not_modify_project_state(self) -> None:
+        self.init_project()
+        corpus, policy, plan = self.partition_fixture_paths()
+        before = (self.project / "project_state.json").read_bytes()
+        code, payload = self.run_cli(
+            "plan-source-partitions",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--policy", str(policy),
+            "--output", str(plan),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["partition_count"], 2)
+        self.assertTrue(plan.is_file())
+        self.assertEqual((self.project / "project_state.json").read_bytes(), before)
+
+    def test_merge_source_analysis_shards_writes_only_requested_output(self) -> None:
+        self.init_project()
+        corpus, policy, plan = self.partition_fixture_paths()
+        code, payload = self.run_cli(
+            "plan-source-partitions",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--policy", str(policy),
+            "--output", str(plan),
+        )
+        self.assertEqual(code, 0, payload)
+        shard_dir = self.project / "tmp/source-analysis/run-001/shards"
+        self.write_json(
+            "tmp/source-analysis/run-001/shards/SP001.json",
+            {
+                "schema_version": 1,
+                "partition_id": "SP001",
+                "source_unit_ids": ["SU001", "SU002"],
+                "units": [
+                    {"source_unit_id": "SU001", "status": "ready", "events": [{"event_id": "EV001"}]},
+                    {"source_unit_id": "SU002", "status": "ready", "events": [{"event_id": "EV002"}]},
+                ],
+            },
+        )
+        self.write_json(
+            "tmp/source-analysis/run-001/shards/SP002.json",
+            {
+                "schema_version": 1,
+                "partition_id": "SP002",
+                "source_unit_ids": ["SU003"],
+                "units": [
+                    {"source_unit_id": "SU003", "status": "ready", "events": [{"event_id": "EV003"}]},
+                ],
+            },
+        )
+        before = (self.project / "project_state.json").read_bytes()
+        output = self.project / "01_原著解析/source_event_index_candidate.json"
+        code, payload = self.run_cli(
+            "merge-source-analysis-shards",
+            str(self.project),
+            "--plan", str(plan),
+            "--shard-dir", str(shard_dir),
+            "--output", str(output),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["unit_count"], 3)
+        self.assertTrue(output.is_file())
+        self.assertEqual((self.project / "project_state.json").read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,40 @@
 
 `source_unit_id` 与 `ordinal` 各自唯一。`source_id` 必须存在于项目来源记录，`content_path` 必须位于项目目录内且散列匹配；同一标准化文件可以被多个不同定位单元引用，但不能省略 `source_locator`。
 
+## 长文本动态分片计划
+
+小说总字数不选择工作流。所有来源先按章节、场景或事件建立完整 `source_unit_id`，再按运行时提供的容量策略组合相邻单元。`source_corpus.source_units[]` 可增加 `character_count`、`estimated_tokens` 与 `complexity_points`；估算参数来自当前运行策略，不在代码中写死小说字数阈值。
+
+分片计划使用：
+
+```json
+{
+  "schema_version": 1,
+  "policy": {
+    "max_input_tokens": 64000,
+    "reserved_output_tokens": 12000,
+    "chars_per_token_estimate": 1.8,
+    "max_complexity_points": 100,
+    "concurrency_mode": "bounded",
+    "max_parallel_tasks": "auto",
+    "single_state_writer": true
+  },
+  "partitions": [
+    {
+      "partition_id": "SP001",
+      "ordinal": 1,
+      "source_unit_ids": ["SRC-CH001"],
+      "estimated_input_tokens": 12000,
+      "complexity_points": 20,
+      "previous_partition_id": null,
+      "next_partition_id": null
+    }
+  ]
+}
+```
+
+示例数值不是默认值。单个来源单元超预算时，必须先按场景/事件建立新稳定ID，不得在模型调用中任意截断。并发分析分片写入 `tmp/source-analysis/<run-id>/shards/`，统一合并后才登记规范事件索引。
+
 ## 原著事件索引
 
 ```json
@@ -118,7 +152,7 @@
 }
 ```
 
-`operation` 只能为 `preserve`、`compress`、`merge`、`reorder`、`omit`、`bridge_addition`、`psychology_externalization`、`dialogue_rewrite`、`scene_transition`、`time_compression`、`action_completion`、`crowd_environment_reaction`、`dramatic_expansion`、`named_character`、`merge_character`、`new_subplot`、`new_relationship`、`new_ability`、`new_major_event`、`change_motivation`、`change_choice`、`change_cause`、`change_outcome`、`change_world_rule`、`change_ending_nature` 或 `hook_crisis`。`source_based` 使用 `no_change`；`auto_allowed` 使用 `expression_only`，且两者都必须绑定至少一个 `source_unit_id`。无原著单元依据时只能走 `user_confirmation_required` 与有效授权。桥接新增还必须提供 `addition_basis`、`purpose` 和 `source_facts_unchanged: true`。
+`operation` 只能为 `preserve`、`compress`、`merge`、`reorder`、`omit`、`bridge_addition`、`psychology_externalization`、`scene_transition`、`time_compression`、`action_completion`、`crowd_environment_reaction`、`dramatic_expansion`、`named_character`、`merge_character`、`new_subplot`、`new_relationship`、`new_ability`、`new_major_event`、`change_motivation`、`change_choice`、`change_cause`、`change_outcome`、`change_world_rule`、`change_ending_nature` 或 `hook_crisis`。`source_based` 使用 `no_change`；`auto_allowed` 使用 `expression_only`，且两者都必须绑定至少一个 `source_unit_id`。无原著单元依据时只能走 `user_confirmation_required` 与有效授权。桥接新增还必须提供 `addition_basis`、`purpose` 和 `source_facts_unchanged: true`。
 
 自动允许项必须是 `boundary_class: auto_allowed`、`change_level: expression_only`、`source_fact_change: false`、`status: accepted`，并绑定原著依据。需要确认或改变故事事实的决策必须是 `boundary_class: user_confirmation_required`、`status: approved_addition`，并以 `authorization_ref` 绑定当前有效授权。
 
@@ -168,7 +202,7 @@
 
 有任一 `blocked` 时结论为 `blocked`；否则有任一 `suspected_overreach` 时为 `needs_human_review`；其余为 `passed`。前两种结论都阻止目标稿确认。报告必须明确自动判断局限，不能声称百分之百正确。
 
-`category` 分为三组：原著直接保留使用 `source_fidelity`；自动表达变化使用 `psychology_externalization`、`dialogue_rewrite`、`scene_transition`、`time_compression`、`action_completion`、`crowd_environment_reaction` 或 `dramatic_expansion`，此时 `passed` 还必须以 `decision_ids` 绑定同类型 `auto_allowed` 决策；需授权的故事事实变化使用变更授权支持的类别。硬冲突使用 `major_character_change`、`identity_change`、`ability_change`、`core_relationship_change`、`motivation_change`、`key_event_change`、`causality_change`、`world_rule_change`、`ending_nature_change`、`premature_knowledge_disclosure` 或 `missing_source_or_authorization`，只能输出 `suspected_overreach` 或 `blocked`。
+`category` 分为三组：原著直接保留使用 `source_fidelity`；自动表达变化使用 `psychology_externalization`、`scene_transition`、`time_compression`、`action_completion`、`crowd_environment_reaction` 或 `dramatic_expansion`，此时 `passed` 还必须以 `decision_ids` 绑定同类型 `auto_allowed` 决策；需授权的故事事实变化使用变更授权支持的类别。硬冲突使用 `major_character_change`、`identity_change`、`ability_change`、`core_relationship_change`、`motivation_change`、`key_event_change`、`causality_change`、`world_rule_change`、`ending_nature_change`、`premature_knowledge_disclosure` 或 `missing_source_or_authorization`，只能输出 `suspected_overreach` 或 `blocked`。
 
 ## 开发阶段审核报告
 
@@ -340,24 +374,38 @@
 
 ```json
 {
-  "cue_id": "Q-E001-S01-001",
-  "episode_id": "E001",
-  "scene_id": "1-1",
-  "speaker_id": "C001",
-  "speaker_name": "角色名",
-  "type": "dialogue",
-  "text": "剧本原文",
-  "context": "当场目的或声音语境",
-  "performance_note": ""
+  "schema_version": 1,
+  "contract_version": 2,
+  "generated_from": [
+    {"artifact_key": "source_corpus", "version": 1},
+    {"artifact_key": "source_event_index", "version": 1},
+    {"artifact_key": "episode_script:E001", "version": 1},
+    {"artifact_key": "episode_boundary_review:E001", "version": 1}
+  ],
+  "records": [{
+    "cue_id": "Q-E001-S01-001",
+    "episode_id": "E001",
+    "scene_id": "1-1",
+    "speaker_id": "C001",
+    "speaker_name": "角色名",
+    "type": "dialogue",
+    "delivery_mode": "on_screen",
+    "text": "原著中的逐字对白",
+    "source_unit_id": "SRC-CH001",
+    "source_locator": "CH001-P023",
+    "source_beat_refs": ["B-E001-023"],
+    "context": "当场目的或声音语境",
+    "performance_note": ""
+  }]
 }
 ```
 
-`type` 只能为 `dialogue`、`vo`、`os`、`environment` 或 `sfx`。必填：`cue_id`、`episode_id`、`scene_id`、`type`、`text`。对白、VO、OS 还必须提供 `speaker_id` 和 `speaker_name`。
+`type` 只能为 `dialogue`、`vo`、`os`、`environment` 或 `sfx`。台词声音表必须直接依赖当前 `source_corpus`、`source_event_index`、分集剧本和对应边界报告。必填：`cue_id`、`episode_id`、`scene_id`、`type`、`text`。对白、VO、OS 还必须提供 `speaker_id`、`speaker_name`、`delivery_mode`、`source_unit_id`、`source_locator` 和 `source_beat_refs`。
 
 ## 双向追溯
 
 - 场景表必须覆盖全部剧本场次，不能缺场或多场。
-- 台词声音表必须覆盖剧本中全部对白、VO 和 OS，文本不得擅改。
+- 台词声音表必须覆盖剧本中全部对白、VO 和 OS，并使用 `contract_version: 2`。口述 cue 必须提供 `text`、`source_unit_id`、`source_locator`、`source_beat_refs`，其中 `text` 必须逐字存在于绑定原著单元，beat 必须属于当前集明确允许范围，定位必须命中 beat 来源，台词顺序不得倒退；不得包含 `source_text`、`delivered_text`、`preservation_mode`、`adaptation_note`、语义分数、改写审批或对白新增事实字段。
 - 场景表引用的角色 ID 必须存在于角色表，物品 ID 必须存在于道具服装台账。
 - 角色和物品的每条 `appearances` 必须指向存在的剧本场次。
 - 提取表出现剧本没有的集号、场号、台词或角色时判为阻断。
@@ -509,9 +557,64 @@
 
 ## 通用语义追踪与制作可执行性（schema v2）
 
-- `source_event_index` 的 schema v2 必须为事件和 beat 提供唯一顺序，并通过 `episode_scopes` 声明每集允许使用的首尾 beat。
+- `source_event_index` 的 schema v2 必须为事件和 beat 提供唯一顺序，并通过 `episode_scopes` 声明每集按原著顺序声明无重复的 `allowed_beat_ids`，并使首尾 beat 与该列表一致。
 - AI 分镜单元必须使用 `source_beat_refs`，顺序不得倒退或越过当前集来源边界；引用 beat 的 `protected_fact_ids` 必须进入 `preserved_fact_ids`。
 - 新增事实必须写入 `new_fact_claims` 并绑定有效改编决策，不能用布尔值自报“忠实”。
 - 台词声音表用 `delivery_mode` 区分 `on_screen`、`off_screen`、`voice_over`、`phone_audio`、`screen_video`；非现场人物不得进入 `characters_on_screen`。
 - 每个分镜单元必须提供 `action_flow`、`time_span_mode` 和完整 `shot_language`。动作前置状态、最短时长、对白字数和屏幕文字后期方案由工具实际校验。
 - 边界报告的最终结论由目标制品的机器校验结果计算；报告自填 `passed` 不能覆盖阻断错误。
+
+### 人物三视图锚点v2与分镜镜头语言v2
+
+`character_anchor:<角色ID>` 的新交付格式使用 `contract_version: 2`，分开保存 `source_appearance`、`visual_design` 与 `turnaround_prompt`。自动补齐的五官、发型、体型和服装属于视觉设计，不得伪装成原著事实，也不得暗示未公开身份、关系、能力或经历。
+
+角色提取表 `appearances[]` 增加 `presence_mode: on_screen | voice_only | crowd_group`。
+
+新逐集交付要求 `ai_shot_plan.shot_language_contract_version: 2`。每个 `units[]` 继续使用现有 `shot_language`，但其中两个字段升级为：
+
+```json
+{
+  "shot_language": {
+    "shot_size": {"start": "medium_shot", "end": "close_up"},
+    "camera_movement": {
+      "type": "push_in",
+      "subject": "C001",
+      "description": "从人物腰部中景缓慢推近至面部近景，最终停在她握紧的手机上"
+    },
+    "camera_angle": "平视",
+    "composition": "人物位于画面左侧",
+    "visual_focus": "手机",
+    "transition": "动作衔接"
+  }
+}
+```
+
+旧字符串格式继续可读；只有新 `render-episode-delivery` 交付要求v2结构。
+
+### 分镜空间、声音与跨集续接硬契约
+
+- `source_event_index` schema v2 顶层必须包含 canonical `entities`；事件 `participants` 只能引用已登记的 character ID。台词 `speaker_id`、现场人物、屏幕人物和状态链人物必须沿用同一 ID。
+- 严格分镜单元必须使用 `space_zones`；每名现场人物必须绑定当前单元的 `space_id`，两辆车、现场与设备屏幕不得合并成同一空间。
+- 严格分镜单元使用结构化 `sound_events`，每条声音必须绑定 `space_id` 且 `scope: unit`。电话或屏幕视频台词必须绑定当前单元的 device sound event，禁止无生命周期的整场广播。
+- 同集 `tail_frame_chain` 必须绑定紧邻上一单元；跨集首镜必须绑定上一集已确认分镜计划的最后一个单元。第一集首镜不得使用上一集尾帧。
+- 正式配音 cue 禁止 `20XX`、`TBD`、`TODO`、`FIXME` 和待定类占位符。
+
+### 剧情内容原子、必要事实与故事时间轴
+
+`source_event_index` schema v2 必须使用 `content_contract_version: 1`。每个 beat 必须提供：
+
+- `content_atoms`：逐字来自原著的剧情内容原子；`text` 必须等于 `source_excerpt`，且摘录必须存在于绑定 `source_corpus` 单元。
+- `required_fact_ids`：当前 beat 出现时必须由可见或可听载体表达的身份、年龄、关系、因果或知情变化事实。
+- 可选 `story_time`：涉及明确时间关系时记录整数 `day_index` 与规范 `day_part`。
+
+顶层 `fact_definitions` 负责定义必要事实及其 `source_beat_ids`；顶层 `temporal_constraints` 用原著逐字时间表达绑定 anchor/target beat。工具从“同日、次日、后天、N天后”等表达确定性计算天数，不接受模型自报偏移量。
+
+严格分镜和Seedance执行单元必须使用 `content_atoms` 与 `content_bindings`：
+
+- 剧情字段只能逐字编译自来源 beat 的 source atom，或逐字来自已接受改编决策的 `authorized_content`。
+- `narrative_task`、`action_start`、`action_end`、动作步骤、屏显、Seedance `start_state/end_state/visual_action/prompt_text` 不得继续作为无来源自由文本。
+- `new_fact_claims: []` 不能证明没有新增事实；没有合法 atom 和 binding 的剧情字段直接阻断。
+
+每集必要事实由 `episode_scope.allowed_beat_ids` 中全部 beat 的 `required_fact_ids` 自动合并。分镜通过 `fact_realizations` 将事实绑定到真实 `dialogue_cue`、`action_step`、`state_change` 或 `screen_text`；不存在的载体不计入覆盖。
+
+AI视频执行计划必须用 `content_atom_refs` 无遗漏消费绑定分镜单元的 atoms。`prompt.action`由 atoms 编译，人物只能来自绑定分镜，环境没有环境atom时固定使用场景锚点，`prompt_text`必须等于 `prompt_compiler_version: 1` 的确定性编译结果。

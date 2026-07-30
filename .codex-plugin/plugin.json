@@ -1,21 +1,27 @@
 {
   "name": "ai-director",
-  "version": "0.8.3",
-  "description": "An AI screenwriter/director workflow for direct source import, optional official-page review, lightweight full-series backbones, batch-scoped source-detail gates, independently validated batch packages, and cross-batch continuity-checked series assembly; optional model-agnostic and Seedance text execution plans.",
+  "version": "0.8.4",
+  "description": "An AI screenwriter/director workflow for direct source import, chapter/event-aware long-novel partitioning, single-writer parallel analysis merging, lightweight full-series backbones, batch-scoped source-detail gates, per-episode DOCX+HTML delivery, and executable model-agnostic text storyboards.",
   "author": {
     "name": "Shinchan-crayon"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "AI导演",
-    "shortDescription": "来源默认直通，按批细化原著并经跨批连续性终检汇总全剧。",
-    "longDescription": "AI导演 v0.8 按原著解析、改编定位、改编圣经、轻量全剧骨架、批次原著范围与逐单元细化、批次大纲、分集剧本和制作提取完成小说改剧本。上传来源默认直接建档；仅在用户把来源标记为已发表小说、主动开启审核并提供指定官网或正版页面时，才登记非阻塞来源审核。全剧骨架只锁定完整集号与每集摘要，详细原著映射下沉到当前批次；每个批次独立通过内容边界、制作就绪、连续性快照和交付审核后生成批次包。全剧交付复用这些批次包，并以跨批连续性终检和全剧汇总清单形成最终包，因此修改一个批次不会让其他已确认批次包失效。核心交付仍是制作就绪文学剧本包；用户明确要求时，可在已确认剧本之外生成模型无关或 Seedance 2.0 的纯文字导演分镜与短执行单元。插件不生成图片、不嵌入 Base64、不提交视频任务，也不调用配音或剪辑接口。",
+    "shortDescription": "长篇小说动态分片并发解析，逐集交付剧本与可执行HTML故事板。",
+    "longDescription": "AI导演 v0.8.4 按原著解析、改编定位、改编圣经、轻量全剧骨架、批次原著范围与逐单元细化、批次大纲、分集剧本和制作提取完成小说改剧本。任意长度小说按章节与事件动态分片，分析分片可并发，项目状态由单一写入者合并；不按固定总字数硬切。每个批次独立通过内容边界、制作就绪、连续性快照和交付审核。每集可确定性输出文学剧本 DOCX 与 HTML 故事板；人物锚点包含正面头肩肖像及全身正面、侧面、背面三视图描述，分镜包含结构化景别与镜头运动。通用视频提示词经过人物、空间、声音、对白、镜头运动、负面约束和屏幕文字后期方案的可执行性门禁。插件不生成图片、不嵌入 Base64、不提交视频任务，也不调用配音或剪辑接口。",
     "developerName": "Shinchan-crayon",
     "category": "Productivity",
     "capabilities": [
       "小说与长内容解析",
       "改编定位与故事圣经",
       "全剧分集规划",
+      "任意长度小说章节/事件动态分片",
+      "并行来源分析分片与单一写入者合并",
+      "逐集DOCX文学剧本与HTML故事板交付",
+      "人物正面头肩肖像与全身三视图文字锚点v2",
+      "结构化镜头景别与镜头运动",
+      "通用视频提示词可执行性门禁",
       "来源默认直通与可选指定官网审核",
       "v0.8轻量全剧骨架",
       "批次原著范围与逐单元细化门禁",
@@ -44,12 +50,11 @@
       "HTML故事板可视化检查"
     ],
     "defaultPrompt": [
-      "我上传一部自有小说或部分章节，请直接建档并建立带原著追溯和内容边界门禁的制作就绪剧本项目；不要自动检查缺章，也不要生成图片。",
-      "这是一部已发表小说。我主动开启官网审核，指定页面是 <URL>；请登记非阻塞审核后继续项目。",
-      "先生成覆盖全部目标集数的 v0.8 轻量全剧骨架，再为 B01 建立原著范围和逐单元细化门禁。",
+      "我上传一部自有完整小说，请禁止读取任何旧项目和旧缓存；先按章节与事件动态分片，允许并行分析，但由主任务单一写入项目状态。",
+      "先生成全书轻量事件地图和60秒左右的分集地图，再只生成全新的E001验收；每集交付剧本DOCX和HTML故事板。",
       "继续上次的AI导演项目，并告诉我当前批次进度、失效范围和下一步。",
       "所有批次都已确认，请先完成跨批连续性终检，再复用现有批次包汇总全剧最终交付。",
-      "把已确认剧本转换为Seedance 2.0纯文字执行计划；不要生成图片，不要提交视频任务。"
+      "把已确认剧本转换为模型无关的纯文字导演分镜；不要生成图片，不要提交视频任务。"
     ]
   }
 }

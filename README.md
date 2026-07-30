@@ -2,7 +2,7 @@
 
 把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.3`
+当前版本：`0.8.4`
 
 ## 它能做什么
 
@@ -162,6 +162,18 @@ skills/novel-to-script-director/
 - 调用配音或剪辑接口；
 - 把未读取到的内容冒充原著事实。
 
+## 动态分批与逐集交付
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py plan-source-partitions   <项目目录> --source-corpus <source_corpus.json> --policy <partition_policy.json>   --output <tmp/source-analysis/run-001/partition-plan.json>
+
+python3 skills/novel-to-script-director/scripts/project_tool.py merge-source-analysis-shards   <项目目录> --plan <partition-plan.json> --shard-dir <shards目录>   --output <source_event_index_candidate.json>
+
+python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-delivery   <项目目录> E001
+```
+
+流程不按小说总字数切换；章节/事件优先，容量预算兜底。逐集命令输出 `E001_剧本.docx` 与 `E001_故事板.html`，不生成图片。
+
 ## 验证
 
 ```bash
@@ -169,7 +181,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8.3 完整测试：`105/105` 通过。
+v0.8.4 完整测试：`155/155` 通过。
 
 ## 更新记录
 

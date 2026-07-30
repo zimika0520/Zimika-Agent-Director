@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import source_partition
+import shot_contracts
+
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "project_state.json"
@@ -170,7 +173,12 @@ ARTIFACT_TYPES = {
 # 已存在的 B 及其所有下游制品都应重新评估。
 DEPENDENCY_GRAPH = {
     "project_spec": {"source_corpus", "story_facts", "adaptation_profile"},
-    "source_corpus": {"source_event_index", "batch_source_scope", "batch_source_detail"},
+    "source_corpus": {
+        "source_event_index",
+        "batch_source_scope",
+        "batch_source_detail",
+        "dialogue_cue_sheet",
+    },
     "source_event_index": {
         "story_facts",
         "adaptation_decision_ledger",
@@ -352,6 +360,7 @@ REQUIRED_UPSTREAM_GROUPS: dict[str, tuple[frozenset[str], ...]] = {
     "generation_retry_ledger": (frozenset({"seedance_execution_plan", "ai_video_execution_plan"}),),
     "model_capability_profile": (frozenset({"project_spec"}),),
     "ai_shot_plan": (
+        frozenset({"source_event_index"}),
         frozenset({"episode_script"}),
         frozenset({"episode_boundary_review"}),
         frozenset({"dialogue_cue_sheet"}),
@@ -393,6 +402,8 @@ REQUIRED_UPSTREAM_GROUPS: dict[str, tuple[frozenset[str], ...]] = {
         frozenset({"episode_boundary_review"}),
     ),
     "dialogue_cue_sheet": (
+        frozenset({"source_corpus"}),
+        frozenset({"source_event_index"}),
         frozenset({"episode_script"}),
         frozenset({"episode_boundary_review"}),
     ),
@@ -744,6 +755,36 @@ class ToolError(Exception):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ToolError(f"无法读取 JSON：{path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ToolError(f"JSON 顶层必须是对象：{path}")
+    return payload
+
+
+def resolve_project_input(project_path: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    path = path if path.is_absolute() else project_path / path
+    path = path.resolve()
+    if project_path != path and project_path not in path.parents:
+        raise ToolError("输入路径必须位于项目目录内")
+    if not path.exists():
+        raise ToolError(f"输入路径不存在：{path}")
+    return path
+
+
+def resolve_project_output(project_path: Path, raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    path = path if path.is_absolute() else project_path / path
+    path = path.resolve()
+    if project_path != path and project_path not in path.parents:
+        raise ToolError("输出路径必须位于项目目录内")
+    return path
 
 
 def sha256_file(path: Path) -> str:
@@ -2346,6 +2387,17 @@ def command_approve(args: argparse.Namespace) -> int:
         if source_errors:
             codes = "、".join(item["code"] for item in source_errors)
             raise ToolError(f"批次大纲原著细化门禁未通过：{codes}")
+    if selected_type == "character_anchor":
+        anchor_path = path_from_record(project_path, selected.get("path"))
+        if anchor_path is not None and anchor_path.suffix.lower() == ".json":
+            try:
+                anchor_payload = read_json_file(anchor_path)
+            except ToolError as exc:
+                raise ToolError(f"人物锚点 JSON 无法读取：{exc}") from exc
+            anchor_errors = validate_character_anchor_payload(anchor_payload)
+            if anchor_errors:
+                codes = "、".join(dict.fromkeys(item["code"] for item in anchor_errors))
+                raise ToolError(f"人物锚点校验未通过，不能确认：{codes}")
     if selected_type in STRUCTURED_DEVELOPMENT_TYPES:
         structured_errors = validate_structured_development_artifact(
             project_path, state, args.artifact_key, selected
@@ -2554,6 +2606,212 @@ def command_add_source(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_plan_source_partitions(args: argparse.Namespace) -> int:
+    project_path, _state = load_state(args.project)
+    source_corpus_path = resolve_project_input(project_path, args.source_corpus)
+    policy_path = resolve_project_input(project_path, args.policy)
+    source_corpus = read_json_file(source_corpus_path)
+    policy_payload = read_json_file(policy_path)
+    policy = policy_payload.get("policy")
+    if not isinstance(policy, dict):
+        raise ToolError("分片策略 JSON 必须包含 policy 对象")
+    try:
+        plan = source_partition.build_partition_plan(source_corpus, policy)
+    except source_partition.PartitionError as exc:
+        raise ToolError(str(exc)) from exc
+    validation = source_partition.validate_partition_plan(plan, source_corpus)
+    if validation:
+        raise ToolError(json.dumps({"errors": validation}, ensure_ascii=False))
+    output = resolve_project_output(project_path, args.output)
+    atomic_write_json(output, plan)
+    print_json({"ok": True, "output": str(output), "partition_count": len(plan["partitions"])})
+    return 0
+
+
+def command_merge_source_analysis_shards(args: argparse.Namespace) -> int:
+    project_path, _state = load_state(args.project)
+    plan_path = resolve_project_input(project_path, args.plan)
+    shard_dir = resolve_project_input(project_path, args.shard_dir)
+    if not shard_dir.is_dir():
+        raise ToolError(f"分析分片路径不是目录：{shard_dir}")
+    plan = read_json_file(plan_path)
+    shards = [read_json_file(path) for path in sorted(shard_dir.glob("*.json"))]
+    try:
+        payload = source_partition.merge_analysis_shards(plan, shards)
+    except source_partition.PartitionError as exc:
+        errors = source_partition.validate_analysis_shards(plan, shards)
+        raise ToolError(json.dumps({"error": str(exc), "errors": errors}, ensure_ascii=False)) from exc
+    output = resolve_project_output(project_path, args.output)
+    atomic_write_json(output, payload)
+    print_json({"ok": True, "output": str(output), "unit_count": len(payload["units"])})
+    return 0
+
+
+def episode_delivery_inputs(
+    project_path: Path, state: dict[str, Any], episode: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    errors: list[dict[str, Any]] = []
+    dependencies: list[dict[str, Any]] = []
+
+    def require_current(key: str, label: str) -> dict[str, Any] | None:
+        record = latest_record(state, key)
+        if not isinstance(record, dict) or not confirmed_record_is_usable(
+            state, key, record, project_path
+        ):
+            errors.append(issue("episode_delivery_input_missing", f"缺少当前已确认{label}", artifact_key=key))
+            return None
+        dependencies.append({"artifact_key": key, "version": record["version"]})
+        return record
+
+    script_key = f"episode_script:{episode}"
+    plan_key = f"ai_shot_plan:{episode}"
+    script_record = require_current(script_key, "分集剧本")
+    plan_record = require_current(plan_key, "AI分镜计划")
+    if isinstance(script_record, dict) and matching_boundary_review(
+        state, script_key, script_record, project_path
+    ) is None:
+        errors.append(issue("episode_delivery_script_review_missing", "分集剧本缺少当前 passed 内容边界报告"))
+    if isinstance(plan_record, dict) and matching_boundary_review(
+        state, plan_key, plan_record, project_path
+    ) is None:
+        errors.append(issue("episode_delivery_shot_review_missing", "AI分镜计划缺少当前 passed 内容边界报告"))
+
+    roster_record = (
+        dependency_record_of_type(state, plan_record, "character_roster")[1]
+        if isinstance(plan_record, dict)
+        and dependency_record_of_type(state, plan_record, "character_roster") is not None
+        else latest_record(state, "character_roster")
+    )
+    if not isinstance(roster_record, dict) or not confirmed_record_is_usable(
+        state, "character_roster", roster_record, project_path
+    ):
+        errors.append(issue("episode_delivery_roster_missing", "缺少当前已确认角色提取表"))
+        roster_payload = None
+    else:
+        dependencies.append({"artifact_key": "character_roster", "version": roster_record["version"]})
+        roster_path = path_from_record(project_path, roster_record.get("path"))
+        roster_payload = read_json_file(roster_path) if roster_path else None
+
+    plan_payload: dict[str, Any] | None = None
+    anchors: dict[str, dict[str, Any]] = {}
+    if isinstance(plan_record, dict):
+        plan_path = path_from_record(project_path, plan_record.get("path"))
+        plan_payload = read_json_file(plan_path) if plan_path else None
+        if not isinstance(plan_payload, dict) or plan_payload.get("shot_language_contract_version") != 2:
+            errors.append(issue("episode_delivery_shot_contract_v2_required", "逐集交付要求 shot_language_contract_version=2"))
+        for dependency in plan_record.get("depends_on", []):
+            if not isinstance(dependency, dict):
+                continue
+            key = dependency.get("artifact_key")
+            version = dependency.get("version")
+            if not isinstance(key, str) or not key.startswith("character_anchor:"):
+                continue
+            record = next(
+                (
+                    item
+                    for item in state.get("artifacts", {}).get(key, [])
+                    if isinstance(item, dict) and item.get("version") == version
+                ),
+                None,
+            ) if type(version) is int else None
+            if not isinstance(record, dict) or not confirmed_record_is_usable(
+                state, key, record, project_path
+            ):
+                errors.append(issue("episode_delivery_anchor_missing", "人物锚点不是当前可用确认版本", artifact_key=key))
+                continue
+            anchor_path = path_from_record(project_path, record.get("path"))
+            if anchor_path is None or anchor_path.suffix.lower() != ".json":
+                errors.append(issue("episode_delivery_anchor_v2_required", "逐集交付要求 JSON 人物锚点v2", artifact_key=key))
+                continue
+            payload = read_json_file(anchor_path)
+            anchor_errors = validate_character_anchor_payload(payload)
+            if anchor_errors:
+                errors.extend(anchor_errors)
+                continue
+            anchors[payload["character_id"]] = payload
+            dependencies.append({"artifact_key": key, "version": version})
+
+    script_text: str | None = None
+    if isinstance(script_record, dict):
+        script_path = path_from_record(project_path, script_record.get("path"))
+        if script_path is not None:
+            try:
+                script_text = script_path.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError):
+                script_text = None
+        if not isinstance(script_text, str):
+            errors.append(issue("episode_delivery_script_unreadable", "分集剧本无法读取"))
+
+    return (
+        {
+            "episode": episode,
+            "script_text": script_text,
+            "roster": roster_payload,
+            "anchors": anchors,
+            "plan": plan_payload,
+            "dependencies": dependencies,
+        },
+        errors,
+    )
+
+
+def validate_episode_delivery_readiness(
+    project_path: Path, episode: str
+) -> dict[str, Any]:
+    state_path = project_path / STATE_FILENAME
+    state = read_json_file(state_path)
+    _inputs, errors = episode_delivery_inputs(project_path, state, episode)
+    return {
+        "ready": not errors,
+        "episode": episode,
+        "errors": errors,
+        "dependencies": _inputs["dependencies"],
+    }
+
+
+def command_render_episode_delivery(args: argparse.Namespace) -> int:
+    import render_episode_script
+    import render_storyboard
+
+    project_path, state = load_state(args.project)
+    episode = str(args.episode).upper()
+    if not EPISODE_ID_RE.fullmatch(episode):
+        raise ToolError("集号必须使用 E001 形式")
+    inputs, errors = episode_delivery_inputs(project_path, state, episode)
+    if errors:
+        codes = "、".join(dict.fromkeys(item["code"] for item in errors))
+        raise ToolError(f"逐集交付未就绪：{codes}")
+    parsed = render_episode_script.parse_episode_script(inputs["script_text"])
+    insertions = render_episode_script.build_turnaround_insertions(
+        episode, parsed["scenes"], inputs["roster"], inputs["anchors"]
+    )
+    output_dir = project_path / "09_定稿交付" / "分集交付" / episode
+    allowed_names = {f"{episode}_剧本.docx", f"{episode}_故事板.html"}
+    if output_dir.exists():
+        extras = [path.name for path in output_dir.iterdir() if path.name not in allowed_names]
+        if extras:
+            raise ToolError(f"逐集交付目录存在非目标文件，拒绝覆盖：{extras}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    script_output = render_episode_script.write_docx(
+        str(state.get("name") or project_path.name),
+        parsed,
+        insertions,
+        output_dir / f"{episode}_剧本.docx",
+    )
+    html_output = render_storyboard.render(
+        project_path, episode, output_dir / f"{episode}_故事板.html"
+    )
+    print_json(
+        {
+            "ok": True,
+            "episode": episode,
+            "outputs": [str(script_output), str(html_output)],
+            "dependencies": inputs["dependencies"],
+        }
+    )
+    return 0
+
+
 def command_render_storyboard(args: argparse.Namespace) -> int:
     """委托 render_storyboard 模块,把已确认分镜计划渲染成 HTML 故事板(只读)。"""
     import render_storyboard
@@ -2569,6 +2827,67 @@ def command_render_storyboard(args: argparse.Namespace) -> int:
 
 def issue(code: str, message: str, **location: Any) -> dict[str, Any]:
     return {"code": code, "message": message, **location}
+
+
+ALLOWED_ADAPTATION_OPERATIONS = frozenset({
+    "preserve",
+    "compress",
+    "merge",
+    "reorder",
+    "omit",
+    "bridge_addition",
+    "psychology_externalization",
+    "scene_transition",
+    "time_compression",
+    "action_completion",
+    "crowd_environment_reaction",
+    "dramatic_expansion",
+    "named_character",
+    "merge_character",
+    "new_subplot",
+    "new_relationship",
+    "new_ability",
+    "new_major_event",
+    "change_motivation",
+    "change_choice",
+    "change_cause",
+    "change_outcome",
+    "change_world_rule",
+    "change_ending_nature",
+    "hook_crisis",
+})
+
+AUTO_ALLOWED_BOUNDARY_CATEGORIES = frozenset({
+    "psychology_externalization",
+    "scene_transition",
+    "time_compression",
+    "action_completion",
+    "crowd_environment_reaction",
+    "dramatic_expansion",
+})
+
+DIALOGUE_REWRITE_METADATA_FIELDS = frozenset({
+    "source_text",
+    "delivered_text",
+    "preservation_mode",
+    "adaptation_note",
+    "rewrite_reason",
+    "rewrite_rationale",
+    "semantic_match_score",
+    "voice_preservation",
+    "rewrite_approved",
+    "new_fact_claims",
+})
+
+SPOKEN_CUE_TYPES = frozenset({"dialogue", "vo", "os"})
+SPOKEN_DELIVERY_MODES = frozenset({
+    "on_screen",
+    "off_screen",
+    "voice_over",
+    "phone_audio",
+    "screen_video",
+    "phone_video",
+})
 
 
 STRUCTURED_DEVELOPMENT_TYPES = {
@@ -2590,6 +2909,7 @@ STRUCTURED_DEVELOPMENT_TYPES = {
     "seedance_boundary_review",
     "genre_profile",
     "model_capability_profile",
+    "dialogue_cue_sheet",
     "ai_shot_plan",
     "ai_video_boundary_review",
     "ai_video_execution_plan",
@@ -3021,6 +3341,63 @@ def source_reference_ids(event_index: dict[str, Any] | None) -> set[str]:
     return references
 
 
+def validate_seedance_unit_content_contract(
+    unit: dict[str, Any],
+    beats: dict[str, dict[str, Any]],
+    decisions_by_id: dict[str, dict[str, Any]],
+    unit_index: int,
+    strict_contract: bool = False,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if not strict_contract and "content_atoms" not in unit:
+        return errors
+    refs = unit.get("source_beat_refs") if isinstance(unit.get("source_beat_refs"), list) else []
+    source_atoms: dict[str, dict[str, Any]] = {}
+    for beat_id in refs:
+        beat = beats.get(beat_id)
+        if isinstance(beat, dict):
+            source_atoms.update(beat.get("content_atoms", {}))
+    atoms_raw = unit.get("content_atoms")
+    if not isinstance(atoms_raw, list) or not atoms_raw:
+        return [issue("seedance_content_atoms_missing", "Seedance严格执行单元必须声明 content_atoms", unit_index=unit_index)]
+    atoms: dict[str, dict[str, Any]] = {}
+    for atom in atoms_raw:
+        if not isinstance(atom, dict) or not isinstance(atom.get("atom_id"), str) or not isinstance(atom.get("text"), str):
+            errors.append(issue("seedance_content_atom_invalid", "Seedance content atom 非法", unit_index=unit_index))
+            continue
+        atom_id = atom["atom_id"]
+        if atom.get("origin") == "source":
+            source_atom = source_atoms.get(atom.get("source_atom_id"))
+            if not isinstance(source_atom, dict) or compact_dialogue_text(atom["text"]) != compact_dialogue_text(str(source_atom.get("text", ""))):
+                errors.append(issue("seedance_content_atom_source_mismatch", "Seedance source atom 必须逐字继承来源 beat", unit_index=unit_index, atom_id=atom_id))
+        elif atom.get("origin") == "approved_decision":
+            decision = decisions_by_id.get(atom.get("decision_id"))
+            authorized = decision.get("authorized_content") if isinstance(decision, dict) else None
+            if not isinstance(decision, dict) or decision.get("status") != "accepted" or not isinstance(authorized, list) or atom["text"] not in authorized:
+                errors.append(issue("seedance_content_atom_decision_invalid", "Seedance决策 atom 未获逐字授权", unit_index=unit_index, atom_id=atom_id))
+        else:
+            errors.append(issue("seedance_content_atom_invalid", "Seedance content atom origin 无效", unit_index=unit_index, atom_id=atom_id))
+        atoms[atom_id] = atom
+    bindings = unit.get("content_bindings")
+    if not isinstance(bindings, dict):
+        return errors + [issue("seedance_content_bindings_missing", "Seedance严格执行单元必须声明 content_bindings", unit_index=unit_index)]
+    for field in ("start_state", "end_state", "prompt_text"):
+        atom_ids = bindings.get(field)
+        compiled = compiled_content_atom_text(atom_ids, atoms) if isinstance(atom_ids, list) else None
+        if compiled is None or compact_dialogue_text(str(unit.get(field, ""))) != compact_dialogue_text(compiled):
+            errors.append(issue("seedance_prompt_content_unproven", f"{field} 必须由绑定 content atoms 确定性编译", unit_index=unit_index, field=field))
+    shots = unit.get("shots")
+    if isinstance(shots, list):
+        for shot_index, shot in enumerate(shots, 1):
+            if not isinstance(shot, dict):
+                continue
+            atom_ids = shot.get("content_atom_refs")
+            compiled = compiled_content_atom_text(atom_ids, atoms) if isinstance(atom_ids, list) else None
+            if compiled is None or compact_dialogue_text(str(shot.get("visual_action", ""))) != compact_dialogue_text(compiled):
+                errors.append(issue("seedance_prompt_content_unproven", "shots[].visual_action 必须由绑定 content atoms 确定性编译", unit_index=unit_index, shot_index=shot_index))
+    return errors
+
+
 def validate_seedance_execution_payload(
     project_path: Path,
     state: dict[str, Any],
@@ -3138,6 +3515,7 @@ def validate_seedance_execution_payload(
             errors.append(issue("seedance_reference_asset_locator_invalid", "参考素材 locator 不能是 data URI"))
 
     event_index = dependency_payload_of_type(project_path, state, record, "source_event_index")
+    canonical_character_ids = source_character_ids(event_index)
     valid_source_refs = source_reference_ids(event_index)
     ledger = dependency_payload_of_type(project_path, state, record, "adaptation_decision_ledger")
     decisions = ledger.get("decisions") if isinstance(ledger, dict) else None
@@ -3146,6 +3524,14 @@ def validate_seedance_execution_payload(
         for item in decisions
         if isinstance(item, dict) and isinstance(item.get("decision_id"), str)
     } if isinstance(decisions, list) else set()
+    decisions_by_id = {
+        item.get("decision_id"): item
+        for item in decisions
+        if isinstance(item, dict) and isinstance(item.get("decision_id"), str)
+    } if isinstance(decisions, list) else {}
+    beats = source_beat_index(event_index)
+    if payload.get("content_contract_version") != 1:
+        errors.append(issue("seedance_content_contract_upgrade_required", "Seedance执行计划必须使用 content_contract_version=1"))
 
     script_dependency = dependency_record_of_type(state, record, "episode_script")
     script_scenes: dict[str, dict[str, Any]] = {}
@@ -3199,6 +3585,7 @@ def validate_seedance_execution_payload(
         if not isinstance(unit, dict):
             errors.append(issue("seedance_unit_invalid", "执行单元必须是对象", unit_index=index))
             continue
+        errors.extend(validate_seedance_unit_content_contract(unit, beats, decisions_by_id, index, True))
         unit_id = unit.get("unit_id")
         if not isinstance(unit_id, str) or not re.fullmatch(
             rf"SD2-{re.escape(episode_id or scope)}-U\d{{3}}", unit_id, re.IGNORECASE
@@ -3508,13 +3895,508 @@ def source_beat_index(event_index: dict[str, Any] | None) -> dict[str, dict[str,
                 beat_ordinal = beat.get("ordinal")
                 if not isinstance(beat_id, str) or type(beat_ordinal) is not int:
                     continue
+                content_atoms = beat.get("content_atoms")
+                atom_map = {
+                    atom.get("atom_id"): atom
+                    for atom in content_atoms
+                    if isinstance(atom, dict) and isinstance(atom.get("atom_id"), str)
+                } if isinstance(content_atoms, list) else {}
                 result[beat_id] = {
                     "order": (event_ordinal, beat_ordinal),
+                    "source_refs": set(beat.get("source_refs", []))
+                    if isinstance(beat.get("source_refs"), list)
+                    else set(),
                     "protected_fact_ids": set(beat.get("protected_fact_ids", []))
                     if isinstance(beat.get("protected_fact_ids"), list)
                     else set(),
+                    "required_fact_ids": set(beat.get("required_fact_ids", []))
+                    if isinstance(beat.get("required_fact_ids"), list)
+                    else set(),
+                    "content_atoms": atom_map,
+                    "story_time": beat.get("story_time") if isinstance(beat.get("story_time"), dict) else None,
                 }
     return result
+
+
+CONTENT_ATOM_KINDS = {
+    "action", "state", "screen_text", "environment", "identity",
+    "relationship", "knowledge", "causality", "time", "dialogue_context",
+}
+REQUIRED_FACT_TYPES = {"identity", "age", "relationship", "causality", "knowledge_change"}
+STORY_DAY_PARTS = {"unknown", "dawn", "morning", "noon", "afternoon", "evening", "night", "late_night"}
+
+
+def validate_source_content_contract(
+    project_path: Path,
+    corpus: dict[str, Any] | None,
+    event_index: dict[str, Any],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    source_texts: dict[str, str] = {}
+    units = corpus.get("source_units") if isinstance(corpus, dict) else None
+    if isinstance(units, list):
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = unit.get("source_unit_id")
+            path = path_from_record(project_path, unit.get("content_path"))
+            if isinstance(unit_id, str) and path is not None and path.is_file():
+                source_texts[unit_id] = path.read_text(encoding="utf-8")
+    seen_atoms: set[str] = set()
+    event_units = event_index.get("units") if isinstance(event_index, dict) else None
+    for unit_index, event_unit in enumerate(event_units if isinstance(event_units, list) else [], 1):
+        if not isinstance(event_unit, dict):
+            continue
+        for event_index_value, event in enumerate(event_unit.get("events", []) if isinstance(event_unit.get("events"), list) else [], 1):
+            if not isinstance(event, dict):
+                continue
+            for beat_index, beat in enumerate(event.get("beats", []) if isinstance(event.get("beats"), list) else [], 1):
+                if not isinstance(beat, dict):
+                    continue
+                atoms = beat.get("content_atoms")
+                if not isinstance(atoms, list) or not atoms:
+                    errors.append(issue("event_content_atoms_missing", "schema v2 beat 必须包含非空 content_atoms", unit_index=unit_index, event_index=event_index_value, beat_index=beat_index))
+                    continue
+                for atom_index, atom in enumerate(atoms, 1):
+                    if not isinstance(atom, dict):
+                        errors.append(issue("event_content_atom_invalid", "source content atom 必须是对象", beat_index=beat_index, atom_index=atom_index))
+                        continue
+                    atom_id = atom.get("atom_id")
+                    text = atom.get("text")
+                    excerpt = atom.get("source_excerpt")
+                    source_unit_id = atom.get("source_unit_id")
+                    if not isinstance(atom_id, str) or not atom_id.strip() or atom_id in seen_atoms:
+                        errors.append(issue("event_content_atom_id_invalid", "source content atom ID 缺失或重复", beat_index=beat_index, atom_index=atom_index))
+                    else:
+                        seen_atoms.add(atom_id)
+                    if atom.get("kind") not in CONTENT_ATOM_KINDS:
+                        errors.append(issue("event_content_atom_kind_invalid", "source content atom kind 无效", atom_id=atom_id))
+                    source_text = source_texts.get(source_unit_id) if isinstance(source_unit_id, str) else None
+                    if not isinstance(excerpt, str) or not excerpt.strip() or not isinstance(source_text, str) or compact_dialogue_text(excerpt) not in compact_dialogue_text(source_text):
+                        errors.append(issue("event_content_atom_excerpt_invalid", "source_excerpt 必须逐字存在于绑定原著单元", atom_id=atom_id, source_unit_id=source_unit_id))
+                    if not isinstance(text, str) or not isinstance(excerpt, str) or compact_dialogue_text(text) != compact_dialogue_text(excerpt):
+                        errors.append(issue("event_content_atom_text_mismatch", "source content atom text 必须等于 source_excerpt，不能改写", atom_id=atom_id))
+                    if not isinstance(atom.get("source_locator"), str) or not atom["source_locator"].strip():
+                        errors.append(issue("event_content_atom_locator_missing", "source content atom 缺少 source_locator", atom_id=atom_id))
+    return errors
+
+
+def validate_fact_definition_contract(event_index: dict[str, Any] | None) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    beats = source_beat_index(event_index)
+    definitions = event_index.get("fact_definitions") if isinstance(event_index, dict) else None
+    if not isinstance(definitions, list):
+        return [issue("story_fact_definitions_invalid", "source_event_index.fact_definitions 必须是数组")]
+    definitions_by_id: dict[str, dict[str, Any]] = {}
+    for index, definition in enumerate(definitions, 1):
+        if not isinstance(definition, dict):
+            errors.append(issue("story_fact_definition_invalid", "事实定义必须是对象", fact_index=index))
+            continue
+        fact_id = definition.get("fact_id")
+        if not isinstance(fact_id, str) or not fact_id.strip() or fact_id in definitions_by_id:
+            errors.append(issue("story_fact_id_invalid", "fact_id 缺失或重复", fact_index=index))
+            continue
+        definitions_by_id[fact_id] = definition
+        if definition.get("fact_type") not in REQUIRED_FACT_TYPES:
+            errors.append(issue("story_fact_type_invalid", "fact_type 无效", fact_id=fact_id))
+        source_beats = definition.get("source_beat_ids")
+        if not isinstance(source_beats, list) or not source_beats or not all(isinstance(value, str) for value in source_beats):
+            errors.append(issue("story_fact_source_beats_invalid", "source_beat_ids 必须是非空字符串数组", fact_id=fact_id))
+        else:
+            unknown = sorted(set(source_beats) - set(beats))
+            if unknown:
+                errors.append(issue("story_fact_source_beat_unknown", "事实定义引用未知 beat", fact_id=fact_id, unknown=unknown))
+    required_backrefs: dict[str, set[str]] = {}
+    for beat_id, beat in beats.items():
+        for fact_id in beat.get("required_fact_ids", set()):
+            required_backrefs.setdefault(fact_id, set()).add(beat_id)
+    for fact_id, beat_ids in required_backrefs.items():
+        definition = definitions_by_id.get(fact_id)
+        if not isinstance(definition, dict):
+            errors.append(issue("story_required_fact_missing", "beat.required_fact_ids 引用了未定义事实", fact_id=fact_id, beat_ids=sorted(beat_ids)))
+            continue
+        declared = set(definition.get("source_beat_ids", [])) if isinstance(definition.get("source_beat_ids"), list) else set()
+        if not beat_ids.issubset(declared):
+            errors.append(issue("story_required_fact_backref_mismatch", "事实定义 source_beat_ids 未覆盖所有 required_fact_ids 反向引用", fact_id=fact_id, missing=sorted(beat_ids - declared)))
+    return errors
+
+
+def compiled_content_atom_text(atom_ids: list[str], atoms: dict[str, dict[str, Any]]) -> str | None:
+    if not atom_ids or any(atom_id not in atoms for atom_id in atom_ids):
+        return None
+    return "；".join(str(atoms[atom_id].get("text", "")).strip() for atom_id in atom_ids)
+
+
+def validate_unit_content_contract(
+    unit: dict[str, Any],
+    beats: dict[str, dict[str, Any]],
+    decisions_by_id: dict[str, dict[str, Any]],
+    unit_index: int,
+    strict_contract: bool = False,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if not strict_contract and "content_atoms" not in unit and "content_bindings" not in unit:
+        return errors
+    refs = unit.get("source_beat_refs")
+    source_atom_map: dict[str, dict[str, Any]] = {}
+    if isinstance(refs, list):
+        for beat_id in refs:
+            beat = beats.get(beat_id)
+            if isinstance(beat, dict):
+                source_atom_map.update(beat.get("content_atoms", {}))
+    atoms_raw = unit.get("content_atoms")
+    if not isinstance(atoms_raw, list) or not atoms_raw:
+        errors.append(issue("shotplan_content_atoms_missing", "严格分镜单元必须声明非空 content_atoms", unit_index=unit_index))
+        return errors
+    atoms: dict[str, dict[str, Any]] = {}
+    for atom_index, atom in enumerate(atoms_raw, 1):
+        if not isinstance(atom, dict):
+            errors.append(issue("shotplan_content_atom_invalid", "content atom 必须是对象", unit_index=unit_index, atom_index=atom_index))
+            continue
+        atom_id = atom.get("atom_id")
+        text = atom.get("text")
+        if not isinstance(atom_id, str) or not atom_id.strip() or atom_id in atoms or not isinstance(text, str) or not text.strip():
+            errors.append(issue("shotplan_content_atom_invalid", "content atom 缺少唯一 atom_id 或非空 text", unit_index=unit_index, atom_index=atom_index))
+            continue
+        origin = atom.get("origin")
+        if origin == "source":
+            source_atom_id = atom.get("source_atom_id")
+            source_atom = source_atom_map.get(source_atom_id) if isinstance(source_atom_id, str) else None
+            if not isinstance(source_atom, dict) or compact_dialogue_text(text) != compact_dialogue_text(str(source_atom.get("text", ""))):
+                errors.append(issue("shotplan_content_atom_source_mismatch", "source content atom 必须逐字继承当前分镜引用 beat 的原著 atom", unit_index=unit_index, atom_id=atom_id, source_atom_id=source_atom_id))
+        elif origin == "approved_decision":
+            decision_id = atom.get("decision_id")
+            decision = decisions_by_id.get(decision_id) if isinstance(decision_id, str) else None
+            authorized = decision.get("authorized_content") if isinstance(decision, dict) else None
+            if (
+                not isinstance(decision, dict)
+                or decision.get("status") != "accepted"
+                or not isinstance(authorized, list)
+                or text not in authorized
+            ):
+                errors.append(issue("shotplan_content_atom_decision_invalid", "approved_decision atom 的文本必须逐字存在于已接受决策 authorized_content", unit_index=unit_index, atom_id=atom_id, decision_id=decision_id))
+        else:
+            errors.append(issue("shotplan_content_atom_invalid", "content atom origin 只能为 source 或 approved_decision", unit_index=unit_index, atom_id=atom_id))
+        atoms[atom_id] = atom
+    bindings = unit.get("content_bindings")
+    if not isinstance(bindings, dict):
+        errors.append(issue("shotplan_content_bindings_missing", "严格分镜单元必须声明 content_bindings", unit_index=unit_index))
+        return errors
+    for field in ("narrative_task", "action_start", "action_end"):
+        atom_ids = bindings.get(field)
+        compiled = compiled_content_atom_text(atom_ids, atoms) if isinstance(atom_ids, list) else None
+        actual = unit.get(field)
+        if compiled is None:
+            errors.append(issue("shotplan_content_binding_missing", f"{field} 必须绑定有效 content atom", unit_index=unit_index, field=field))
+        elif not isinstance(actual, str) or compact_dialogue_text(actual) != compact_dialogue_text(compiled):
+            errors.append(issue("shotplan_unproven_content", f"{field} 必须等于绑定 content atom 的确定性编译文本", unit_index=unit_index, field=field))
+    flow = unit.get("action_flow")
+    steps = flow.get("steps") if isinstance(flow, dict) else None
+    if isinstance(steps, list):
+        for step_index, step in enumerate(steps, 1):
+            if not isinstance(step, dict):
+                continue
+            atom_ids = step.get("content_atom_refs")
+            if strict_contract and (
+                not isinstance(atom_ids, list) or not atom_ids or any(atom_id not in atoms for atom_id in atom_ids)
+            ):
+                errors.append(issue("shotplan_action_content_binding_missing", "每个动作步骤必须绑定有效 content_atom_refs", unit_index=unit_index, step_index=step_index))
+    screen_text = unit.get("screen_text")
+    if isinstance(screen_text, dict) and screen_text.get("required_text"):
+        atom_ids = screen_text.get("content_atom_refs")
+        compiled = compiled_content_atom_text(atom_ids, atoms) if isinstance(atom_ids, list) else None
+        if compiled is None:
+            errors.append(issue("shotplan_screen_text_source_missing", "剧情屏显必须绑定有效 content atoms", unit_index=unit_index))
+        elif compact_dialogue_text(str(screen_text.get("required_text"))) != compact_dialogue_text(compiled):
+            errors.append(issue("shotplan_unproven_content", "screen_text.required_text 必须等于绑定 content atom 文本", unit_index=unit_index, field="screen_text.required_text"))
+    # prompt_text 是制作字段，由已验证的动作、人物、镜头、声音和负面约束编译；
+    # 不把整段生产提示词伪装成原著 content atom。其完整性由
+    # validate_unit_prompt_executability 单独校验。
+    return errors
+
+
+def _prompt_contract_text(value: Any) -> str:
+    return re.sub(r"[\s，。！？；：、‘’“”\"'（）()《》【】]+", "", str(value or ""))
+
+
+def _prompt_contains(prompt_text: str, required_text: Any) -> bool:
+    required = _prompt_contract_text(required_text)
+    return bool(required) and required in _prompt_contract_text(prompt_text)
+
+
+def validate_unit_prompt_executability(
+    unit: dict[str, Any],
+    cues_by_id: dict[str, dict[str, Any]],
+    unit_index: int,
+) -> list[dict[str, Any]]:
+    """阻止只有“风格+一句动作”的模板提示词冒充可直接生成的通用提示词。"""
+    prompt_text = unit.get("prompt_text")
+    if prompt_text is None:
+        return []
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        return [issue("shotplan_prompt_text_invalid", "prompt_text 如提供必须是非空字符串", unit_index=unit_index)]
+
+    errors: list[dict[str, Any]] = []
+    action_start = unit.get("action_start")
+    action_end = unit.get("action_end")
+    if isinstance(action_start, str) and re.search(r"(?:本场|场)?上一状态完成|上一镜完成|承接上镜$", action_start.strip()):
+        errors.append(issue("shotplan_prompt_placeholder_state", "动作起点不能使用“上一状态完成”等占位文字", unit_index=unit_index))
+    elif isinstance(action_start, str) and action_start.strip() and not _prompt_contains(prompt_text, action_start):
+        errors.append(issue("shotplan_prompt_action_start_missing", "prompt_text 未包含实际动作起点", unit_index=unit_index))
+    if isinstance(action_end, str) and action_end.strip() and not _prompt_contains(prompt_text, action_end):
+        errors.append(issue("shotplan_prompt_action_end_missing", "prompt_text 未包含动作终点", unit_index=unit_index))
+
+    for character_index, character in enumerate(unit.get("characters_on_screen", []) or [], 1):
+        if not isinstance(character, dict):
+            continue
+        appearance_lock = character.get("appearance_lock")
+        if isinstance(appearance_lock, str) and appearance_lock.strip() and not _prompt_contains(prompt_text, appearance_lock):
+            errors.append(issue("shotplan_prompt_appearance_missing", "prompt_text 未注入出场人物 appearance_lock", unit_index=unit_index, character_index=character_index, character_id=character.get("character_id")))
+
+    sound_events = unit.get("sound_events")
+    if not isinstance(sound_events, list) or not sound_events:
+        errors.append(issue("shotplan_prompt_sound_missing", "通用提示词必须声明环境声、音效、对白声或明确静音", unit_index=unit_index))
+    else:
+        for sound_index, sound in enumerate(sound_events, 1):
+            description = sound.get("description") if isinstance(sound, dict) else None
+            if isinstance(description, str) and description.strip() and not _prompt_contains(prompt_text, description):
+                errors.append(issue("shotplan_prompt_sound_missing", "prompt_text 未包含 sound_events 声音描述", unit_index=unit_index, sound_index=sound_index))
+
+    movement = unit.get("shot_language", {}).get("camera_movement") if isinstance(unit.get("shot_language"), dict) else None
+    movement_description = movement.get("description") if isinstance(movement, dict) else movement
+    if isinstance(movement_description, str) and movement_description.strip() and not _prompt_contains(prompt_text, movement_description):
+        errors.append(issue("shotplan_prompt_camera_missing", "prompt_text 未包含当前镜头运动描述", unit_index=unit_index))
+
+    for zone_index, zone in enumerate(unit.get("space_zones", []) or [], 1):
+        description = zone.get("description") if isinstance(zone, dict) else None
+        if isinstance(description, str) and description.strip() and not _prompt_contains(prompt_text, description):
+            errors.append(issue("shotplan_prompt_environment_missing", "prompt_text 未包含空间环境描述", unit_index=unit_index, zone_index=zone_index))
+
+    for cue_entry in unit.get("dialogue", []) or []:
+        if not isinstance(cue_entry, dict):
+            continue
+        cue = cues_by_id.get(cue_entry.get("cue_id"))
+        if not isinstance(cue, dict):
+            continue
+        speaker = cue.get("speaker_name") or cue.get("speaker_id") or cue.get("character_id")
+        text = cue.get("text")
+        if (isinstance(speaker, str) and not _prompt_contains(prompt_text, speaker)) or (
+            isinstance(text, str) and not _prompt_contains(prompt_text, text)
+        ):
+            errors.append(issue("shotplan_prompt_dialogue_missing", "prompt_text 未同时包含说话人和原著台词", unit_index=unit_index, cue_id=cue_entry.get("cue_id")))
+
+    for negative_index, negative in enumerate(unit.get("negative_constraints", []) or [], 1):
+        if isinstance(negative, str) and negative.strip() and not _prompt_contains(prompt_text, negative):
+            errors.append(issue("shotplan_prompt_negative_missing", "prompt_text 未包含当前单元负面约束", unit_index=unit_index, negative_index=negative_index))
+    return errors
+
+
+def fact_definitions_by_id(event_index: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    definitions = event_index.get("fact_definitions") if isinstance(event_index, dict) else None
+    if not isinstance(definitions, list):
+        return {}
+    return {
+        item.get("fact_id"): item
+        for item in definitions
+        if isinstance(item, dict) and isinstance(item.get("fact_id"), str)
+    }
+
+
+def validate_required_fact_coverage(
+    event_index: dict[str, Any] | None,
+    payload: dict[str, Any],
+    episode_id: str,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    beats = source_beat_index(event_index)
+    scopes = event_index.get("episode_scopes") if isinstance(event_index, dict) else None
+    scope = scopes.get(episode_id) if isinstance(scopes, dict) else None
+    allowed = scope.get("allowed_beat_ids") if isinstance(scope, dict) else None
+    if not isinstance(allowed, list):
+        return errors
+    required: set[str] = set()
+    for beat_id in allowed:
+        beat = beats.get(beat_id)
+        if isinstance(beat, dict):
+            required.update(beat.get("required_fact_ids", set()))
+    definitions = fact_definitions_by_id(event_index)
+    covered: set[str] = set()
+    for unit_index, unit in enumerate(payload.get("units", []), 1):
+        if not isinstance(unit, dict):
+            continue
+        unit_beat_refs = set(unit.get("source_beat_refs", [])) if isinstance(unit.get("source_beat_refs"), list) else set()
+        cue_ids = {
+            entry.get("cue_id") for entry in unit.get("dialogue", [])
+            if isinstance(entry, dict) and isinstance(entry.get("cue_id"), str)
+        } if isinstance(unit.get("dialogue"), list) else set()
+        flow = unit.get("action_flow")
+        step_ids = {
+            step.get("step_id") for step in flow.get("steps", [])
+            if isinstance(step, dict) and isinstance(step.get("step_id"), str)
+        } if isinstance(flow, dict) and isinstance(flow.get("steps"), list) else set()
+        realizations = unit.get("fact_realizations")
+        if not isinstance(realizations, list):
+            if required:
+                errors.append(issue("shotplan_fact_realizations_invalid", "存在必要事实时每个分镜单元 fact_realizations 必须是数组", unit_index=unit_index))
+            continue
+        for realization_index, realization in enumerate(realizations, 1):
+            if not isinstance(realization, dict):
+                errors.append(issue("shotplan_fact_realizations_invalid", "fact realization 必须是对象", unit_index=unit_index, realization_index=realization_index))
+                continue
+            fact_id = realization.get("fact_id")
+            definition = definitions.get(fact_id) if isinstance(fact_id, str) else None
+            if not isinstance(definition, dict):
+                errors.append(issue("shotplan_fact_realization_unknown", "fact realization 引用了未知事实", unit_index=unit_index, fact_id=fact_id))
+                continue
+            source_beats = set(definition.get("source_beat_ids", [])) if isinstance(definition.get("source_beat_ids"), list) else set()
+            if not source_beats.intersection(unit_beat_refs):
+                errors.append(issue("shotplan_fact_beat_mismatch", "事实实现必须位于其来源 beat 对应的分镜单元", unit_index=unit_index, fact_id=fact_id))
+                continue
+            carrier = realization.get("carrier")
+            carrier_id = realization.get("carrier_id")
+            carrier_valid = (
+                (carrier == "dialogue_cue" and carrier_id in cue_ids)
+                or (carrier == "action_step" and carrier_id in step_ids)
+                or (carrier == "screen_text" and isinstance(unit.get("screen_text"), dict) and unit["screen_text"].get("required_text"))
+                or (carrier == "state_change" and isinstance(unit.get("state_chain"), dict) and isinstance(unit["state_chain"].get("exit"), dict))
+            )
+            if not carrier_valid:
+                errors.append(issue("shotplan_fact_carrier_missing", "fact realization 声明的真实载体不存在", unit_index=unit_index, fact_id=fact_id, carrier=carrier, carrier_id=carrier_id))
+                continue
+            covered.add(fact_id)
+    missing = sorted(required - covered)
+    if missing:
+        errors.append(issue("shotplan_required_fact_coverage_missing", "当前集必要事实未通过真实载体覆盖", episode_id=episode_id, missing=missing))
+    return errors
+
+
+def chinese_number_to_int(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if value in digits:
+        return digits[value]
+    if value == "十":
+        return 10
+    if "十" in value:
+        left, right = value.split("十", 1)
+        tens = digits.get(left, 1) if left else 1
+        ones = digits.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return None
+
+
+def parse_relative_time_expression(expression: str) -> tuple[int, str | None] | None:
+    text = re.sub(r"\\s+", "", expression)
+    day_part_map = {"凌晨": "dawn", "早晨": "morning", "上午": "morning", "中午": "noon", "下午": "afternoon", "傍晚": "evening", "晚上": "night", "夜里": "night", "深夜": "late_night"}
+    day_part = next((mapped for label, mapped in day_part_map.items() if label in text), None)
+    if text.startswith(("同日", "当天")):
+        return 0, day_part
+    if text.startswith(("次日", "翌日", "第二天")):
+        return 1, day_part
+    if text.startswith("后天"):
+        return 2, day_part
+    match = re.match(r"([零一二两三四五六七八九十\\d]+)天后", text)
+    if match:
+        value = chinese_number_to_int(match.group(1))
+        return (value, day_part) if value is not None else None
+    return None
+
+
+def validate_source_timeline_contract(
+    event_index: dict[str, Any] | None,
+    source_text_by_id: dict[str, str],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    beats = source_beat_index(event_index)
+    constraints = event_index.get("temporal_constraints", []) if isinstance(event_index, dict) else []
+    if not isinstance(constraints, list):
+        return [issue("event_temporal_constraints_invalid", "temporal_constraints 必须是数组")]
+    seen: set[str] = set()
+    for index, constraint in enumerate(constraints, 1):
+        if not isinstance(constraint, dict):
+            errors.append(issue("event_temporal_constraint_invalid", "时间约束必须是对象", constraint_index=index))
+            continue
+        constraint_id = constraint.get("constraint_id")
+        if not isinstance(constraint_id, str) or not constraint_id.strip() or constraint_id in seen:
+            errors.append(issue("event_temporal_constraint_id_invalid", "时间约束 ID 缺失或重复", constraint_index=index))
+        else:
+            seen.add(constraint_id)
+        anchor_id = constraint.get("anchor_beat_id")
+        target_id = constraint.get("target_beat_id")
+        anchor = beats.get(anchor_id) if isinstance(anchor_id, str) else None
+        target = beats.get(target_id) if isinstance(target_id, str) else None
+        if not isinstance(anchor, dict) or not isinstance(target, dict):
+            errors.append(issue("event_temporal_beat_unknown", "时间约束 anchor/target beat 不存在", constraint_index=index))
+            continue
+        expression = constraint.get("expression_text")
+        source_unit_id = constraint.get("source_unit_id")
+        source_text = source_text_by_id.get(source_unit_id) if isinstance(source_unit_id, str) else None
+        if not isinstance(expression, str) or not expression.strip() or not isinstance(source_text, str) or compact_dialogue_text(expression) not in compact_dialogue_text(source_text):
+            errors.append(issue("event_temporal_expression_not_in_source", "时间表达必须逐字存在于绑定原著单元", constraint_index=index))
+            continue
+        parsed = parse_relative_time_expression(expression)
+        if parsed is None:
+            errors.append(issue("event_temporal_expression_unsupported", "精确时间约束包含不支持的模糊表达", constraint_index=index, expression=expression))
+            continue
+        anchor_time = anchor.get("story_time")
+        target_time = target.get("story_time")
+        if not isinstance(anchor_time, dict) or not isinstance(target_time, dict) or type(anchor_time.get("day_index")) is not int or type(target_time.get("day_index")) is not int:
+            errors.append(issue("event_story_time_missing", "时间约束涉及的 beat 必须声明整数 day_index", constraint_index=index))
+            continue
+        offset, expected_part = parsed
+        if target_time["day_index"] - anchor_time["day_index"] != offset:
+            errors.append(issue("event_temporal_offset_mismatch", "相对时间表达与目标事件 day_index 不一致", constraint_index=index, expected_offset=offset, actual_offset=target_time["day_index"] - anchor_time["day_index"]))
+        if offset > 0 and target["order"] <= anchor["order"]:
+            errors.append(issue("event_temporal_target_order_invalid", "未来时间表达的目标 beat 必须晚于 anchor beat", constraint_index=index))
+        if expected_part is not None and target_time.get("day_part") != expected_part:
+            errors.append(issue("event_temporal_day_part_mismatch", "时间表达的目标时段与 target beat 不一致", constraint_index=index, expected=expected_part, actual=target_time.get("day_part")))
+    return errors
+
+
+def validate_shot_plan_timeline_contract(
+    event_index: dict[str, Any] | None,
+    payload: dict[str, Any],
+    cues_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    beats = source_beat_index(event_index)
+    constraints = event_index.get("temporal_constraints", []) if isinstance(event_index, dict) else []
+    constrained_beats = {
+        value
+        for constraint in constraints if isinstance(constraint, dict)
+        for value in (constraint.get("anchor_beat_id"), constraint.get("target_beat_id"))
+        if isinstance(value, str)
+    } if isinstance(constraints, list) else set()
+    previous_day: int | None = None
+    relative_claim_re = re.compile(r"(?:同日|当天|次日|翌日|第二天|后天|[零一二两三四五六七八九十\\d]+天后)(?:凌晨|早晨|上午|中午|下午|傍晚|晚上|夜里|深夜)?")
+    for unit_index, unit in enumerate(payload.get("units", []), 1):
+        if not isinstance(unit, dict):
+            continue
+        refs = unit.get("source_beat_refs") if isinstance(unit.get("source_beat_refs"), list) else []
+        times = [beats[ref].get("story_time") for ref in refs if ref in beats and isinstance(beats[ref].get("story_time"), dict)]
+        days = [time.get("day_index") for time in times if type(time.get("day_index")) is int]
+        mode = unit.get("time_span_mode")
+        if mode == "continuous" and len(set(days)) > 1:
+            errors.append(issue("shotplan_continuous_time_jump", "continuous 分镜单元不能同时引用不同故事日期的 beat", unit_index=unit_index, day_indices=sorted(set(days))))
+        if days:
+            current_day = min(days)
+            if previous_day is not None and current_day < previous_day and mode != "flashback":
+                errors.append(issue("shotplan_story_time_reversed", "非 flashback 分镜不能让故事日期倒退", unit_index=unit_index, previous_day=previous_day, current_day=current_day))
+            previous_day = max(days)
+        text_fields = [unit.get("narrative_task"), unit.get("action_start"), unit.get("action_end")]
+        screen_text = unit.get("screen_text")
+        if isinstance(screen_text, dict):
+            text_fields.append(screen_text.get("required_text"))
+        for entry in unit.get("dialogue", []) if isinstance(unit.get("dialogue"), list) else []:
+            if isinstance(entry, dict):
+                cue = cues_by_id.get(entry.get("cue_id"))
+                if isinstance(cue, dict):
+                    text_fields.append(cue.get("text"))
+        if any(isinstance(text, str) and relative_claim_re.search(text) for text in text_fields):
+            if not set(refs).intersection(constrained_beats):
+                errors.append(issue("shotplan_temporal_claim_unbound", "分镜中的明确相对时间表达必须绑定原著 temporal_constraint", unit_index=unit_index))
+    return errors
 
 
 def validate_shot_plan_source_contract(
@@ -3543,15 +4425,26 @@ def validate_shot_plan_source_contract(
     if not isinstance(scope, dict):
         errors.append(issue("shotplan_source_scope_missing", "原著事件索引必须声明当前集 episode_scope", episode_id=episode_id))
         return errors
+    allowed_ids = scope.get("allowed_beat_ids")
+    if (
+        not isinstance(allowed_ids, list)
+        or not allowed_ids
+        or len(allowed_ids) != len(set(allowed_ids))
+        or not all(isinstance(value, str) and value in beats for value in allowed_ids)
+    ):
+        errors.append(issue("shotplan_source_scope_invalid", "episode_scope 必须声明无重复且全部存在的 allowed_beat_ids", episode_id=episode_id))
+        return errors
+    allowed_orders = [beats[value]["order"] for value in allowed_ids]
+    if allowed_orders != sorted(allowed_orders):
+        errors.append(issue("shotplan_source_scope_reversed", "allowed_beat_ids 必须严格遵循原著顺序", episode_id=episode_id))
+        return errors
     first_id = scope.get("first_beat_id")
     last_id = scope.get("last_beat_id")
-    if first_id not in beats or last_id not in beats:
-        errors.append(issue("shotplan_source_scope_invalid", "episode_scope 的首尾 beat 必须存在", episode_id=episode_id))
+    if first_id != allowed_ids[0] or last_id != allowed_ids[-1]:
+        errors.append(issue("shotplan_source_scope_invalid", "episode_scope 首尾 beat 必须与 allowed_beat_ids 首尾一致", episode_id=episode_id))
         return errors
-    lower, upper = beats[first_id]["order"], beats[last_id]["order"]
-    if lower > upper:
-        errors.append(issue("shotplan_source_scope_reversed", "episode_scope 首尾顺序无效", episode_id=episode_id))
-        return errors
+    lower, upper = allowed_orders[0], allowed_orders[-1]
+    allowed_set = set(allowed_ids)
     facts = story_facts.get("facts") if isinstance(story_facts, dict) else None
     known_fact_ids = {
         item.get("fact_id")
@@ -3571,8 +4464,9 @@ def validate_shot_plan_source_contract(
             errors.append(issue("shotplan_source_beat_unknown", "分镜引用了不存在的来源 beat", unit_index=index, unknown=unknown))
             continue
         orders = [beats[value]["order"] for value in refs]
-        if min(orders) < lower or max(orders) > upper:
-            errors.append(issue("shotplan_source_boundary_exceeded", "分镜引用超出当前集允许的原著范围", unit_index=index))
+        outside = sorted(set(refs) - allowed_set)
+        if outside:
+            errors.append(issue("shotplan_source_boundary_exceeded", "分镜引用超出当前集明确允许的原著 beat", unit_index=index, outside=outside))
         if min(orders) < previous_order:
             errors.append(issue("shotplan_source_order_violation", "分镜来源顺序发生倒退或调序", unit_index=index))
         previous_order = max(previous_order, max(orders))
@@ -3590,6 +4484,54 @@ def validate_shot_plan_source_contract(
             errors.append(issue("shotplan_new_fact_claims_invalid", "new_fact_claims 必须是数组", unit_index=index))
         elif new_claims and not unit.get("decision_ids"):
             errors.append(issue("shotplan_unauthorized_fact_added", "新增事实必须绑定已批准改编决策", unit_index=index))
+    return errors
+
+
+def source_character_ids(event_index: dict[str, Any] | None) -> set[str]:
+    entities = event_index.get("entities") if isinstance(event_index, dict) else None
+    if not isinstance(entities, list):
+        return set()
+    return {
+        entity.get("entity_id")
+        for entity in entities
+        if isinstance(entity, dict)
+        and entity.get("entity_type") == "character"
+        and isinstance(entity.get("entity_id"), str)
+    }
+
+
+def validate_unit_character_registry(
+    unit: dict[str, Any], canonical_character_ids: set[str], unit_index: int
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    referenced: set[str] = set()
+    characters = unit.get("characters_on_screen")
+    if isinstance(characters, list):
+        referenced.update(
+            item.get("character_id")
+            for item in characters
+            if isinstance(item, dict) and isinstance(item.get("character_id"), str)
+        )
+    screen_video = unit.get("screen_video_characters")
+    if isinstance(screen_video, list):
+        referenced.update(value for value in screen_video if isinstance(value, str))
+    state_chain = unit.get("state_chain")
+    if isinstance(state_chain, dict):
+        for state_name in ("enter", "exit"):
+            state = state_chain.get(state_name)
+            characters_state = state.get("characters") if isinstance(state, dict) else None
+            if isinstance(characters_state, dict):
+                referenced.update(value for value in characters_state if isinstance(value, str))
+    unknown = sorted(referenced - canonical_character_ids)
+    if unknown:
+        errors.append(
+            issue(
+                "shotplan_character_unknown",
+                "分镜人物必须引用原著事件索引的 canonical character ID",
+                unit_index=unit_index,
+                unknown=unknown,
+            )
+        )
     return errors
 
 
@@ -3628,6 +4570,139 @@ def validate_unit_character_modes(
     return errors
 
 
+def validate_tail_frame_contract(
+    units: list[Any],
+    state: dict[str, Any],
+    episode_id: str,
+    project_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    episode_match = re.fullmatch(r"E(\d{3,6})", episode_id or "", re.IGNORECASE)
+    previous_unit_id: str | None = None
+    for index, unit in enumerate(units, 1):
+        if not isinstance(unit, dict):
+            continue
+        strategy = unit.get("generation_strategy")
+        unit_id = unit.get("unit_id")
+        if strategy == "tail_frame_chain":
+            if index > 1:
+                if unit.get("continuation_from_unit_id") != previous_unit_id:
+                    errors.append(issue("shotplan_tail_previous_unit_missing", "同集 tail_frame_chain 必须明确绑定紧邻上一分镜单元", unit_index=index, expected=previous_unit_id))
+            else:
+                ref = unit.get("previous_episode_tail_ref")
+                if not isinstance(ref, dict):
+                    errors.append(issue("shotplan_cross_episode_tail_missing", "跨集首镜使用 tail_frame_chain 时必须绑定上一集已确认尾镜", unit_index=index))
+                elif episode_match is None or int(episode_match.group(1)) <= 1:
+                    errors.append(issue("shotplan_cross_episode_tail_invalid", "第一集首镜不能使用上一集尾帧续接", unit_index=index))
+                else:
+                    previous_episode = f"E{int(episode_match.group(1)) - 1:03d}"
+                    expected_key = f"ai_shot_plan:{previous_episode}"
+                    key = ref.get("artifact_key")
+                    version = ref.get("version")
+                    tail_unit_id = ref.get("unit_id")
+                    if key != expected_key or type(version) is not int or not isinstance(tail_unit_id, str):
+                        errors.append(issue("shotplan_cross_episode_tail_invalid", "上一集尾帧引用必须包含正确 artifact_key/version/unit_id", unit_index=index, expected_key=expected_key))
+                    else:
+                        target = next(
+                            (
+                                record
+                                for record in state.get("artifacts", {}).get(key, [])
+                                if isinstance(record, dict) and record.get("version") == version
+                            ),
+                            None,
+                        )
+                        if target is None or target.get("status") != "confirmed":
+                            errors.append(issue("shotplan_cross_episode_tail_unconfirmed", "上一集尾帧引用必须指向已确认分镜计划", unit_index=index, artifact_key=key, version=version))
+                        elif project_path is not None:
+                            target_path = path_from_record(project_path, target.get("path"))
+                            target_payload = read_json(target_path) if target_path and target_path.is_file() else None
+                            target_units = target_payload.get("units") if isinstance(target_payload, dict) else None
+                            last_unit_id = target_units[-1].get("unit_id") if isinstance(target_units, list) and target_units and isinstance(target_units[-1], dict) else None
+                            if tail_unit_id != last_unit_id:
+                                errors.append(issue("shotplan_cross_episode_tail_not_last", "跨集续接必须引用上一集最后一个分镜单元", unit_index=index, expected=last_unit_id, actual=tail_unit_id))
+        previous_unit_id = unit_id if isinstance(unit_id, str) else None
+    return errors
+
+
+def validate_unit_spatial_audio_contract(
+    unit: dict[str, Any],
+    cues_by_id: dict[str, dict[str, Any]],
+    unit_index: int,
+    strict_contract: bool = False,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    zones = unit.get("space_zones")
+    if not strict_contract and zones is None and unit.get("sound_events") is None:
+        return errors
+    zone_ids: set[str] = set()
+    if not isinstance(zones, list) or not zones:
+        errors.append(issue("shotplan_space_zones_missing", "分镜单元必须声明非空 space_zones", unit_index=unit_index))
+    else:
+        for zone_index, zone in enumerate(zones, 1):
+            if not isinstance(zone, dict):
+                errors.append(issue("shotplan_space_zone_invalid", "space_zones 条目必须是对象", unit_index=unit_index, zone_index=zone_index))
+                continue
+            space_id = zone.get("space_id")
+            if not isinstance(space_id, str) or not space_id.strip() or space_id in zone_ids:
+                errors.append(issue("shotplan_space_zone_id_invalid", "space_id 缺失或重复", unit_index=unit_index, zone_index=zone_index))
+            else:
+                zone_ids.add(space_id)
+            if zone.get("kind") not in {"room", "exterior", "vehicle", "device_screen", "memory", "virtual"}:
+                errors.append(issue("shotplan_space_zone_kind_invalid", "space zone kind 无效", unit_index=unit_index, zone_index=zone_index))
+    characters = unit.get("characters_on_screen")
+    if isinstance(characters, list):
+        for character_index, character in enumerate(characters, 1):
+            if not isinstance(character, dict):
+                continue
+            space_id = character.get("space_id")
+            if not isinstance(space_id, str) or space_id not in zone_ids:
+                errors.append(issue("shotplan_character_space_missing", "现场人物必须绑定当前单元的有效 space_id", unit_index=unit_index, character_index=character_index, character_id=character.get("character_id")))
+    sound_events = unit.get("sound_events")
+    if not isinstance(sound_events, list):
+        errors.append(issue("shotplan_sound_events_invalid", "sound_events 必须是数组（无声音用空数组）", unit_index=unit_index))
+        sound_events = []
+    sound_by_id: dict[str, dict[str, Any]] = {}
+    for sound_index, sound in enumerate(sound_events, 1):
+        if not isinstance(sound, dict):
+            errors.append(issue("shotplan_sound_event_invalid", "sound_events 条目必须是对象", unit_index=unit_index, sound_index=sound_index))
+            continue
+        sound_id = sound.get("sound_id")
+        if not isinstance(sound_id, str) or not sound_id.strip() or sound_id in sound_by_id:
+            errors.append(issue("shotplan_sound_event_id_invalid", "sound_id 缺失或重复", unit_index=unit_index, sound_index=sound_index))
+            continue
+        sound_by_id[sound_id] = sound
+        if not isinstance(sound.get("description"), str) or not sound["description"].strip():
+            errors.append(issue("shotplan_sound_description_missing", "声音事件缺少 description", unit_index=unit_index, sound_index=sound_index))
+        source_type = sound.get("source_type")
+        if source_type not in {"ambient", "sfx", "device", "voice"}:
+            errors.append(issue("shotplan_sound_source_type_invalid", "sound source_type 无效", unit_index=unit_index, sound_index=sound_index))
+        if sound.get("space_id") not in zone_ids:
+            errors.append(issue("shotplan_sound_space_invalid", "声音事件必须绑定当前单元的有效 space_id", unit_index=unit_index, sound_index=sound_index))
+        if sound.get("scope") != "unit":
+            code = "shotplan_device_audio_scope_invalid" if source_type == "device" else "shotplan_sound_scope_invalid"
+            errors.append(issue(code, "声音生命周期必须限制在当前分镜单元，跨单元需逐单元显式续写", unit_index=unit_index, sound_index=sound_index))
+        if source_type == "device" and (
+            not isinstance(sound.get("device_id"), str) or not sound["device_id"].strip()
+        ):
+            errors.append(issue("shotplan_device_audio_source_missing", "设备声音必须声明 device_id", unit_index=unit_index, sound_index=sound_index))
+    dialogue = unit.get("dialogue")
+    if isinstance(dialogue, list):
+        for cue_entry in dialogue:
+            if not isinstance(cue_entry, dict):
+                continue
+            cue_id = cue_entry.get("cue_id")
+            cue = cues_by_id.get(cue_id) if isinstance(cue_id, str) else None
+            if not isinstance(cue, dict) or cue.get("delivery_mode") not in {"phone_audio", "phone_video", "screen_video"}:
+                continue
+            audio_event_id = cue_entry.get("audio_event_id")
+            sound = sound_by_id.get(audio_event_id) if isinstance(audio_event_id, str) else None
+            if not isinstance(sound, dict) or sound.get("source_type") != "device" or sound.get("scope") != "unit":
+                errors.append(issue("shotplan_device_audio_binding_missing", "电话或屏幕视频台词必须绑定当前单元的 device sound_event", unit_index=unit_index, cue_id=cue_id))
+    if strict_contract and "sound" in unit:
+        errors.append(issue("shotplan_legacy_sound_forbidden", "严格分镜契约禁止使用无空间和生命周期的 sound 字符串数组", unit_index=unit_index))
+    return errors
+
+
 def validate_unit_feasibility(
     unit: dict[str, Any],
     cues_by_id: dict[str, dict[str, Any]],
@@ -3640,13 +4715,9 @@ def validate_unit_feasibility(
     spoken_chars = 0
     for entry in unit.get("dialogue", []) if isinstance(unit.get("dialogue"), list) else []:
         cue = cues_by_id.get(entry.get("cue_id"), {}) if isinstance(entry, dict) else {}
-        text = cue.get("text") or cue.get("delivered_text")
+        text = cue.get("text")
         if isinstance(text, str):
             spoken_chars += len(re.sub(r"\s+", "", text))
-        if cue.get("preservation_mode") == "exact":
-            source_text = cue.get("source_text")
-            if not isinstance(source_text, str) or text != source_text:
-                errors.append(issue("protected_dialogue_changed", "exact 关键台词必须与来源原文一致", unit_index=unit_index, cue_id=cue.get("cue_id")))
     if isinstance(duration, (int, float)) and duration > 0 and spoken_chars > duration * rate[1]:
         errors.append(issue("shotplan_dialogue_capacity_exceeded", "按最快语速计算，对白仍超过当前镜头时长", unit_index=unit_index, spoken_chars=spoken_chars, duration=duration))
     flow = unit.get("action_flow")
@@ -3755,6 +4826,7 @@ def validate_ai_shot_plan_payload(
         budget = {}
 
     event_index = dependency_payload_of_type(project_path, state, record, "source_event_index")
+    canonical_character_ids = source_character_ids(event_index)
     valid_source_refs = source_reference_ids(event_index)
     ledger = dependency_payload_of_type(project_path, state, record, "adaptation_decision_ledger")
     decisions = ledger.get("decisions") if isinstance(ledger, dict) else None
@@ -3763,6 +4835,11 @@ def validate_ai_shot_plan_payload(
         for item in decisions
         if isinstance(item, dict) and isinstance(item.get("decision_id"), str)
     } if isinstance(decisions, list) else set()
+    decisions_by_id = {
+        item.get("decision_id"): item
+        for item in decisions
+        if isinstance(item, dict) and isinstance(item.get("decision_id"), str)
+    } if isinstance(decisions, list) else {}
 
     script_dependency = dependency_record_of_type(state, record, "episode_script")
     script_scenes: dict[str, dict[str, Any]] = {}
@@ -3809,6 +4886,11 @@ def validate_ai_shot_plan_payload(
     ) or (
         isinstance(plan_schema, int) and not isinstance(plan_schema, bool) and plan_schema >= 2
     )
+    if strict_contract and payload.get("content_contract_version") != 1:
+        errors.append(issue("shotplan_content_contract_upgrade_required", "严格分镜计划必须使用 content_contract_version=1"))
+    errors.extend(validate_required_fact_coverage(event_index, payload, str(episode_id or scope)))
+    errors.extend(validate_shot_plan_timeline_contract(event_index, payload, cues_by_id))
+    beats = source_beat_index(event_index)
     unit_rate = dialogue_chars_per_second(project_duration_policy(project_path, state))
 
     seen_unit_ids: set[str] = set()
@@ -3843,9 +4925,18 @@ def validate_ai_shot_plan_payload(
         if not isinstance(shot_language, dict):
             errors.append(issue("shotplan_shot_language_missing", "分镜单元必须声明 shot_language", unit_index=index))
             shot_language = {}
-        for field in ("shot_size", "camera_angle", "composition", "camera_movement", "visual_focus", "transition"):
+        shot_contract_version = payload.get("shot_language_contract_version", 1)
+        if shot_contract_version not in {1, 2}:
+            errors.append(issue("shotplan_shot_contract_version_invalid", "shot_language_contract_version 必须为1或2"))
+            shot_contract_version = 1
+        for field in ("camera_angle", "composition", "visual_focus", "transition"):
             if not isinstance(shot_language.get(field), str) or not shot_language[field].strip():
                 errors.append(issue("shotplan_shot_language_field_missing", f"shot_language 缺少 {field}", unit_index=index, field=field))
+        errors.extend(
+            shot_contracts.validate_shot_framing_contract(
+                unit, index, strict=shot_contract_version == 2
+            )
+        )
         duration = unit.get("duration_seconds")
         if not isinstance(duration, (int, float)) or isinstance(duration, bool) or duration <= 0 or duration > 60:
             errors.append(issue("shotplan_unit_duration_invalid", "duration_seconds 必须是0到60秒之间的数值", unit_index=index))
@@ -3940,11 +5031,16 @@ def validate_ai_shot_plan_payload(
         if lip_sync_count and len(lip_sync_speakers) > 1:
             errors.append(issue("shotplan_multi_lip_sync", "一个分镜单元只允许一名角色清晰对嘴", unit_index=index, speakers=sorted(lip_sync_speakers)))
 
+        errors.extend(validate_unit_content_contract(unit, beats, decisions_by_id, index, strict_contract))
+        errors.extend(validate_unit_character_registry(unit, canonical_character_ids, index))
         errors.extend(validate_unit_character_modes(unit, cues_by_id, index))
+        errors.extend(validate_unit_spatial_audio_contract(unit, cues_by_id, index, strict_contract))
         errors.extend(validate_unit_feasibility(unit, cues_by_id, unit_rate, index, strict_contract))
 
-        if not isinstance(unit.get("sound"), list) or not all(
-            isinstance(value, str) and value.strip() for value in unit.get("sound", [])
+        if not strict_contract and (
+            not isinstance(unit.get("sound"), list) or not all(
+                isinstance(value, str) and value.strip() for value in unit.get("sound", [])
+            )
         ):
             errors.append(issue("shotplan_sound_invalid", "sound 必须是字符串数组", unit_index=index))
         negative = unit.get("negative_constraints")
@@ -3961,6 +5057,7 @@ def validate_ai_shot_plan_payload(
                 errors.append(issue("shotplan_prompt_text_invalid", "prompt_text 如提供必须是非空字符串", unit_index=index))
             elif re.search(r"(?<!\d)\d{1,2}\s*(?:[-—~至到])\s*\d{1,2}\s*秒", unit_prompt_text):
                 errors.append(issue("shotplan_prompt_hard_timestamp", "通用提示词不得使用镜头内硬秒点", unit_index=index))
+            errors.extend(validate_unit_prompt_executability(unit, cues_by_id, index))
 
         state_chain = unit.get("state_chain")
         if not isinstance(state_chain, dict):
@@ -3979,6 +5076,8 @@ def validate_ai_shot_plan_payload(
                 errors.append(issue("shotplan_state_chain_break", "同链上一单元 exit 状态必须与本单元 enter 状态完全一致", unit_index=index))
         previous_chain = chain_id if isinstance(chain_id, str) else None
         previous_exit = exit_state
+
+    errors.extend(validate_tail_frame_contract(units, state, str(episode_id or scope), project_path))
 
     used_counts = Counter(used_cue_ids)
     missing_cues = sorted(expected_cue_ids - set(used_cue_ids))
@@ -4036,6 +5135,61 @@ def validate_ai_shot_plan_payload(
     return errors
 
 
+def compile_ai_execution_prompt_text(prompt: dict[str, Any]) -> str:
+    return json.dumps(prompt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_ai_execution_content_contract(
+    task: dict[str, Any],
+    shot_units_by_id: dict[str, dict[str, Any]],
+    task_index: int,
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    source_unit_ids = task.get("source_unit_ids") if isinstance(task.get("source_unit_ids"), list) else []
+    allowed_atoms: dict[str, dict[str, Any]] = {}
+    allowed_characters: set[str] = set()
+    for unit_id in source_unit_ids:
+        unit = shot_units_by_id.get(unit_id)
+        if not isinstance(unit, dict):
+            continue
+        for atom in unit.get("content_atoms", []) if isinstance(unit.get("content_atoms"), list) else []:
+            if isinstance(atom, dict) and isinstance(atom.get("atom_id"), str):
+                allowed_atoms[atom["atom_id"]] = atom
+        for character in unit.get("characters_on_screen", []) if isinstance(unit.get("characters_on_screen"), list) else []:
+            if isinstance(character, dict) and isinstance(character.get("character_id"), str):
+                allowed_characters.add(character["character_id"])
+    atom_refs = task.get("content_atom_refs")
+    if not isinstance(atom_refs, list) or not atom_refs or set(atom_refs) != set(allowed_atoms):
+        errors.append(issue("aiexec_content_atom_refs_mismatch", "执行任务必须无遗漏地消费绑定分镜单元的全部 content atoms", task_index=task_index, expected=sorted(allowed_atoms), actual=sorted(atom_refs) if isinstance(atom_refs, list) else []))
+        atom_refs = []
+    expected_action = compiled_content_atom_text(atom_refs, allowed_atoms) if atom_refs else None
+    prompt = task.get("prompt")
+    if not isinstance(prompt, dict):
+        return errors
+    if expected_action is None or compact_dialogue_text(str(prompt.get("action", ""))) != compact_dialogue_text(expected_action):
+        errors.append(issue("aiexec_prompt_content_unproven", "prompt.action 必须由绑定分镜 content atoms 确定性编译", task_index=task_index))
+    subjects = prompt.get("subject")
+    subject_ids = {
+        item.get("character_id") for item in subjects
+        if isinstance(item, dict) and isinstance(item.get("character_id"), str)
+    } if isinstance(subjects, list) else set()
+    if subject_ids - allowed_characters:
+        errors.append(issue("aiexec_prompt_subject_unproven", "prompt.subject 包含绑定分镜未出现的人物", task_index=task_index, unknown=sorted(subject_ids - allowed_characters)))
+    environment_atom_refs = task.get("environment_atom_refs", [])
+    if environment_atom_refs:
+        expected_environment = compiled_content_atom_text(environment_atom_refs, allowed_atoms) if isinstance(environment_atom_refs, list) else None
+        if expected_environment is None or compact_dialogue_text(str(prompt.get("environment", ""))) != compact_dialogue_text(expected_environment):
+            errors.append(issue("aiexec_prompt_environment_unproven", "prompt.environment 必须来自绑定环境 content atoms", task_index=task_index))
+    elif prompt.get("environment") != "使用绑定场景锚点":
+        errors.append(issue("aiexec_prompt_environment_unproven", "没有环境 content atom 时 prompt.environment 必须固定为使用绑定场景锚点", task_index=task_index))
+    if task.get("prompt_compiler_version") != 1:
+        errors.append(issue("aiexec_prompt_compiler_missing", "执行任务必须使用 prompt_compiler_version=1", task_index=task_index))
+    expected_prompt_text = compile_ai_execution_prompt_text(prompt)
+    if task.get("prompt_text") != expected_prompt_text:
+        errors.append(issue("aiexec_prompt_text_not_compiled", "prompt_text 必须等于代码确定性编译结果", task_index=task_index))
+    return errors
+
+
 def validate_ai_video_execution_payload(
     project_path: Path,
     state: dict[str, Any],
@@ -4082,12 +5236,14 @@ def validate_ai_video_execution_payload(
 
     shot_plan = dependency_payload_of_type(project_path, state, record, "ai_shot_plan")
     shot_unit_ids: set[str] = set()
+    shot_units_by_id: dict[str, dict[str, Any]] = {}
     if shot_plan is None:
         errors.append(issue("aiexec_shot_plan_dependency_missing", "执行计划必须绑定当前集已确认的 AI分镜计划"))
     else:
         for unit in shot_plan.get("units", []) if isinstance(shot_plan.get("units"), list) else []:
             if isinstance(unit, dict) and isinstance(unit.get("unit_id"), str):
                 shot_unit_ids.add(unit["unit_id"])
+                shot_units_by_id[unit["unit_id"]] = unit
         if not shot_unit_ids:
             errors.append(issue("aiexec_shot_plan_units_missing", "绑定的 AI分镜计划没有可用单元"))
 
@@ -4188,6 +5344,7 @@ def validate_ai_video_execution_payload(
             errors.append(issue("aiexec_prompt_text_missing", "生成任务缺少编译后的 prompt_text", task_index=index))
         elif hard_timestamp.search(prompt_text):
             errors.append(issue("aiexec_prompt_hard_timestamp", "提示词不得使用镜头内硬秒点", task_index=index))
+        errors.extend(validate_ai_execution_content_contract(task, shot_units_by_id, index))
         chain = task.get("chain")
         if not isinstance(chain, dict):
             errors.append(issue("aiexec_chain_invalid", "生成任务 chain 必须是对象", task_index=index))
@@ -4296,6 +5453,349 @@ def validate_source_review_payload(
     return errors
 
 
+FINAL_OUTPUT_PLACEHOLDER_RE = re.compile(
+    r"\b(?:TBD|TODO|FIXME)\b|20XX|(?:\d{2}|XX)XX年|(?:\[|【)待(?:补|定|确认)",
+    re.IGNORECASE,
+)
+
+
+def compact_dialogue_text(value: str) -> str:
+    """仅忽略排版空白；不改字词、语序或标点。"""
+    return re.sub(r"\s+", "", value)
+
+
+def validate_dialogue_cue_sheet_payload(
+    project_path: Path,
+    state: dict[str, Any],
+    artifact_key: str,
+    record: dict[str, Any],
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """对白采用原著只读契约，不再支持模型改写或自填 source_text。"""
+    errors: list[dict[str, Any]] = []
+    if payload.get("contract_version") != 2:
+        errors.append(
+            issue(
+                "dialogue_contract_upgrade_required",
+                "台词声音表必须使用 contract_version=2 的原著对白只读契约",
+                artifact_key=artifact_key,
+            )
+        )
+    corpus = dependency_payload_of_type(
+        project_path, state, record, "source_corpus"
+    )
+    event_index = dependency_payload_of_type(
+        project_path, state, record, "source_event_index"
+    )
+    beats = source_beat_index(event_index)
+    episode_scopes = (
+        event_index.get("episode_scopes") if isinstance(event_index, dict) else None
+    )
+    canonical_character_ids = source_character_ids(event_index)
+    if not beats or not isinstance(episode_scopes, dict):
+        errors.append(
+            issue(
+                "dialogue_source_event_index_missing",
+                "台词声音表必须直接绑定带 episode_scopes 和 beats 的原著事件索引",
+                artifact_key=artifact_key,
+            )
+        )
+    source_units = corpus.get("source_units") if isinstance(corpus, dict) else None
+    source_text_by_id: dict[str, str] = {}
+    if not isinstance(source_units, list):
+        errors.append(
+            issue(
+                "dialogue_source_corpus_missing",
+                "台词声音表必须直接绑定有效原著语料库",
+                artifact_key=artifact_key,
+            )
+        )
+    else:
+        for unit in source_units:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = unit.get("source_unit_id")
+            content_path = path_from_record(project_path, unit.get("content_path"))
+            if (
+                isinstance(unit_id, str)
+                and unit_id
+                and content_path is not None
+                and content_path.is_file()
+            ):
+                source_text_by_id[unit_id] = content_path.read_text(encoding="utf-8")
+
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        errors.append(
+            issue(
+                "dialogue_records_invalid",
+                "台词声音表 records 必须是非空数组",
+                artifact_key=artifact_key,
+            )
+        )
+        return errors
+    cue_ids: set[str] = set()
+    previous_order_by_episode: dict[str, tuple[int, int]] = {}
+    for index, cue in enumerate(records):
+        if not isinstance(cue, dict):
+            errors.append(
+                issue(
+                    "dialogue_cue_invalid",
+                    "台词声音表中的每条记录必须是对象",
+                    cue_index=index,
+                )
+            )
+            continue
+        cue_id = cue.get("cue_id")
+        if not isinstance(cue_id, str) or not cue_id.strip():
+            errors.append(
+                issue(
+                    "dialogue_cue_id_invalid",
+                    "台词记录缺少 cue_id",
+                    cue_index=index,
+                )
+            )
+        elif cue_id in cue_ids:
+            errors.append(
+                issue(
+                    "dialogue_cue_id_duplicate",
+                    f"台词 cue_id 重复：{cue_id}",
+                    cue_index=index,
+                )
+            )
+        else:
+            cue_ids.add(cue_id)
+        cue_type = cue.get("type")
+        delivery_mode = cue.get("delivery_mode")
+        is_spoken = (
+            cue_type in SPOKEN_CUE_TYPES
+            or delivery_mode in SPOKEN_DELIVERY_MODES
+            or isinstance(cue.get("speaker_id"), str)
+        )
+        if not is_spoken:
+            continue
+        speaker_id = cue.get("speaker_id")
+        if not isinstance(speaker_id, str) or speaker_id not in canonical_character_ids:
+            errors.append(
+                issue(
+                    "dialogue_speaker_unknown",
+                    "对白、VO、OS speaker_id 必须引用原著事件索引的 canonical character ID",
+                    cue_index=index,
+                    cue_id=cue_id,
+                    speaker_id=speaker_id,
+                )
+            )
+        forbidden = sorted(DIALOGUE_REWRITE_METADATA_FIELDS.intersection(cue))
+        if forbidden:
+            errors.append(
+                issue(
+                    "dialogue_generated_metadata_forbidden",
+                    "原著对白只读契约禁止改写元数据和模型自填 source_text",
+                    cue_index=index,
+                    cue_id=cue_id,
+                    fields=forbidden,
+                )
+            )
+        text = cue.get("text")
+        if not isinstance(text, str) or not text.strip():
+            errors.append(
+                issue(
+                    "dialogue_text_invalid",
+                    "对白、VO、OS 必须提供非空原著文本",
+                    cue_index=index,
+                    cue_id=cue_id,
+                )
+            )
+            continue
+        if FINAL_OUTPUT_PLACEHOLDER_RE.search(text):
+            errors.append(
+                issue(
+                    "dialogue_placeholder_forbidden",
+                    "正式配音台词禁止包含 20XX、TBD、TODO 或待定占位符",
+                    cue_index=index,
+                    cue_id=cue_id,
+                )
+            )
+        source_unit_id = cue.get("source_unit_id")
+        source_locator = cue.get("source_locator")
+        if not isinstance(source_locator, str) or not source_locator.strip():
+            errors.append(
+                issue(
+                    "dialogue_source_locator_missing",
+                    "对白、VO、OS 必须提供可回查的 source_locator",
+                    cue_index=index,
+                    cue_id=cue_id,
+                )
+            )
+        episode_id = cue.get("episode_id")
+        source_beat_refs = cue.get("source_beat_refs")
+        if (
+            not isinstance(source_beat_refs, list)
+            or not source_beat_refs
+            or not all(isinstance(value, str) and value.strip() for value in source_beat_refs)
+        ):
+            errors.append(
+                issue(
+                    "dialogue_source_beats_missing",
+                    "每条对白、VO、OS 必须引用非空 source_beat_refs",
+                    cue_index=index,
+                    cue_id=cue_id,
+                )
+            )
+        else:
+            unknown = sorted(set(source_beat_refs) - set(beats))
+            if unknown:
+                errors.append(
+                    issue(
+                        "dialogue_source_beat_unknown",
+                        "对白引用了不存在的来源 beat",
+                        cue_index=index,
+                        cue_id=cue_id,
+                        unknown=unknown,
+                    )
+                )
+            scope = episode_scopes.get(episode_id) if isinstance(episode_scopes, dict) else None
+            allowed = scope.get("allowed_beat_ids") if isinstance(scope, dict) else None
+            if not isinstance(allowed, list) or not allowed or not all(
+                isinstance(value, str) and value in beats for value in allowed
+            ):
+                errors.append(
+                    issue(
+                        "dialogue_source_scope_invalid",
+                        "当前集必须声明有效且非空的 allowed_beat_ids",
+                        cue_index=index,
+                        cue_id=cue_id,
+                        episode_id=episode_id,
+                    )
+                )
+            elif not unknown:
+                outside = sorted(set(source_beat_refs) - set(allowed))
+                if outside:
+                    errors.append(
+                        issue(
+                            "dialogue_source_boundary_exceeded",
+                            "对白引用超出当前集明确允许的原著 beat",
+                            cue_index=index,
+                            cue_id=cue_id,
+                            episode_id=episode_id,
+                            outside=outside,
+                        )
+                    )
+                orders = [beats[value]["order"] for value in source_beat_refs]
+                previous_order = previous_order_by_episode.get(episode_id)
+                if previous_order is not None and min(orders) < previous_order:
+                    errors.append(
+                        issue(
+                            "dialogue_source_order_violation",
+                            "台词来源顺序发生倒退或调序",
+                            cue_index=index,
+                            cue_id=cue_id,
+                            episode_id=episode_id,
+                        )
+                    )
+                previous_order_by_episode[episode_id] = max(
+                    previous_order or orders[0], max(orders)
+                )
+                locator_refs: set[str] = set()
+                for beat_id in source_beat_refs:
+                    locator_refs.update(beats[beat_id].get("source_refs", set()))
+                if (
+                    isinstance(source_locator, str)
+                    and source_locator.strip()
+                    and source_locator not in locator_refs
+                    and source_unit_id not in locator_refs
+                ):
+                    errors.append(
+                        issue(
+                            "dialogue_source_locator_mismatch",
+                            "source_locator/source_unit_id 与绑定 beat 的原著位置不一致",
+                            cue_index=index,
+                            cue_id=cue_id,
+                            source_locator=source_locator,
+                            source_beat_refs=source_beat_refs,
+                        )
+                    )
+        source_text = (
+            source_text_by_id.get(source_unit_id)
+            if isinstance(source_unit_id, str)
+            else None
+        )
+        if source_text is None:
+            errors.append(
+                issue(
+                    "dialogue_source_unit_unknown",
+                    "对白引用了不存在或不可读取的原著单元",
+                    cue_index=index,
+                    cue_id=cue_id,
+                    source_unit_id=source_unit_id,
+                )
+            )
+            continue
+        if compact_dialogue_text(text) not in compact_dialogue_text(source_text):
+            errors.append(
+                issue(
+                    "dialogue_not_exact_source",
+                    "对白、VO、OS 必须逐字来自绑定的原著单元，不能润色、改写或补写",
+                    cue_index=index,
+                    cue_id=cue_id,
+                    source_unit_id=source_unit_id,
+                )
+            )
+    return errors
+
+
+CHARACTER_ANCHOR_ROLE_KINDS = {"stable", "temporary_speaking", "crowd_group"}
+CHARACTER_PRESENCE_MODES = {"on_screen", "voice_only", "crowd_group"}
+VISUAL_STORY_CLAIM_PATTERNS = (
+    re.compile(r"真实身份|继承人|血统|能力觉醒|家族徽记|伤疤来源|秘密组织"),
+)
+
+
+def _nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def validate_character_anchor_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if payload.get("contract_version") != 2:
+        errors.append(issue("character_anchor_contract_version_invalid", "人物锚点必须使用 contract_version 2"))
+    if not _nonempty_text(payload.get("character_id")):
+        errors.append(issue("character_anchor_id_missing", "人物锚点缺少 character_id"))
+    if not _nonempty_text(payload.get("display_name")):
+        errors.append(issue("character_anchor_name_missing", "人物锚点缺少 display_name"))
+    if payload.get("role_kind") not in CHARACTER_ANCHOR_ROLE_KINDS:
+        errors.append(issue("character_anchor_role_kind_invalid", "人物锚点 role_kind 非法"))
+    source_appearance = payload.get("source_appearance")
+    if not isinstance(source_appearance, dict):
+        errors.append(issue("character_anchor_source_appearance_missing", "人物锚点缺少 source_appearance"))
+    else:
+        source_refs = source_appearance.get("source_refs")
+        details = source_appearance.get("confirmed_details")
+        if not isinstance(source_refs, list) or not all(_nonempty_text(value) for value in source_refs):
+            errors.append(issue("character_anchor_source_refs_invalid", "source_appearance.source_refs 必须是字符串数组"))
+        if not isinstance(details, list) or not all(_nonempty_text(value) for value in details):
+            errors.append(issue("character_anchor_source_details_invalid", "source_appearance.confirmed_details 必须是字符串数组"))
+    visual_design = payload.get("visual_design")
+    if not isinstance(visual_design, dict):
+        errors.append(issue("character_anchor_visual_design_missing", "人物锚点缺少 visual_design"))
+        visual_design = {}
+    elif visual_design.get("auto_completed") not in {True, False}:
+        errors.append(issue("character_anchor_auto_completed_invalid", "visual_design.auto_completed 必须为布尔值"))
+    turnaround = payload.get("turnaround_prompt")
+    if not isinstance(turnaround, dict) or not _nonempty_text(turnaround.get("layout")):
+        errors.append(issue("character_anchor_turnaround_layout_missing", "缺少人物三视图布局描述"))
+    if not isinstance(turnaround, dict) or not _nonempty_text(turnaround.get("full_text")):
+        errors.append(issue("character_anchor_turnaround_text_missing", "缺少完整人物三视图文字描述"))
+    if isinstance(turnaround, dict):
+        rules = turnaround.get("consistency_rules")
+        if not isinstance(rules, list) or not rules or not all(_nonempty_text(value) for value in rules):
+            errors.append(issue("character_anchor_consistency_rules_missing", "人物锚点必须提供三视图一致性规则"))
+    visual_text = json.dumps(visual_design, ensure_ascii=False)
+    if any(pattern.search(visual_text) for pattern in VISUAL_STORY_CLAIM_PATTERNS):
+        errors.append(issue("character_anchor_visual_story_claim", "视觉设定包含身份、能力、身世或未揭露剧情暗示"))
+    return errors
+
+
 def validate_structured_development_artifact(
     project_path: Path,
     state: dict[str, Any],
@@ -4312,8 +5812,15 @@ def validate_structured_development_artifact(
     if artifact_kind == "source_review":
         errors.extend(validate_source_review_payload(state, artifact_key, record, payload))
         return errors
-    if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
-        errors.append(issue("structured_schema_invalid", "规范 JSON 的 schema_version 必须为1", artifact_key=artifact_key))
+    allowed_schema_versions = {1, 2} if artifact_kind == "source_event_index" else {1}
+    if type(payload.get("schema_version")) is not int or payload.get("schema_version") not in allowed_schema_versions:
+        errors.append(
+            issue(
+                "structured_schema_invalid",
+                f"规范 JSON 的 schema_version 必须为{sorted(allowed_schema_versions)}",
+                artifact_key=artifact_key,
+            )
+        )
     if payload.get("project_id") != state.get("project_id"):
         errors.append(issue("structured_project_mismatch", "规范 JSON 的 project_id 与项目不一致", artifact_key=artifact_key))
     generated_list, generated_refs = payload_generated_refs(payload)
@@ -4332,7 +5839,14 @@ def validate_structured_development_artifact(
             )
         )
 
-    if artifact_kind == "batch_source_scope":
+    if artifact_kind == "dialogue_cue_sheet":
+        errors.extend(
+            validate_dialogue_cue_sheet_payload(
+                project_path, state, artifact_key, record, payload
+            )
+        )
+
+    elif artifact_kind == "batch_source_scope":
         scope = artifact_key.split(":", 1)[1] if ":" in artifact_key else ""
         batch_id = payload.get("batch_id")
         if not BATCH_ID_RE.fullmatch(scope) or batch_id != scope:
@@ -4625,6 +6139,32 @@ def validate_structured_development_artifact(
         event_ordinals: set[int] = set()
         beat_ids: set[str] = set()
         schema_v2 = type(payload.get("schema_version")) is int and payload.get("schema_version") >= 2
+        canonical_entity_ids: set[str] = set()
+        if schema_v2:
+            entities = payload.get("entities")
+            if not isinstance(entities, list) or not entities:
+                errors.append(issue("event_entities_missing", "schema v2 事件索引必须包含非空 canonical entities"))
+            else:
+                for entity_index, entity in enumerate(entities):
+                    if not isinstance(entity, dict):
+                        errors.append(issue("event_entity_invalid", "canonical entity 必须是对象", entity_index=entity_index))
+                        continue
+                    entity_id = entity.get("entity_id")
+                    if (
+                        not isinstance(entity_id, str)
+                        or not re.fullmatch(r"(?:C\d{3,6}|(?:CHAR|LOC|PROP)-[A-Z0-9_.-]+)", entity_id)
+                        or entity_id in canonical_entity_ids
+                    ):
+                        errors.append(issue("event_entity_id_invalid", "entity_id 必须使用 C001 或 CHAR-/LOC-/PROP- 规范格式且全局唯一", entity_index=entity_index))
+                    else:
+                        canonical_entity_ids.add(entity_id)
+                    if entity.get("entity_type") not in {"character", "location", "prop"}:
+                        errors.append(issue("event_entity_type_invalid", "entity_type 只能为 character/location/prop", entity_index=entity_index))
+                    if not isinstance(entity.get("canonical_name"), str) or not entity["canonical_name"].strip():
+                        errors.append(issue("event_entity_name_missing", "canonical entity 缺少 canonical_name", entity_index=entity_index))
+                    aliases = entity.get("aliases", [])
+                    if not isinstance(aliases, list) or not all(isinstance(value, str) and value.strip() for value in aliases):
+                        errors.append(issue("event_entity_aliases_invalid", "canonical entity aliases 必须是字符串数组", entity_index=entity_index))
         for index, unit in enumerate(units):
             if not isinstance(unit, dict):
                 errors.append(issue("event_unit_invalid", "事件索引单元必须是对象", unit_index=index))
@@ -4674,6 +6214,23 @@ def validate_structured_development_artifact(
                 else:
                     event_ids.add(event_id)
                 if schema_v2:
+                    participants = event.get("participants")
+                    if not isinstance(participants, list) or not all(
+                        isinstance(value, str) and value.strip() for value in participants
+                    ):
+                        errors.append(issue("event_participants_invalid", "schema v2 事件 participants 必须是 canonical character ID 数组", unit_index=index, event_index=event_index))
+                    else:
+                        unknown_participants = sorted(set(participants) - canonical_entity_ids)
+                        if unknown_participants:
+                            errors.append(issue("event_participant_unknown", "事件引用了未登记的 canonical character ID", unit_index=index, event_index=event_index, unknown=unknown_participants))
+                        non_character_ids = {
+                            entity.get("entity_id")
+                            for entity in payload.get("entities", [])
+                            if isinstance(entity, dict) and entity.get("entity_type") != "character"
+                        }
+                        invalid_participants = sorted(set(participants) & non_character_ids)
+                        if invalid_participants:
+                            errors.append(issue("event_participant_type_invalid", "事件 participants 只能引用 character 实体", unit_index=index, event_index=event_index, invalid=invalid_participants))
                     event_ordinal = event.get("ordinal")
                     if type(event_ordinal) is not int or event_ordinal < 1 or event_ordinal in event_ordinals:
                         errors.append(issue("event_ordinal_invalid", "schema v2 事件 ordinal 必须是唯一正整数", unit_index=index, event_index=event_index))
@@ -4704,6 +6261,13 @@ def validate_structured_development_artifact(
                         protected = beat.get("protected_fact_ids", [])
                         if not isinstance(protected, list) or not all(isinstance(v, str) and v.strip() for v in protected):
                             errors.append(issue("event_beat_protected_facts_invalid", "protected_fact_ids 必须是字符串数组", unit_index=index, event_index=event_index, beat_index=beat_index))
+                        required = beat.get("required_fact_ids")
+                        if not isinstance(required, list) or not all(isinstance(v, str) and v.strip() for v in required):
+                            errors.append(issue("event_beat_required_facts_invalid", "required_fact_ids 必须是字符串数组", unit_index=index, event_index=event_index, beat_index=beat_index))
+                        story_time = beat.get("story_time")
+                        if story_time is not None:
+                            if not isinstance(story_time, dict) or type(story_time.get("day_index")) is not int or story_time.get("day_part") not in STORY_DAY_PARTS:
+                                errors.append(issue("event_beat_story_time_invalid", "story_time 必须包含整数 day_index 和有效 day_part", unit_index=index, event_index=event_index, beat_index=beat_index))
                 required_event_fields = (
                     ("summary",)
                     if granularity == "chapter_summary"
@@ -4743,6 +6307,20 @@ def validate_structured_development_artifact(
                 )
 
         if schema_v2:
+            if payload.get("content_contract_version") != 1:
+                errors.append(issue("event_content_contract_upgrade_required", "schema v2 事件索引必须使用 content_contract_version=1"))
+            errors.extend(validate_source_content_contract(project_path, corpus, payload))
+            errors.extend(validate_fact_definition_contract(payload))
+            source_texts: dict[str, str] = {}
+            if isinstance(corpus_units, list):
+                for source_unit in corpus_units:
+                    if not isinstance(source_unit, dict):
+                        continue
+                    source_unit_id = source_unit.get("source_unit_id")
+                    source_path = path_from_record(project_path, source_unit.get("content_path"))
+                    if isinstance(source_unit_id, str) and source_path is not None and source_path.is_file():
+                        source_texts[source_unit_id] = source_path.read_text(encoding="utf-8")
+            errors.extend(validate_source_timeline_contract(payload, source_texts))
             episode_scopes = payload.get("episode_scopes")
             if not isinstance(episode_scopes, dict) or not episode_scopes:
                 errors.append(issue("event_episode_scopes_missing", "schema v2 事件索引必须声明 episode_scopes"))
@@ -4751,8 +6329,24 @@ def validate_structured_development_artifact(
                     if not isinstance(episode_id, str) or not re.fullmatch(r"E\d{3,6}", episode_id):
                         errors.append(issue("event_episode_scope_id_invalid", "episode_scopes key 必须是规范集号", episode_id=episode_id))
                         continue
-                    if not isinstance(scope, dict) or scope.get("first_beat_id") not in beat_ids or scope.get("last_beat_id") not in beat_ids:
-                        errors.append(issue("event_episode_scope_invalid", "episode_scope 首尾 beat 必须存在", episode_id=episode_id))
+                    if not isinstance(scope, dict):
+                        errors.append(issue("event_episode_scope_invalid", "episode_scope 必须是对象", episode_id=episode_id))
+                        continue
+                    allowed_ids = scope.get("allowed_beat_ids")
+                    if (
+                        not isinstance(allowed_ids, list)
+                        or not allowed_ids
+                        or len(allowed_ids) != len(set(allowed_ids))
+                        or not all(isinstance(value, str) and value in beat_ids for value in allowed_ids)
+                    ):
+                        errors.append(issue("event_episode_scope_invalid", "episode_scope 必须声明无重复且全部存在的 allowed_beat_ids", episode_id=episode_id))
+                        continue
+                    beat_order = source_beat_index(payload)
+                    allowed_orders = [beat_order[value]["order"] for value in allowed_ids]
+                    if allowed_orders != sorted(allowed_orders):
+                        errors.append(issue("event_episode_scope_order_invalid", "allowed_beat_ids 必须严格遵循原著顺序", episode_id=episode_id))
+                    if scope.get("first_beat_id") != allowed_ids[0] or scope.get("last_beat_id") != allowed_ids[-1]:
+                        errors.append(issue("event_episode_scope_bounds_mismatch", "episode_scope 首尾 beat 必须与 allowed_beat_ids 首尾一致", episode_id=episode_id))
 
     elif artifact_kind == "change_authorization":
         authorizations = payload.get("authorizations")
@@ -4836,34 +6430,6 @@ def validate_structured_development_artifact(
                     }
                 )
         decision_ids: set[str] = set()
-        allowed_operations = {
-            "preserve",
-            "compress",
-            "merge",
-            "reorder",
-            "omit",
-            "bridge_addition",
-            "psychology_externalization",
-            "dialogue_rewrite",
-            "scene_transition",
-            "time_compression",
-            "action_completion",
-            "crowd_environment_reaction",
-            "dramatic_expansion",
-            "named_character",
-            "merge_character",
-            "new_subplot",
-            "new_relationship",
-            "new_ability",
-            "new_major_event",
-            "change_motivation",
-            "change_choice",
-            "change_cause",
-            "change_outcome",
-            "change_world_rule",
-            "change_ending_nature",
-            "hook_crisis",
-        }
         for index, decision in enumerate(decisions):
             if not isinstance(decision, dict):
                 errors.append(issue("adaptation_decision_invalid", "改编决策必须是对象", decision_index=index))
@@ -4876,7 +6442,7 @@ def validate_structured_development_artifact(
             else:
                 decision_ids.add(decision_id)
             operation = decision.get("operation")
-            if operation not in allowed_operations:
+            if operation not in ALLOWED_ADAPTATION_OPERATIONS:
                 errors.append(issue("adaptation_operation_invalid", "改编操作类型无效", decision_index=index))
             source_unit_ids = decision.get("source_unit_ids")
             if not isinstance(source_unit_ids, list) or not all(
@@ -5174,15 +6740,7 @@ def validate_structured_development_artifact(
             "production_feasibility",
             "screen_text_postproduction",
         }
-        auto_allowed_categories = {
-            "psychology_externalization",
-            "dialogue_rewrite",
-            "scene_transition",
-            "time_compression",
-            "action_completion",
-            "crowd_environment_reaction",
-            "dramatic_expansion",
-        }
+        auto_allowed_categories = AUTO_ALLOWED_BOUNDARY_CATEGORIES
         confirmation_categories = {
             "named_character",
             "merge_character",
@@ -8152,6 +9710,42 @@ def validate_breakdowns_state(
     payloads: dict[str, dict[str, Any]] = {}
     for artifact_kind, (key, record, payload) in loaded.items():
         payloads[artifact_kind] = payload
+        artifact_expected_sources = set(expected_sources)
+        if artifact_kind == "dialogue_cue_sheet":
+            source_corpus_record = latest_record(state, "source_corpus")
+            source_corpus_version = (
+                source_corpus_record.get("version")
+                if isinstance(source_corpus_record, dict)
+                else None
+            )
+            if type(source_corpus_version) is int:
+                artifact_expected_sources.add(
+                    ("source_corpus", source_corpus_version)
+                )
+            else:
+                errors.append(
+                    issue(
+                        "dialogue_source_corpus_missing",
+                        "台词声音表缺少当前原著语料库",
+                        artifact_key=key,
+                    )
+                )
+            source_event_record = latest_record(state, "source_event_index")
+            source_event_version = (
+                source_event_record.get("version")
+                if isinstance(source_event_record, dict)
+                else None
+            )
+            if type(source_event_version) is int:
+                artifact_expected_sources.add(("source_event_index", source_event_version))
+            else:
+                errors.append(
+                    issue(
+                        "dialogue_source_event_index_missing",
+                        "台词声音表缺少当前原著事件索引",
+                        artifact_key=key,
+                    )
+                )
         if type(payload.get("schema_version")) is not int or payload.get("schema_version") != 1:
             errors.append(
                 issue(
@@ -8189,26 +9783,29 @@ def validate_breakdowns_state(
             not isinstance(generated_from, list)
             or len(generated_source_list) != len(generated_from)
             or len(generated_source_list) != len(actual_sources)
-            or actual_sources != expected_sources
+            or actual_sources != artifact_expected_sources
         ):
             errors.append(
                 issue(
                     "breakdown_source_versions_mismatch",
                     "制作提取表 generated_from 未精确绑定当前分集剧本及对应内容边界报告版本",
                     artifact_key=key,
-                    expected=sorted(f"{item[0]}@{item[1]}" for item in expected_sources),
+                    expected=sorted(f"{item[0]}@{item[1]}" for item in artifact_expected_sources),
                     actual=sorted(f"{item[0]}@{item[1]}" for item in actual_sources),
                 )
             )
+        allowed_state_source_types = {"episode_script", "episode_boundary_review"}
+        if artifact_kind == "dialogue_cue_sheet":
+            allowed_state_source_types.update({"source_corpus", "source_event_index"})
         state_sources = {
             (item.get("artifact_key"), item.get("version"))
             for item in record.get("depends_on", [])
             if isinstance(item, dict)
             and isinstance(item.get("artifact_key"), str)
             and artifact_type(item["artifact_key"])
-            in {"episode_script", "episode_boundary_review"}
+            in allowed_state_source_types
         }
-        if state_sources != expected_sources:
+        if state_sources != artifact_expected_sources:
             errors.append(
                 issue(
                     "breakdown_state_dependencies_mismatch",
@@ -8843,6 +10440,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="已废弃兼容参数；v0.8 不自动检查上传文件",
     )
     add_source_parser.set_defaults(handler=command_add_source)
+
+    partition_parser = subparsers.add_parser(
+        "plan-source-partitions", help="按语义单元与容量预算生成只读原著分析分片计划"
+    )
+    partition_parser.add_argument("project", help="项目目录")
+    partition_parser.add_argument("--source-corpus", required=True, help="项目内 source_corpus JSON 路径")
+    partition_parser.add_argument("--policy", required=True, help="项目内分片策略 JSON 路径")
+    partition_parser.add_argument("--output", required=True, help="项目内分片计划输出路径")
+    partition_parser.set_defaults(handler=command_plan_source_partitions)
+
+    merge_shards_parser = subparsers.add_parser(
+        "merge-source-analysis-shards", help="校验并合并独立原著分析分片；不修改项目状态"
+    )
+    merge_shards_parser.add_argument("project", help="项目目录")
+    merge_shards_parser.add_argument("--plan", required=True, help="项目内分片计划 JSON 路径")
+    merge_shards_parser.add_argument("--shard-dir", required=True, help="项目内分片结果目录")
+    merge_shards_parser.add_argument("--output", required=True, help="项目内合并结果输出路径")
+    merge_shards_parser.set_defaults(handler=command_merge_source_analysis_shards)
+
+    episode_delivery_parser = subparsers.add_parser(
+        "render-episode-delivery", help="从同版本剧本、人物锚点和分镜计划生成逐集DOCX与HTML"
+    )
+    episode_delivery_parser.add_argument("project", help="项目目录")
+    episode_delivery_parser.add_argument("episode", help="集号，如 E001")
+    episode_delivery_parser.set_defaults(handler=command_render_episode_delivery)
 
     render_parser = subparsers.add_parser(
         "render-storyboard", help="把已确认的 AI 分镜计划渲染成单文件 HTML 故事板(只读)"

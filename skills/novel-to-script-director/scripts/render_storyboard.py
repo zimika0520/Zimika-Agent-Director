@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import shot_contracts
+
 STATE_FILENAME = "project_state.json"
 
 # 参考色板(dataviz 默认,已通过六项校验;场景按登记顺序取固定槽位,不循环)
@@ -27,6 +29,34 @@ SCENE_SLOTS_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008
 
 def esc(value: Any) -> str:
     return html.escape(str(value if value is not None else ""))
+
+
+def compiled_content_field(unit: dict[str, Any], field: str) -> str:
+    atoms = {
+        atom.get("atom_id"): atom
+        for atom in unit.get("content_atoms", [])
+        if isinstance(atom, dict) and isinstance(atom.get("atom_id"), str)
+    } if isinstance(unit.get("content_atoms"), list) else {}
+    bindings = unit.get("content_bindings")
+    refs = bindings.get(field) if isinstance(bindings, dict) else None
+    if not isinstance(refs, list) or not refs or any(ref not in atoms for ref in refs):
+        return ""
+    return "；".join(str(atoms[ref].get("text", "")).strip() for ref in refs)
+
+
+def compiled_screen_text(unit: dict[str, Any]) -> str:
+    screen_text = unit.get("screen_text")
+    if not isinstance(screen_text, dict):
+        return ""
+    atoms = {
+        atom.get("atom_id"): atom
+        for atom in unit.get("content_atoms", [])
+        if isinstance(atom, dict) and isinstance(atom.get("atom_id"), str)
+    } if isinstance(unit.get("content_atoms"), list) else {}
+    refs = screen_text.get("content_atom_refs")
+    if not isinstance(refs, list) or not refs or any(ref not in atoms for ref in refs):
+        return ""
+    return "；".join(str(atoms[ref].get("text", "")).strip() for ref in refs)
 
 
 def load_state(project_path: Path) -> dict[str, Any]:
@@ -95,7 +125,13 @@ def collect_anchors(state: dict[str, Any], project_path: Path, prefix: str) -> l
             record = latest_confirmed(state, key)
             content = read_artifact(project_path, record)
             if isinstance(content, dict):
-                content = anchor_dict_to_text(content)
+                turnaround = content.get("turnaround_prompt")
+                full_text = turnaround.get("full_text") if isinstance(turnaround, dict) else None
+                if prefix == "character_anchor" and isinstance(full_text, str) and full_text.strip():
+                    name = content.get("display_name") or key
+                    content = f"人物三视图描述\n{name}：{full_text.strip()}"
+                else:
+                    content = anchor_dict_to_text(content)
             if isinstance(content, str) and content.strip():
                 found.append((key, content))
     return found
@@ -214,7 +250,7 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
         slot = scene_slot.get(str(unit.get("scene_id")), 0)
         over = " tl-over4" if duration_class(duration) else ""
         label = str(unit.get("sequence", ""))
-        tooltip = f"{unit.get('unit_id')} · {duration}s · {unit.get('narrative_task', '')}"
+        tooltip = f"{unit.get('unit_id')} · {duration}s · {compiled_content_field(unit, 'narrative_task')}"
         timeline_blocks.append(
             f'<div class="tl-block{over}" style="width:{width:.2f}%;background:var(--scene-{slot})" title="{esc(tooltip)}"><span>{esc(label)}</span></div>'
         )
@@ -269,21 +305,33 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
             if over and unit.get("over_4s_rationale")
             else ""
         )
+        framing_instruction = shot_contracts.compile_shot_instruction(unit)
         prompt_text = unit.get("prompt_text")
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            prompt_text = compiled_content_field(unit, "prompt_text")
+        framing_prefix = framing_instruction.rstrip("。") + "。"
+        compiled_prompt = (
+            f"{framing_prefix}\n{prompt_text.strip()}"
+            if isinstance(prompt_text, str) and prompt_text.strip()
+            else framing_prefix
+        )
         prompt_html = (
             f"<details><summary>通用提示词 <button class='copy' data-copy>复制</button></summary>"
-            f"<pre class='prompt'>{esc(prompt_text)}</pre></details>"
-            if isinstance(prompt_text, str) and prompt_text.strip()
-            else '<div class="muted">未提供通用提示词</div>'
+            f"<pre class='prompt'>{esc(compiled_prompt)}</pre></details>"
         )
-        sounds = "、".join(str(item) for item in unit.get("sound", []) or []) or "无"
+        sound_events = unit.get("sound_events") if isinstance(unit.get("sound_events"), list) else []
+        sounds = "、".join(
+            str(item.get("description")) for item in sound_events
+            if isinstance(item, dict) and item.get("description")
+        ) or "无"
         chain = unit.get("state_chain") or {}
         screen_video = "、".join(str(item) for item in unit.get("screen_video_characters", []) or []) or "无"
         screen_text = unit.get("screen_text")
         screen_text_html = ""
-        if isinstance(screen_text, dict) and screen_text.get("required_text"):
+        verified_screen_text = compiled_screen_text(unit)
+        if isinstance(screen_text, dict) and verified_screen_text:
             screen_text_html = (
-                f'<div class="row">屏幕文字:{esc(screen_text.get("required_text"))} '
+                f'<div class="row">屏幕文字:{esc(verified_screen_text)} '
                 f'<span class="chip">{esc(screen_text.get("render_mode"))}</span></div>'
             )
         cards.append(f"""
@@ -295,8 +343,10 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
     <span class="chip scene">场 {esc(unit.get('scene_id'))}</span>
     <span class="chip strategy">{esc(unit.get('generation_strategy'))}</span>
   </header>
-  <div class="row task">{esc(unit.get('narrative_task'))}</div>
-  <div class="row">动作:{esc(unit.get('action_start'))} <span class="arrow">→</span> {esc(unit.get('action_end'))}</div>
+  <div class="row"><b>景别：</b>{esc(shot_contracts.shot_size_text(unit))}</div>
+  <div class="row"><b>镜头运动：</b>{esc(shot_contracts.camera_movement_text(unit))}</div>
+  <div class="row task">{esc(compiled_content_field(unit, 'narrative_task'))}</div>
+  <div class="row">动作:{esc(compiled_content_field(unit, 'action_start'))} <span class="arrow">→</span> {esc(compiled_content_field(unit, 'action_end'))}</div>
   <div class="row">现场人物:{characters}</div>
   <div class="row">屏幕视频人物:{esc(screen_video)}</div>
   <div class="row">台词:{dialogue_html}</div>
