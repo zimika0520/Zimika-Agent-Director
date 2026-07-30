@@ -8830,6 +8830,11 @@ SPACE_TOKEN_RE = re.compile(
 CHARACTER_RE = re.compile(
     r"^\s*(?:[-*>•]\s*)?(?:\*{0,2})?\s*(?:出场)?人物\s*[：:]\s*(?P<value>.+?)\s*(?:\*{0,2})?\s*$"
 )
+OFF_SCENE_CHARACTER_RE = re.compile(
+    r"^\s*(?:[-*>•]\s*)?(?:\*{0,2})?\s*"
+    r"(?:非现场人物|画外音人物|电话声音人物|屏幕人物)"
+    r"\s*[：:]\s*(?P<value>.+?)\s*(?:\*{0,2})?\s*$"
+)
 PROPS_RE = re.compile(
     r"^\s*(?:[-*>•]\s*)?(?:\*{0,2})?\s*(?:关键)?道具\s*[：:]\s*(?P<value>.+?)\s*(?:\*{0,2})?\s*$"
 )
@@ -8925,12 +8930,20 @@ HOOK_RE = re.compile(
 DIALOGUE_RE = re.compile(
     r"^\s*(?:[-*>•]\s*)?(?:\*{0,2})?\s*"
     r"(?P<speaker>[一-鿿A-Za-z0-9_·•]{1,20})"
-    r"(?:\s+(?:VO|OS|画外音|内心|旁白)|\s*[（(][^）)\r\n]{1,30}[）)])?"
-    r"\s*[：:]\s*(?P<text>\S.*?)\s*(?:\*{0,2})?\s*$"
+    r"(?P<annotation>"
+    r"(?:\s+(?:VO|OS|画外音|内心|旁白|电话声音|电话音|电话声|屏幕声音|视频声音)"
+    r"|\s*[（(][^）)\r\n]{1,30}[）)])?"
+    r")"
+    r"\s*[：:]\s*(?P<text>\S.*?)\s*(?:\*{0,2})?\s*$",
+    re.IGNORECASE,
 )
 NON_DIALOGUE_LABELS = {
     "人物",
     "出场人物",
+    "非现场人物",
+    "画外音人物",
+    "电话声音人物",
+    "屏幕人物",
     "道具",
     "关键道具",
     "动作",
@@ -9007,6 +9020,7 @@ def maximum_dialogue_run(block: list[tuple[int, str]]) -> tuple[int, int | None]
             current = 0
         elif line.strip() and not (
             CHARACTER_RE.match(line)
+            or OFF_SCENE_CHARACTER_RE.match(line)
             or PROPS_RE.match(line)
             or HOOK_RE.match(line)
         ):
@@ -9053,12 +9067,34 @@ def scene_heading_metadata(body: str) -> tuple[bool, bool, bool]:
 
 
 def dialogue_match(line: str) -> re.Match[str] | None:
+    if CHARACTER_RE.match(line) or OFF_SCENE_CHARACTER_RE.match(line) or PROPS_RE.match(line):
+        return None
     match = DIALOGUE_RE.match(line)
     if not match:
         return None
     if match.group("speaker") in NON_DIALOGUE_LABELS:
         return None
     return match
+
+
+def dialogue_annotation(line: str) -> str:
+    match = dialogue_match(line)
+    if not match:
+        return ""
+    return (match.group("annotation") or "").upper()
+
+
+def delivery_mode_from_line(line: str) -> str:
+    annotation = dialogue_annotation(line)
+    if re.search(r"\bVO\b|旁白|内心", annotation):
+        return "voice_over"
+    if re.search(r"\bOS\b|画外音", annotation):
+        return "off_screen"
+    if re.search(r"电话声音|电话音|电话声", annotation):
+        return "phone_audio"
+    if re.search(r"屏幕声音|视频声音", annotation):
+        return "screen_video"
+    return "on_screen"
 
 
 def spoken_char_count(text: str) -> int:
@@ -9287,6 +9323,36 @@ def validate_script_file(
         if len(declared_characters) != len(set(declared_characters)):
             warnings.append(issue("scene_characters_duplicate", "人物声明存在重复项", **location))
 
+        off_scene_characters = [
+            (number, OFF_SCENE_CHARACTER_RE.match(line)) for number, line in block
+        ]
+        off_scene_matches = [
+            (number, match) for number, match in off_scene_characters if match
+        ]
+        declared_off_scene_speakers = [
+            speaker
+            for _, match in off_scene_matches
+            for speaker in split_declared_items(match.group("value"))
+        ]
+        if len(declared_off_scene_speakers) != len(set(declared_off_scene_speakers)):
+            warnings.append(
+                issue("scene_off_scene_speakers_duplicate", "非现场人物声明存在重复项", **location)
+            )
+        presence_conflicts = sorted(
+            set(declared_characters).intersection(declared_off_scene_speakers)
+        )
+        if presence_conflicts:
+            errors.append(
+                issue(
+                    "scene_character_presence_conflict",
+                    "人物不能同时声明为现场与非现场：" + "、".join(presence_conflicts),
+                    **location,
+                )
+            )
+        declared_speakers = list(
+            dict.fromkeys([*declared_characters, *declared_off_scene_speakers])
+        )
+
         props = [(number, PROPS_RE.match(line)) for number, line in block]
         prop_matches = [(number, match) for number, match in props if match]
         if not prop_matches:
@@ -9358,9 +9424,9 @@ def validate_script_file(
                 speaker == item
                 or speaker.startswith(item.rstrip("若干"))
                 or (speaker_base and speaker_base in item)
-                for item in declared_characters
+                for item in declared_speakers
             )
-            if declared_characters and not declared:
+            if declared_speakers and not declared:
                 errors.append(
                     issue(
                         "dialogue_speaker_undeclared",
@@ -9529,7 +9595,7 @@ def validate_script_file(
 
 
 def cue_type_from_line(line: str) -> str:
-    annotation = re.split(r"[：:]", line, maxsplit=1)[0].upper()
+    annotation = dialogue_annotation(line)
     if re.search(r"\bVO\b|旁白|内心", annotation):
         return "vo"
     if re.search(r"\bOS\b|画外音", annotation):
@@ -9543,7 +9609,7 @@ def normalized_text(value: str) -> str:
 
 def extract_script_index(
     script_path: Path, artifact_key: str
-) -> tuple[dict[str, dict[str, Any]], list[tuple[str, str, str, str]]]:
+) -> tuple[dict[str, dict[str, Any]], list[tuple[str, str, str, str, str]]]:
     text = script_path.read_text(encoding="utf-8-sig")
     lines = text.splitlines()
     key_scope = artifact_key.split(":", 1)[1] if ":" in artifact_key else ""
@@ -9564,18 +9630,24 @@ def extract_script_index(
         if match:
             scene_positions.append((index, match))
     scenes: dict[str, dict[str, Any]] = {}
-    cues: list[tuple[str, str, str, str]] = []
+    cues: list[tuple[str, str, str, str, str]] = []
     for position, (start, match) in enumerate(scene_positions):
         end = scene_positions[position + 1][0] if position + 1 < len(scene_positions) else len(lines)
         scene_id = re.sub(r"\s+", "", match.group("scene_id"))
         location_name, time_value, space_value = scene_heading_values(match.group("body"))
         block = lines[start + 1 : end]
         characters: list[str] = []
+        off_scene_speakers: list[str] = []
         props: list[str] = []
         for line in block:
             character_match = CHARACTER_RE.match(line)
             if character_match and not characters:
                 characters = split_declared_items(character_match.group("value"))
+            off_scene_match = OFF_SCENE_CHARACTER_RE.match(line)
+            if off_scene_match:
+                off_scene_speakers.extend(
+                    split_declared_items(off_scene_match.group("value"))
+                )
             prop_match = PROPS_RE.match(line)
             if prop_match and not props:
                 props = split_declared_items(prop_match.group("value"))
@@ -9585,6 +9657,7 @@ def extract_script_index(
                     scene_id,
                     dialogue.group("speaker"),
                     cue_type_from_line(line),
+                    delivery_mode_from_line(line),
                     normalized_text(dialogue.group("text")),
                 )
                 cues.append(cue)
@@ -9595,6 +9668,7 @@ def extract_script_index(
             "time": time_value,
             "space": space_value,
             "characters": characters,
+            "off_scene_speakers": list(dict.fromkeys(off_scene_speakers)),
             "props": props,
             "text": "\n".join(block),
         }
@@ -9895,7 +9969,7 @@ def validate_breakdowns_state(
         errors.append(issue("breakdown_no_episode_scripts", "没有可用于制作提取的分集剧本"))
 
     script_scenes: dict[str, dict[str, Any]] = {}
-    script_cues: list[tuple[str, str, str, str]] = []
+    script_cues: list[tuple[str, str, str, str, str]] = []
     expected_script_sources: set[tuple[str, int]] = set()
     expected_review_sources: set[tuple[str, int]] = set()
     for key, record in sorted(episode_records.items()):
@@ -10334,7 +10408,7 @@ def validate_breakdowns_state(
 
     cue_records = records_of("dialogue_cue_sheet")
     cue_ids: set[str] = set()
-    extracted_cues: list[tuple[str, str, str, str]] = []
+    extracted_cues: list[tuple[str, str, str, str, str]] = []
     allowed_cue_types = {"dialogue", "vo", "os", "environment", "sfx"}
     for index, record in enumerate(cue_records):
         cue_id = record.get("cue_id")
@@ -10374,7 +10448,13 @@ def validate_breakdowns_state(
                     )
                 )
             extracted_cues.append(
-                (scene_id, speaker_name, cue_type, normalized_text(cue_text))
+                (
+                    scene_id,
+                    speaker_name,
+                    cue_type,
+                    record.get("delivery_mode"),
+                    normalized_text(cue_text),
+                )
             )
         elif normalized_text(cue_text) not in normalized_text(script_scenes[scene_id]["text"]):
             errors.append(issue("cue_not_in_script", f"声音记录 {cue_id} 的内容未出现在剧本场次中"))

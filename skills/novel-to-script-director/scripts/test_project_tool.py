@@ -36,6 +36,38 @@ GOOD_SCRIPT = """# 第1集：钥匙之争
 """
 
 
+OFF_SCENE_VOICE_SCRIPT = """# 第1集：她的儿子？
+
+## 1-1 场景：梦中卧室 夜 / 内
+人物：温喻、祈宥
+道具：无
+
+△温喻在梦中惊醒。
+温喻：嘶，轻点..
+祈宥：温喻……
+温喻：嗯...
+场尾状态：温喻从梦中惊醒。
+
+## 1-2 场景：温喻卧室 晨 / 内
+人物：温喻
+非现场人物：王警官（电话声音）、祈星染（画外音）
+道具：手机
+
+△手机剧烈震动，温喻接通。
+王警官 电话声音：请问是温喻女士吗？
+△温喻挂断，手机再次震动。
+温喻：喂...
+王警官 电话声音：请迅速来分局一趟。
+△温喻确认是公安局固定电话。
+温喻：你们是不是搞错了？
+王警官 电话声音：孩子在这儿，您先过来再说吧。
+△温喻抵达警局大厅。
+祈星染 OS：妈妈。
+场尾状态：温喻在警局第一次见到祈星染。
+集尾钩子：男孩依赖地看着温喻。
+"""
+
+
 class ProjectToolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -259,6 +291,54 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(project_tool.cue_type_from_line("阿青：我内心并不害怕。"), "dialogue")
         self.assertEqual(project_tool.cue_type_from_line("阿青（VO）：门终于开了。"), "vo")
         self.assertEqual(project_tool.cue_type_from_line("阿青（OS）：谁在外面？"), "os")
+
+
+    def test_dialogue_parser_supports_off_scene_and_phone_annotations(self) -> None:
+        self.assertIsNone(
+            project_tool.dialogue_match(
+                "非现场人物：王警官（电话声音）、祈星染（画外音）"
+            )
+        )
+        phone = project_tool.dialogue_match("王警官 电话声音：请迅速来分局一趟。")
+        self.assertIsNotNone(phone)
+        assert phone is not None
+        self.assertEqual(phone.group("speaker"), "王警官")
+        self.assertEqual(project_tool.cue_type_from_line("王警官 电话声音：请迅速来分局一趟。"), "dialogue")
+        self.assertEqual(project_tool.delivery_mode_from_line("王警官 电话声音：请迅速来分局一趟。"), "phone_audio")
+        self.assertEqual(project_tool.delivery_mode_from_line("王警官（电话声音）：请迅速来分局一趟。"), "phone_audio")
+        self.assertEqual(project_tool.delivery_mode_from_line("祈星染 OS：妈妈。"), "off_screen")
+        self.assertEqual(project_tool.delivery_mode_from_line("温喻：喂..."), "on_screen")
+
+    def test_script_validation_accepts_declared_off_scene_speakers_and_counts_all_cues(self) -> None:
+        script = self.root / "off-scene-voice.md"
+        script.write_text(OFF_SCENE_VOICE_SCRIPT, encoding="utf-8")
+
+        result = project_tool.validate_script_file(script)
+
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["summary"]["dialogue_count"], 9, result)
+        self.assertNotIn(
+            "dialogue_speaker_undeclared",
+            {item["code"] for item in result["errors"]},
+        )
+
+    def test_script_index_separates_on_scene_characters_and_voice_delivery_modes(self) -> None:
+        script = self.root / "off-scene-index.md"
+        script.write_text(OFF_SCENE_VOICE_SCRIPT, encoding="utf-8")
+
+        scenes, cues = project_tool.extract_script_index(script, "episode_script:E001")
+
+        self.assertEqual(scenes["1-2"]["characters"], ["温喻"])
+        self.assertEqual(scenes["1-2"]["off_scene_speakers"], ["王警官", "祈星染"])
+        self.assertEqual(len(cues), 9)
+        self.assertIn(
+            ("1-2", "王警官", "dialogue", "phone_audio", "请迅速来分局一趟"),
+            cues,
+        )
+        self.assertIn(
+            ("1-2", "祈星染", "os", "off_screen", "妈妈"),
+            cues,
+        )
 
     def test_tampered_confirmed_dependency_blocks_downstream_approval(self) -> None:
         self.init_project()
