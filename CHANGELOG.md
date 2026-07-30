@@ -1,5 +1,16 @@
 # 更新记录
 
+## v0.8.5 — 2026-07-30
+
+- 修复未确认`project_spec`覆盖已确认规格的运行权威缺陷。
+- 将分集剧本时长warnings传播到项目和交付校验结果。
+- canonical entity按类型支持`C/L/P`短ID与`CHAR/LOC/PROP-`长ID。
+- 移除没有可靠消费者的`duration_policy.inflation_redline_ratio`字段。
+- 新增章节分析幂等登记、carryover优先滚动窗口和重复分析阻断。
+- 新增`register-source-analysis`、`plan-rolling-source-window`和`build-production-context-manifest`命令。
+- rolling_batch schema v2支持未知最终集数，扩批必须显式用户确认。
+- 显式故事板输出增加项目根路径保护；完整测试由155项增加到165项。
+
 
 ## v0.8.4 — 2026-07-30
 

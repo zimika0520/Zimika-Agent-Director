@@ -6,7 +6,7 @@
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "project_id": "项目UUID",
   "source_units": [
     {
@@ -240,19 +240,21 @@
 {
   "schema_version": 1,
   "project_id": "项目UUID",
-  "expected_episodes": 60,
+  "scope_mode": "rolling_batch",
+  "batch_size": 3,
+  "initial_source_window_units": 3,
+  "final_expected_episodes": null,
   "target_duration_seconds": 90,
   "duration_policy": {
     "tolerance_ratio": 0.2,
-    "dialogue_chars_per_second": [3.5, 4.5],
-    "inflation_redline_ratio": 0.3
+    "dialogue_chars_per_second": [3.5, 4.5]
   },
   "target_runtime": "每集目标时长或内容量（人工备注，不参与校验）",
   "handoff_target": "可直接进入导演拆镜"
 }
 ```
 
-`expected_episodes` 必须是大于 0 的整数。`validate-handoff` 和 `build-handoff` 的同名参数只能与已确认项目规格核对，不得用较小参数绕过全剧集数。
+固定全剧项目的`expected_episodes`必须是大于0的整数。`rolling_batch` schema v2使用`final_expected_episodes`，允许为`null`；批次范围以用户显式确认的`project_state.batches`为权威。
 
 `target_duration_seconds` 是可选的单集目标时长覆盖值，必须是大于 0 的整数秒。未声明时使用默认 60 秒；声明后以项目值为权威。AI 分镜计划必须写出当前生效值，剧本校验也据此给出对白秒数预警。默认建议约 15 个分镜单元，该数量仅用于规划提示，不作为机械阻断门禁。
 
@@ -260,7 +262,11 @@
 
 - `tolerance_ratio`：分镜计划单元合计时长的允许偏差，0 到 1 之间，缺省 `0.1`（±10%）。
 - `dialogue_chars_per_second`：中文配音字/秒推算区间 `[下限, 上限]`，必须递增且为正数，缺省 `[3.5, 4.5]`。该区间是样本推算值，不是行业标准，仅作预警。
-- `inflation_redline_ratio`：防扩写红线，0 到 1 之间，缺省 `0.3`。
+- `inflation_redline_ratio`已在v0.8.5移除：旧实现没有可靠的原著范围字数消费者，继续保留会造成配置生效假象。
+
+## 章节分析登记与滚动来源进度
+
+`chapter_analysis_registry`按`source_unit_id + content_sha256 + analysis_contract_version`生成幂等键；同一有效组合只能登记一次。`rolling_source_progress`记录当前批次、carryover事件、逐事件消费状态和`next_read_start`。合法消费状态为`unconsumed`、`partially_consumed`、`consumed`和`invalidated`。
 
 `target_runtime` 是人工备注自由文本，不参与任何机器校验，保留仅为兼容旧项目。
 

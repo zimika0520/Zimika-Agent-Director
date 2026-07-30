@@ -2,7 +2,7 @@
 
 把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.4`
+当前版本：`0.8.5`
 
 ## 它能做什么
 
@@ -14,6 +14,9 @@
 - 每个批次独立打包；修改一个批次时，其他已确认批次包保持有效。
 - 全剧完成后执行跨批连续性终检，并复用批次包汇总最终交付。
 - 可选输出模型无关或 Seedance 2.0 的纯文字导演执行计划。
+- 只有有效确认的项目规格能改变运行权威；未确认新版本不会覆盖旧确认版本。
+- 章节分析按章节哈希和契约版本幂等登记，后续批次优先复用carryover。
+- `rolling_batch`允许最终总集数未知，并要求显式用户确认后才能扩展批次。
 
 ## 工作流
 
@@ -120,7 +123,25 @@ python3 skills/novel-to-script-director/scripts/project_tool.py validate-script 
 
 ```bash
 python3 skills/novel-to-script-director/scripts/project_tool.py define-batch \
-  /path/to/project B01 E001 E002 E003
+  /path/to/project B01 E001 E002 E003 --confirmed-by-user
+```
+
+`--confirmed-by-user`只对`scope_mode: rolling_batch`、`schema_version: 2`的新批次强制；固定全剧旧项目仍按`expected_episodes`校验。
+
+### 滚动来源复用
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py register-source-analysis \
+  /path/to/project --source-corpus 01_原著解析/source_corpus.json \
+  --registry 01_原著解析/chapter_registry_v1.json \
+  --source-unit-id SRC-CH001 --analysis tmp/CH001_analysis.json \
+  --contract-version 1 --output 01_原著解析/chapter_registry_v2.json
+
+python3 skills/novel-to-script-director/scripts/project_tool.py plan-rolling-source-window \
+  /path/to/project --source-corpus 01_原著解析/source_corpus.json \
+  --registry 01_原著解析/chapter_registry_v2.json \
+  --progress 01_原著解析/rolling_progress.json \
+  --window-size 3 --output tmp/rolling_plan.json
 ```
 
 ### 构建批次交付包
@@ -181,7 +202,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8.4 完整测试：`155/155` 通过。
+v0.8.5 完整测试：`165/165` 通过。
 
 ## 更新记录
 

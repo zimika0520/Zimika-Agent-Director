@@ -2,6 +2,7 @@
 """Deterministic semantic-unit partition planning and analysis-shard merging."""
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -297,4 +298,175 @@ def merge_analysis_shards(
             "partition_ids": [item["partition_id"] for item in plan["partitions"]],
         },
         "units": units,
+    }
+
+
+def analysis_idempotency_key(
+    source_unit_id: str, content_sha256: str, analysis_contract_version: int
+) -> str:
+    return f"{source_unit_id}:{content_sha256}:v{analysis_contract_version}"
+
+
+def validate_chapter_analysis_registry(
+    registry: dict[str, Any]
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if not isinstance(registry, dict) or registry.get("schema_version") != 1:
+        return [issue("analysis_registry_schema_invalid", "章节分析登记表 schema_version 必须为1")]
+    records = registry.get("records")
+    if not isinstance(records, list):
+        return [issue("analysis_registry_records_invalid", "章节分析登记表 records 必须是数组")]
+    seen: set[str] = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            errors.append(issue("analysis_registry_record_invalid", "章节分析登记必须是对象", record_index=index))
+            continue
+        unit_id = record.get("source_unit_id")
+        content_hash = record.get("content_sha256")
+        contract_version = record.get("analysis_contract_version")
+        if not isinstance(unit_id, str) or not unit_id:
+            errors.append(issue("analysis_registry_source_unit_invalid", "章节分析登记缺少 source_unit_id", record_index=index))
+            continue
+        if not isinstance(content_hash, str) or not content_hash:
+            errors.append(issue("analysis_registry_content_hash_invalid", "章节分析登记缺少 content_sha256", source_unit_id=unit_id))
+            continue
+        if type(contract_version) is not int or contract_version < 1:
+            errors.append(issue("analysis_registry_contract_version_invalid", "analysis_contract_version 必须是正整数", source_unit_id=unit_id))
+            continue
+        expected_key = analysis_idempotency_key(unit_id, content_hash, contract_version)
+        actual_key = record.get("idempotency_key")
+        if actual_key != expected_key:
+            errors.append(issue("analysis_registry_hash_mismatch", "分析登记幂等键与章节哈希或契约版本不一致", source_unit_id=unit_id))
+        if expected_key in seen:
+            errors.append(issue("source_analysis_idempotency_conflict", "同一章节、哈希和分析契约存在多个登记", source_unit_id=unit_id))
+        seen.add(expected_key)
+        if record.get("analysis_status") not in {"pending", "analyzed", "invalidated"}:
+            errors.append(issue("analysis_registry_status_invalid", "analysis_status 必须为 pending/analyzed/invalidated", source_unit_id=unit_id))
+        for field in ("analysis_path", "analysis_sha256"):
+            if record.get("analysis_status") == "analyzed" and (
+                not isinstance(record.get(field), str) or not record[field]
+            ):
+                errors.append(issue("analysis_registry_artifact_invalid", f"已分析记录缺少 {field}", source_unit_id=unit_id))
+    return errors
+
+
+def record_chapter_analysis(
+    registry: dict[str, Any],
+    *,
+    source_unit_id: str,
+    content_sha256: str,
+    analysis_contract_version: int,
+    analysis_path: str,
+    analysis_sha256: str,
+) -> dict[str, Any]:
+    errors = validate_chapter_analysis_registry(registry)
+    if errors:
+        raise PartitionError("analysis_registry_invalid")
+    key = analysis_idempotency_key(
+        source_unit_id, content_sha256, analysis_contract_version
+    )
+    records = registry["records"]
+    if any(
+        isinstance(record, dict)
+        and record.get("idempotency_key") == key
+        and record.get("analysis_status") != "invalidated"
+        for record in records
+    ):
+        raise PartitionError("source_unit_reanalysis_forbidden")
+    result = copy.deepcopy(registry)
+    result["records"].append(
+        {
+            "source_unit_id": source_unit_id,
+            "content_sha256": content_sha256,
+            "analysis_contract_version": analysis_contract_version,
+            "analysis_status": "analyzed",
+            "analysis_path": analysis_path,
+            "analysis_sha256": analysis_sha256,
+            "idempotency_key": key,
+        }
+    )
+    return result
+
+
+def validate_rolling_source_progress(
+    progress: dict[str, Any]
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    if not isinstance(progress, dict) or progress.get("schema_version") != 1:
+        return [issue("rolling_progress_schema_invalid", "滚动来源进度 schema_version 必须为1")]
+    batch_id = progress.get("current_batch_id")
+    if not isinstance(batch_id, str) or not batch_id:
+        errors.append(issue("rolling_progress_batch_invalid", "滚动来源进度缺少 current_batch_id"))
+    carryover = progress.get("carryover_event_ids", [])
+    if not isinstance(carryover, list) or not all(isinstance(value, str) and value for value in carryover):
+        errors.append(issue("carryover_analysis_missing", "carryover_event_ids 必须是字符串数组"))
+        carryover = []
+    consumption = progress.get("event_consumption", {})
+    if not isinstance(consumption, dict):
+        errors.append(issue("rolling_progress_consumption_invalid", "event_consumption 必须是对象"))
+        consumption = {}
+    allowed = {"unconsumed", "partially_consumed", "consumed", "invalidated"}
+    for event_id, status in consumption.items():
+        if not isinstance(event_id, str) or status not in allowed:
+            errors.append(
+                issue(
+                    "rolling_progress_consumption_status_invalid",
+                    "事件消费状态必须为 unconsumed/partially_consumed/consumed/invalidated",
+                    event_id=event_id,
+                    status=status,
+                )
+            )
+    missing = [event_id for event_id in carryover if event_id not in consumption]
+    if missing:
+        errors.append(issue("carryover_analysis_missing", "carryover事件缺少消费状态", event_ids=missing))
+    next_read_start = progress.get("next_read_start")
+    if next_read_start is not None and (
+        not isinstance(next_read_start, str) or not next_read_start
+    ):
+        errors.append(issue("rolling_progress_next_read_invalid", "next_read_start 必须是字符串或null"))
+    return errors
+
+
+def build_rolling_source_plan(
+    source_corpus: dict[str, Any],
+    registry: dict[str, Any],
+    progress: dict[str, Any],
+    *,
+    window_size: int = 3,
+) -> dict[str, Any]:
+    if type(window_size) is not int or window_size < 1:
+        raise PartitionError("rolling_window_size_invalid")
+    registry_errors = validate_chapter_analysis_registry(registry)
+    if registry_errors:
+        raise PartitionError("analysis_registry_invalid")
+    progress_errors = validate_rolling_source_progress(progress)
+    if progress_errors:
+        raise PartitionError("rolling_source_progress_invalid")
+    ordered = _ordered_units(source_corpus)
+    corpus_hashes = {
+        unit["source_unit_id"]: unit.get("content_sha256") for unit in ordered
+    }
+    analyzed = {
+        record["source_unit_id"]
+        for record in registry["records"]
+        if isinstance(record, dict)
+        and record.get("analysis_status") == "analyzed"
+        and corpus_hashes.get(record.get("source_unit_id")) == record.get("content_sha256")
+    }
+    ordered_ids = [unit["source_unit_id"] for unit in ordered]
+    start_id = progress.get("next_read_start") if isinstance(progress, dict) else None
+    start_index = ordered_ids.index(start_id) if start_id in ordered_ids else 0
+    new_units = [unit_id for unit_id in ordered_ids[start_index:] if unit_id not in analyzed][
+        :window_size
+    ]
+    carryover = progress.get("carryover_event_ids", []) if isinstance(progress, dict) else []
+    if not isinstance(carryover, list) or not all(isinstance(value, str) for value in carryover):
+        raise PartitionError("carryover_analysis_missing")
+    return {
+        "schema_version": 1,
+        "current_batch_id": progress.get("current_batch_id") if isinstance(progress, dict) else None,
+        "carryover_event_ids": list(carryover),
+        "reusable_analyzed_source_unit_ids": [unit_id for unit_id in ordered_ids if unit_id in analyzed],
+        "new_analysis_source_unit_ids": new_units,
+        "next_read_start": new_units[0] if new_units else None,
     }

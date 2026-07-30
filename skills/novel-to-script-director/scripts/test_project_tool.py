@@ -2681,6 +2681,25 @@ class ProjectToolTests(unittest.TestCase):
             {item["code"] for item in result["errors"]},
         )
 
+    def test_source_event_index_accepts_typed_short_character_location_and_prop_ids(self) -> None:
+        self.create_ready_project()
+
+        def add_typed_entities(payload: dict) -> None:
+            payload["entities"].extend(
+                [
+                    {"entity_id": "L001", "entity_type": "location", "canonical_name": "院门", "aliases": []},
+                    {"entity_id": "P001", "entity_type": "prop", "canonical_name": "钥匙", "aliases": []},
+                ]
+            )
+
+        self.update_artifact_json("source_event_index", add_typed_entities)
+        result = project_tool.validate_state(self.project)
+        self.assertNotIn(
+            "event_entity_id_invalid",
+            {item["code"] for item in result["errors"]},
+            result,
+        )
+
     def test_source_event_index_requires_exact_upgrade_pending_tracking(self) -> None:
         self.create_ready_project()
 
@@ -3686,7 +3705,6 @@ class ProjectToolTests(unittest.TestCase):
                 "duration_policy": {
                     "tolerance_ratio": 0.15,
                     "dialogue_chars_per_second": [3.5, 4.5],
-                    "inflation_redline_ratio": 0.25,
                 },
             },
             "合法时长",
@@ -3705,6 +3723,7 @@ class ProjectToolTests(unittest.TestCase):
             ({"target_duration_seconds": "90秒"}, "target_duration_seconds"),
             ({"duration_policy": {"tolerance_ratio": 1.5}}, "tolerance_ratio"),
             ({"duration_policy": {"dialogue_chars_per_second": [4.5, 3.5]}}, "递增"),
+            ({"duration_policy": {"inflation_redline_ratio": 0.25}}, "inflation_redline_ratio"),
             ({"duration_policy": "宽松"}, "duration_policy"),
         )):
             with self.subTest(fields=fields):
@@ -4445,6 +4464,22 @@ class ProjectToolTests(unittest.TestCase):
         self.assertGreater(estimate["spoken_char_count"], 0)
         self.assertIn("非配音实测", estimate["estimate_basis"])
 
+    def test_validate_project_propagates_current_script_duration_warnings(self) -> None:
+        self.create_ready_project()
+        overloaded = GOOD_SCRIPT.replace(
+            "管家：把钥匙交出来。", "管家：" + "把钥匙交出来。" * 120
+        )
+        version = self.register_episode_candidate(content=overloaded, file_tag="时长预警传播")
+        result = project_tool.validate_state(self.project)
+        warnings = [
+            item
+            for item in result["warnings"]
+            if item.get("artifact_key") == "episode_script:E001"
+            and item.get("version") == version
+        ]
+        self.assertIn("episode_dialogue_budget_over", {item["code"] for item in warnings}, result)
+        self.assertIn("scene_duration_unbalanced", {item["code"] for item in warnings}, result)
+
     def test_script_duration_estimate_absent_without_target(self) -> None:
         """不传目标时长时输出与改动前逐字段一致，且不产生任何时长预警。"""
         script = self.root / "常规剧本.md"
@@ -4726,6 +4761,59 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(code, 0, payload)
         self.assertEqual(payload["episode_scope_source"], "project_spec")
         self.assertNotIn("warnings", payload)
+
+    def test_awaiting_project_spec_does_not_override_confirmed_authority(self) -> None:
+        self.init_project()
+        confirmed = {
+            "schema_version": 1,
+            "project_id": self.state()["project_id"],
+            "expected_episodes": 4,
+            "target_runtime": "按项目实读复核",
+            "handoff_target": "可直接进入导演拆镜",
+        }
+        self.register_and_approve(
+            "project_spec",
+            "01_原著解析/项目规格V1.json",
+            json.dumps(confirmed, ensure_ascii=False),
+        )
+        self.register_artifact(
+            "project_spec",
+            "01_原著解析/项目规格V2_未确认.json",
+            json.dumps({**confirmed, "expected_episodes": 99}, ensure_ascii=False),
+        )
+
+        code, payload = self.run_cli("define-batch", str(self.project), "B02", "E005")
+        self.assertEqual(code, 2, payload)
+        self.assertIn("项目规格 expected_episodes（4）", payload["error"])
+        self.assertEqual(project_tool.project_expected_episodes(self.project, self.state()), 4)
+
+    def test_rolling_batch_schema_v2_allows_unknown_final_count_only_with_user_confirmation(self) -> None:
+        self.init_project()
+        spec = {
+            "schema_version": 2,
+            "project_id": self.state()["project_id"],
+            "scope_mode": "rolling_batch",
+            "batch_size": 3,
+            "target_duration_seconds": 60,
+            "initial_source_window_units": 3,
+            "final_expected_episodes": None,
+        }
+        self.register_and_approve(
+            "project_spec", "01_原著解析/项目规格V2.json", json.dumps(spec, ensure_ascii=False)
+        )
+        code, payload = self.run_cli(
+            "define-batch", str(self.project), "B01", "E001", "E002", "E003"
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("--confirmed-by-user", payload["error"])
+        code, payload = self.run_cli(
+            "define-batch", str(self.project), "B01", "E001", "E002", "E003",
+            "--confirmed-by-user",
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["episode_scope_source"], "confirmed_batches")
+        self.assertIsNone(project_tool.project_expected_episodes(self.project, self.state()))
+        self.assertEqual(project_tool.confirmed_episode_ids(self.state()), ["E001", "E002", "E003"])
 
     def test_init_without_expected_episodes_still_requires_project_spec(self) -> None:
         self.init_project()
@@ -5013,6 +5101,60 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(payload["unit_count"], 3)
         self.assertTrue(output.is_file())
         self.assertEqual((self.project / "project_state.json").read_bytes(), before)
+
+    def test_rolling_source_commands_write_only_requested_project_outputs(self) -> None:
+        self.init_project()
+        corpus = self.write_json(
+            "01_原著解析/rolling_corpus.json",
+            {
+                "schema_version": 1,
+                "source_units": [
+                    {"source_unit_id": "SU001", "ordinal": 1, "estimated_tokens": 100, "complexity_points": 1, "content_sha256": "hash-1"},
+                    {"source_unit_id": "SU002", "ordinal": 2, "estimated_tokens": 100, "complexity_points": 1, "content_sha256": "hash-2"},
+                ],
+            },
+        )
+        registry = self.write_json(
+            "01_原著解析/chapter_registry_v1.json",
+            {"schema_version": 1, "records": []},
+        )
+        progress = self.write_json(
+            "01_原著解析/rolling_progress_v1.json",
+            {"schema_version": 1, "current_batch_id": "B01", "carryover_event_ids": [], "event_consumption": {}, "next_read_start": "SU001"},
+        )
+        analysis = self.write_json("tmp/SU001_analysis.json", {"events": []})
+        registry_v2 = self.project / "01_原著解析/chapter_registry_v2.json"
+        code, payload = self.run_cli(
+            "register-source-analysis", str(self.project),
+            "--source-corpus", str(corpus), "--registry", str(registry),
+            "--source-unit-id", "SU001", "--analysis", str(analysis),
+            "--contract-version", "1", "--output", str(registry_v2),
+        )
+        self.assertEqual(code, 0, payload)
+        plan = self.project / "tmp/rolling_plan.json"
+        code, payload = self.run_cli(
+            "plan-rolling-source-window", str(self.project),
+            "--source-corpus", str(corpus), "--registry", str(registry_v2),
+            "--progress", str(progress), "--window-size", "2", "--output", str(plan),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(json.loads(plan.read_text())["new_analysis_source_unit_ids"], ["SU002"])
+
+    def test_production_context_manifest_excludes_tests_and_development_plans(self) -> None:
+        self.init_project()
+        output = self.project / "tmp/production_context.json"
+        code, payload = self.run_cli(
+            "build-production-context-manifest",
+            str(self.project),
+            "--stage", "source_analysis",
+            "--output", str(output),
+        )
+        self.assertEqual(code, 0, payload)
+        loaded = json.loads(output.read_text())
+        paths = loaded["allowed_plugin_paths"]
+        self.assertTrue(paths)
+        self.assertFalse(any("test_" in path for path in paths))
+        self.assertFalse(any("docs/superpowers/plans" in path for path in paths))
 
 
 if __name__ == "__main__":

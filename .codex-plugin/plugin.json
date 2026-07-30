@@ -1,7 +1,7 @@
 {
   "name": "ai-director",
-  "version": "0.8.4",
-  "description": "An AI screenwriter/director workflow for direct source import, chapter/event-aware long-novel partitioning, single-writer parallel analysis merging, lightweight full-series backbones, batch-scoped source-detail gates, per-episode DOCX+HTML delivery, and executable model-agnostic text storyboards.",
+  "version": "0.8.5",
+  "description": "An AI screenwriter/director workflow with confirmed-spec authority, rolling-batch unknown final counts, idempotent chapter analysis reuse, project-root I/O guards, and per-episode DOCX+HTML delivery.",
   "author": {
     "name": "Shinchan-crayon"
   },
@@ -9,10 +9,14 @@
   "interface": {
     "displayName": "AI导演",
     "shortDescription": "长篇小说动态分片并发解析，逐集交付剧本与可执行HTML故事板。",
-    "longDescription": "AI导演 v0.8.4 按原著解析、改编定位、改编圣经、轻量全剧骨架、批次原著范围与逐单元细化、批次大纲、分集剧本和制作提取完成小说改剧本。任意长度小说按章节与事件动态分片，分析分片可并发，项目状态由单一写入者合并；不按固定总字数硬切。每个批次独立通过内容边界、制作就绪、连续性快照和交付审核。每集可确定性输出文学剧本 DOCX 与 HTML 故事板；人物锚点包含正面头肩肖像及全身正面、侧面、背面三视图描述，分镜包含结构化景别与镜头运动。通用视频提示词经过人物、空间、声音、对白、镜头运动、负面约束和屏幕文字后期方案的可执行性门禁。插件不生成图片、不嵌入 Base64、不提交视频任务，也不调用配音或剪辑接口。",
+    "longDescription": "AI导演 v0.8.5 按原著解析、改编定位、改编圣经、轻量全剧骨架、批次原著范围与逐单元细化、批次大纲、分集剧本和制作提取完成小说改剧本。任意长度小说按章节与事件动态分片，分析分片可并发，项目状态由单一写入者合并；不按固定总字数硬切。每个批次独立通过内容边界、制作就绪、连续性快照和交付审核。每集可确定性输出文学剧本 DOCX 与 HTML 故事板；人物锚点包含正面头肩肖像及全身正面、侧面、背面三视图描述，分镜包含结构化景别与镜头运动。通用视频提示词经过人物、空间、声音、对白、镜头运动、负面约束和屏幕文字后期方案的可执行性门禁。插件不生成图片、不嵌入 Base64、不提交视频任务，也不调用配音或剪辑接口。 v0.8.5新增有效确认项目规格权威、C/L/P实体ID一致性、剧本预警传播、章节分析幂等登记、carryover优先滚动窗口、未知最终集数批次确认和生产上下文清单。",
     "developerName": "Shinchan-crayon",
     "category": "Productivity",
     "capabilities": [
+      "生产上下文最小加载清单",
+      "rolling_batch未知最终集数与用户确认扩批",
+      "章节分析幂等登记与carryover优先复用",
+      "有效确认项目规格运行权威",
       "小说与长内容解析",
       "改编定位与故事圣经",
       "全剧分集规划",

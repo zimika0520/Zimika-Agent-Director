@@ -135,6 +135,109 @@ class SourcePartitionTests(unittest.TestCase):
             ["SU001", "SU002", "SU003"],
         )
 
+    def rolling_corpus(self) -> dict:
+        corpus = self.source_corpus()
+        for index, unit in enumerate(corpus["source_units"], 1):
+            unit["content_sha256"] = f"hash-{index}"
+        return corpus
+
+    def test_rolling_plan_reuses_carryover_and_only_schedules_unanalyzed_units(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "records": [
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001.json",
+                    "analysis_sha256": "analysis-1",
+                    "idempotency_key": "SU001:hash-1:v1",
+                }
+            ],
+        }
+        progress = {
+            "schema_version": 1,
+            "current_batch_id": "B02",
+            "carryover_event_ids": ["EV-OLD-1"],
+            "event_consumption": {"EV-OLD-1": "unconsumed"},
+            "next_read_start": "SU002",
+        }
+        plan = source_partition.build_rolling_source_plan(
+            self.rolling_corpus(), registry, progress, window_size=2
+        )
+        self.assertEqual(plan["carryover_event_ids"], ["EV-OLD-1"])
+        self.assertEqual(plan["reusable_analyzed_source_unit_ids"], ["SU001"])
+        self.assertEqual(plan["new_analysis_source_unit_ids"], ["SU002", "SU003"])
+
+    def test_record_chapter_analysis_rejects_same_unit_hash_and_contract_twice(self) -> None:
+        registry = {"schema_version": 1, "records": []}
+        first = source_partition.record_chapter_analysis(
+            registry,
+            source_unit_id="SU001",
+            content_sha256="hash-1",
+            analysis_contract_version=1,
+            analysis_path="tmp/SU001.json",
+            analysis_sha256="analysis-1",
+        )
+        with self.assertRaisesRegex(
+            source_partition.PartitionError, "source_unit_reanalysis_forbidden"
+        ):
+            source_partition.record_chapter_analysis(
+                first,
+                source_unit_id="SU001",
+                content_sha256="hash-1",
+                analysis_contract_version=1,
+                analysis_path="tmp/SU001-retry.json",
+                analysis_sha256="analysis-2",
+            )
+
+    def test_registry_validation_detects_hash_and_idempotency_conflicts(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "records": [
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001.json",
+                    "analysis_sha256": "analysis-1",
+                    "idempotency_key": "wrong",
+                },
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001-duplicate.json",
+                    "analysis_sha256": "analysis-2",
+                    "idempotency_key": "SU001:hash-1:v1",
+                },
+            ],
+        }
+        codes = {
+            item["code"]
+            for item in source_partition.validate_chapter_analysis_registry(registry)
+        }
+        self.assertIn("analysis_registry_hash_mismatch", codes)
+        self.assertIn("source_analysis_idempotency_conflict", codes)
+
+    def test_rolling_progress_rejects_unknown_consumption_status(self) -> None:
+        errors = source_partition.validate_rolling_source_progress(
+            {
+                "schema_version": 1,
+                "current_batch_id": "B01",
+                "carryover_event_ids": ["EV001"],
+                "event_consumption": {"EV001": "mystery"},
+                "next_read_start": "SU002",
+            }
+        )
+        self.assertIn(
+            "rolling_progress_consumption_status_invalid",
+            {item["code"] for item in errors},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

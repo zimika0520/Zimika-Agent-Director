@@ -71,6 +71,8 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。并发工作者只写独立文件，由单一合并者登记规范制品。
 
+生产来源分析必须维护`chapter_analysis_registry`和`rolling_source_progress`。相同`source_unit_id + content_sha256 + analysis_contract_version`不得重复分析；下一批先复用carryover，再从`next_read_start`规划新章节。使用`register-source-analysis`登记新的registry文件，使用`plan-rolling-source-window`生成增量窗口。所有输入输出必须位于显式项目根目录内。
+
 ## 建立本地项目
 
 默认在工作区创建 `AI导演项目/<安全项目名>/`，不得覆盖已有项目：
@@ -85,7 +87,7 @@ python3 <技能目录>/scripts/project_tool.py init \
 
 必须至少提供一份 `--source`，可重复提供。脚本复制原文件并记录散列，不修改原文件。用户粘贴内容时先保存为来源文件再注册。
 
-`--expected-episodes` 记入状态的 `expected_episodes_hint`，只用于在 `project_spec` 确认前先定义批次（此时 `define-batch` 返回 `episode_scope_source: init_hint` 并附警告）。它不是交付权威：`project_spec` 一经确认即覆盖提示，全部交付门禁与校验仍以已确认 `project_spec` 的 `expected_episodes` 为准。未提供该参数时，必须先确认 `project_spec` 才能定义批次。
+`--expected-episodes`记入状态的`expected_episodes_hint`，只用于固定全剧规格确认前的规划提示。运行时只读取有效确认的`project_spec`；更高版本仍为draft或awaiting_approval时不能覆盖上一份有效确认规格。`rolling_batch` schema v2允许`final_expected_episodes: null`，批次范围以显式用户确认的`project_state.batches`为权威。
 
 完整小说、部分章节、TXT、Markdown、Word 或其他可读取文档都直接登记。`self_owned` 与 `storyline` 不询问官网审核；`published_novel` 再询问用户是否审核，默认关闭。用户主动开启时必须提供 HTTP/HTTPS 页面，审核结论只展示，不阻塞原著解析。`--garble-threshold` 仅为旧命令兼容保留，当前版本不触发正文检查。
 
@@ -99,6 +101,7 @@ python3 <技能目录>/scripts/project_tool.py init \
 - 将“可直接进入导演拆镜”写入交付要求，不把“可商用”当成没有验收条件的形容词。
 - 建立稳定来源 ID、人物、关系、地点、时间线、事件、因果和异常；事实、推断、未知和改编新增分栏。
 - 逐个可定位原著单元生成全局 `SourceEventIndex`：允许整本使用 `chapter_summary`，仍须逐单元覆盖 `SourceCorpus` 并维护 `upgrade_pending`。当前批次不反复改写全局索引，而是用 `batch_source_scope:B01` 确定所需原著单元，再用 `batch_source_detail:B01` 对这些单元建立完整 `unit_detail`；缺单元、仍为粗粒度或绑定旧版本时不能确认批次大纲。
+- canonical entity按类型使用`character: C001/CHAR-*`、`location: L001/LOC-*`、`prop: P001/PROP-*`，全局唯一且类型与前缀必须一致。
 - 生成项目规格、原著语料、事件索引与事实库；项目规格和事件索引以规范 JSON 为权威，其他阅读版只作副本。
 
 ### 2. 改编定位与题材打标
@@ -125,8 +128,10 @@ python3 <技能目录>/scripts/project_tool.py init \
 
 ```bash
 python3 <技能目录>/scripts/project_tool.py define-batch \
-  <项目目录> B01 E001 E002
+  <项目目录> B01 E001 E002 E003 --confirmed-by-user
 ```
+
+`--confirmed-by-user`只在rolling_batch schema v2新增批次时强制；不得由模型自行假定用户已确认。
 
 - 按已确认地图细化当前批次；试写数量由项目决定，默认参数不是标准。
 - 先登记并确认 `batch_source_scope:B01` 与 `batch_source_detail:B01`。范围制品绑定批次集号和当前原著语料；细化制品必须逐项覆盖范围中的所有原著单元，并全部达到 `unit_detail`。
@@ -140,6 +145,7 @@ python3 <技能目录>/scripts/project_tool.py define-batch \
 ### 5. 分批写作与滚动连续性
 
 - 每批按 [workflow.md](references/workflow.md) 的“写第 N 集上下文配方”加载：全局滚动摘要（`rolling_summary`，硬上限）＋近程定向摘要＋上集结尾原文接缝，外加已确认圣经、批次大纲、对应原著片段、连续性台账和下一集地图条目；不整本回喂已写剧本。每批完成后更新滚动摘要新版本。
+- 生产任务开始前运行`build-production-context-manifest`生成当前阶段最小加载清单；不得读取`test_*.py`或`docs/superpowers/plans/`。
 - 顺序生成少量剧集，不并行破坏前后集状态。
 - 每集剧本先登记 `awaiting_approval`，再生成精确绑定当前版本的 `episode_boundary_review`；`blocked` 或 `suspected_overreach` 必须先返修或人工确认，不能把越界内容带入后续剧集。
 - 每集更新人物位置、身体/身份状态、关系、知情范围、服装、道具、伏笔、未解决冲突和故事线进度。

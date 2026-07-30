@@ -78,7 +78,7 @@ N-M 场景：地点 日/夜 / 内/外
 - 字数和对白密度只能预警，不能冒充实测结果。批次大纲阶段即按“中文配音约3.5—4.5字/秒”做逐场对白秒数预算（样本推算值，仅作预警工具，可用 `duration_policy.dialogue_chars_per_second` 调整）：净对白秒数＋动作与转场余量明显超出单集目标时长时，先在大纲层压缩，不把超载留到成稿返修。`validate-script` 在净对白按最快语速推算已超目标时长时报 `episode_dialogue_budget_over` 警告。
 - 只预警超时，不预警偏短：判断偏短需要动作与转场余量，该余量不是项目已声明的参数，工具不凭空设定，只把估算数据放进 `duration_estimate` 交人工判断。
 - 单场时长按“单集目标时长 ÷ 场数”推导比例区间（如 90 秒 3 场 → 每场约 20—45 秒），不写死绝对秒数；明显失衡的场报 `scene_duration_unbalanced` 警告，在大纲层调整。
-- 防扩写红线（预警参数，默认 20%—30%，项目可调 `duration_policy.inflation_redline_ratio`）：成稿字数相对所改编原著段落的膨胀率超线时，边界报告须逐项核对膨胀部分是否全部为格式开销与表达层操作；膨胀率随边界报告记录。
+- 防扩写仍由内容边界报告逐项核对新增文字是否只是格式开销与表达层操作。v0.8.5移除了没有可靠原著范围字数消费者的`duration_policy.inflation_redline_ratio`，不得再把该字段写入项目规格。
 - AI 分镜计划必须写明当前生效的 `target_duration_seconds`：项目规格未声明时必须为默认 60，已声明时必须与项目值一致。缺失报 `shotplan_target_duration_missing`，数值不符报 `shotplan_target_duration_mismatch`；两者都是阻断错误。工具随后校验单元合计时长偏差是否超过 `duration_policy.tolerance_ratio`（默认 ±10%），超差须写 `duration_deviation_note` 或返修。
 - 不为了增加动作重复信息，也不为了压时长删掉因果成立所需的反应和选择。
 

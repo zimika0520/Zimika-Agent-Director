@@ -28,6 +28,14 @@
 
 审核只读取用户指定页面，不自行搜索、下载或替换正文。该制品不进入阶段完成或交付强制依赖，任何结论都不阻塞后续工作流。
 
+## 章节分析登记表 `ChapterAnalysisRegistry`
+
+规范JSON制品键为`chapter_analysis_registry`，直接依赖当前`source_corpus`。每条记录使用`source_unit_id + content_sha256 + analysis_contract_version`生成幂等键，保存分析文件相对路径、SHA256和`pending/analyzed/invalidated`状态。同一有效幂等键只能存在一次；原文哈希或分析契约变化时创建新记录并使旧记录失效，不覆盖历史。
+
+## 滚动来源进度 `RollingSourceProgress`
+
+规范JSON制品键为`rolling_source_progress`，依赖当前`source_corpus`和`chapter_analysis_registry`。记录当前批次、`carryover_event_ids`、逐事件`unconsumed/partially_consumed/consumed/invalidated`状态和`next_read_start`。下一批必须先消费有效carryover，再规划新的未分析章节。
+
 ## 原著事件索引 `SourceEventIndex`
 
 顶层包含 `schema_version`、`project_id`、精确的 `generated_from`、`units` 和 `upgrade_pending`。每个 `SourceCorpus` 单元必须且只能出现一次：

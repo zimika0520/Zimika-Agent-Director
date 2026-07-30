@@ -53,7 +53,6 @@ DEFAULT_DIALOGUE_CHARS_PER_SECOND = (3.5, 4.5)
 # 单场时长比例带：单集目标时长 ÷ 场数 后允许的上下浮动，取自文档示例
 #（90 秒 3 场 → 每场约 20—45 秒，即均值 30 秒的 2/3 到 3/2）。
 SCENE_DURATION_BAND = (2 / 3, 3 / 2)
-DEFAULT_INFLATION_REDLINE_RATIO = 0.3
 
 # 入料体检（init/add-source 时的来源体检卡）。体检只提示，不阻塞。
 INTAKE_CHECK_FILENAME = "入料体检.json"
@@ -122,6 +121,8 @@ ARTIFACT_TYPES = {
     "project_spec": "项目规格",
     "source_review": "来源官网审核",
     "source_corpus": "原著语料库",
+    "chapter_analysis_registry": "章节分析登记表",
+    "rolling_source_progress": "滚动来源进度",
     "source_event_index": "原著事件索引",
     "story_facts": "故事事实库",
     "adaptation_profile": "改编定位卡",
@@ -174,11 +175,15 @@ ARTIFACT_TYPES = {
 DEPENDENCY_GRAPH = {
     "project_spec": {"source_corpus", "story_facts", "adaptation_profile"},
     "source_corpus": {
+        "chapter_analysis_registry",
+        "rolling_source_progress",
         "source_event_index",
         "batch_source_scope",
         "batch_source_detail",
         "dialogue_cue_sheet",
     },
+    "chapter_analysis_registry": {"rolling_source_progress", "source_event_index"},
+    "rolling_source_progress": {"batch_source_scope", "batch_source_detail"},
     "source_event_index": {
         "story_facts",
         "adaptation_decision_ledger",
@@ -292,6 +297,11 @@ DEPENDENCY_GRAPH = {
 # 这既保留试写/正式剧本的分支，也阻止以空依赖绕过制作链路。
 REQUIRED_UPSTREAM_GROUPS: dict[str, tuple[frozenset[str], ...]] = {
     "source_corpus": (frozenset({"project_spec"}),),
+    "chapter_analysis_registry": (frozenset({"source_corpus"}),),
+    "rolling_source_progress": (
+        frozenset({"source_corpus"}),
+        frozenset({"chapter_analysis_registry"}),
+    ),
     "source_event_index": (frozenset({"source_corpus"}),),
     "story_facts": (frozenset({"source_event_index"}),),
     "adaptation_profile": (
@@ -608,6 +618,8 @@ ARTIFACT_STAGE = {
     "project_spec": "project_setup",
     "source_review": "source_analysis",
     "source_corpus": "source_analysis",
+    "chapter_analysis_registry": "source_analysis",
+    "rolling_source_progress": "source_analysis",
     "source_event_index": "source_analysis",
     "story_facts": "source_analysis",
     "adaptation_profile": "adaptation_positioning",
@@ -1408,7 +1420,13 @@ def duration_policy_issues(payload: dict[str, Any]) -> list[str]:
         problems.append("duration_policy 必须是对象")
         return problems
 
-    for field in ("tolerance_ratio", "inflation_redline_ratio"):
+    if "inflation_redline_ratio" in policy:
+        problems.append(
+            "duration_policy.inflation_redline_ratio 已移除：旧字段没有可靠的原著范围字数消费者，"
+            "请删除该字段后重新登记项目规格"
+        )
+
+    for field in ("tolerance_ratio",):
         value = policy.get(field)
         if value is None:
             continue
@@ -2018,21 +2036,40 @@ def command_define_batch(args: argparse.Namespace) -> int:
         raise ToolError("批次集号必须使用 E001、E002 这类格式")
     if len(episode_ids) != len(set(episode_ids)):
         raise ToolError("批次集号不能重复")
+    spec = confirmed_project_spec_payload(project_path, state)
+    rolling_v2 = (
+        isinstance(spec, dict)
+        and spec.get("schema_version") == 2
+        and spec.get("scope_mode") == "rolling_batch"
+    )
     expected_episodes = project_expected_episodes(project_path, state)
-    episode_scope_source = "project_spec"
-    if expected_episodes is None:
+    episode_scope_source = "confirmed_batches" if rolling_v2 else "project_spec"
+    if rolling_v2:
+        if not args.confirmed_by_user:
+            raise ToolError("rolling_batch新增批次必须显式提供 --confirmed-by-user")
+        batch_size = spec.get("batch_size")
+        if type(batch_size) is not int or batch_size < 1:
+            raise ToolError("rolling_batch项目规格 batch_size 必须是正整数")
+        if len(episode_ids) != batch_size:
+            raise ToolError(f"rolling_batch批次必须包含 batch_size={batch_size} 集")
+        previous = confirmed_episode_ids(state)
+        first_expected = int(previous[-1][1:]) + 1 if previous else 1
+        expected_sequence = [f"E{number:03d}" for number in range(first_expected, first_expected + len(episode_ids))]
+        if episode_ids != expected_sequence:
+            raise ToolError("rolling_batch新批次集号必须紧接已确认批次且连续：" + " ".join(expected_sequence))
+    elif expected_episodes is None:
         # project_spec 仍是交付门禁的唯一权威；这里只让规划期的批次划分
         # 回退到 init 登记的目标集数提示，避免建档后无法定义批次。
         expected_episodes = state_expected_episodes_hint(state)
         episode_scope_source = "init_hint"
-    if expected_episodes is None:
+    if not rolling_v2 and expected_episodes is None:
         raise ToolError(
             "无法读取目标集数：请先登记并确认含 expected_episodes 的 project_spec，"
             "或在 init 时提供 --expected-episodes"
         )
     out_of_range = [
         value for value in episode_ids if int(value[1:]) > expected_episodes
-    ]
+    ] if expected_episodes is not None else []
     if out_of_range:
         scope_label = (
             f"项目规格 expected_episodes（{expected_episodes}）"
@@ -2069,6 +2106,14 @@ def command_define_batch(args: argparse.Namespace) -> int:
         "defined_at": defined_at,
         "note": args.note or "",
     }
+    if rolling_v2:
+        batches[batch_id].update(
+            {
+                "status": "confirmed",
+                "confirmed_at": defined_at,
+                "approval_note": args.note or "用户显式确认批次范围",
+            }
+        )
     append_history(
         state,
         "batch_defined",
@@ -2647,6 +2692,93 @@ def command_merge_source_analysis_shards(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_register_source_analysis(args: argparse.Namespace) -> int:
+    project_path, _state = load_state(args.project)
+    corpus = read_json_file(resolve_project_input(project_path, args.source_corpus))
+    registry = read_json_file(resolve_project_input(project_path, args.registry))
+    analysis_path = resolve_project_input(project_path, args.analysis)
+    units = corpus.get("source_units")
+    unit = next(
+        (
+            item
+            for item in units
+            if isinstance(item, dict) and item.get("source_unit_id") == args.source_unit_id
+        ),
+        None,
+    ) if isinstance(units, list) else None
+    if not isinstance(unit, dict) or not isinstance(unit.get("content_sha256"), str):
+        raise ToolError("source_unit_id 不存在或缺少 content_sha256")
+    try:
+        updated = source_partition.record_chapter_analysis(
+            registry,
+            source_unit_id=args.source_unit_id,
+            content_sha256=unit["content_sha256"],
+            analysis_contract_version=args.contract_version,
+            analysis_path=analysis_path.relative_to(project_path).as_posix(),
+            analysis_sha256=sha256_file(analysis_path),
+        )
+    except source_partition.PartitionError as exc:
+        raise ToolError(str(exc)) from exc
+    output = resolve_project_output(project_path, args.output)
+    atomic_write_json(output, updated)
+    print_json({"ok": True, "output": str(output), "record_count": len(updated["records"])})
+    return 0
+
+
+def command_plan_rolling_source_window(args: argparse.Namespace) -> int:
+    project_path, _state = load_state(args.project)
+    corpus = read_json_file(resolve_project_input(project_path, args.source_corpus))
+    registry = read_json_file(resolve_project_input(project_path, args.registry))
+    progress = read_json_file(resolve_project_input(project_path, args.progress))
+    try:
+        plan = source_partition.build_rolling_source_plan(
+            corpus, registry, progress, window_size=args.window_size
+        )
+    except source_partition.PartitionError as exc:
+        raise ToolError(str(exc)) from exc
+    output = resolve_project_output(project_path, args.output)
+    atomic_write_json(output, plan)
+    print_json(
+        {
+            "ok": True,
+            "output": str(output),
+            "carryover_event_count": len(plan["carryover_event_ids"]),
+            "new_analysis_unit_count": len(plan["new_analysis_source_unit_ids"]),
+        }
+    )
+    return 0
+
+
+def command_build_production_context_manifest(args: argparse.Namespace) -> int:
+    project_path, _state = load_state(args.project)
+    common = [
+        "skills/novel-to-script-director/SKILL.md",
+        "skills/novel-to-script-director/references/workflow.md",
+        "skills/novel-to-script-director/references/artifact-contracts.md",
+        "skills/novel-to-script-director/references/production-data-schemas.md",
+        "skills/novel-to-script-director/scripts/project_tool.py",
+    ]
+    stage_paths = {
+        "source_analysis": ["skills/novel-to-script-director/scripts/source_partition.py"],
+        "batch_writing": ["skills/novel-to-script-director/references/script-format-and-quality.md"],
+        "final_delivery": [
+            "skills/novel-to-script-director/scripts/render_episode_script.py",
+            "skills/novel-to-script-director/scripts/render_storyboard.py",
+        ],
+    }
+    allowed = list(dict.fromkeys(common + stage_paths.get(args.stage, [])))
+    payload = {
+        "schema_version": 1,
+        "stage": args.stage,
+        "allowed_plugin_paths": allowed,
+        "forbidden_patterns": ["test_*.py", "docs/superpowers/plans/**"],
+    }
+    output = resolve_project_output(project_path, args.output)
+    atomic_write_json(output, payload)
+    print_json({"ok": True, "output": str(output), "allowed_path_count": len(allowed)})
+    return 0
+
+
 def episode_delivery_inputs(
     project_path: Path, state: dict[str, Any], episode: str
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -2816,10 +2948,12 @@ def command_render_storyboard(args: argparse.Namespace) -> int:
     """委托 render_storyboard 模块,把已确认分镜计划渲染成 HTML 故事板(只读)。"""
     import render_storyboard
 
+    project_path, _state = load_state(args.project)
+    requested_output = resolve_project_output(project_path, args.output) if args.output else None
     output = render_storyboard.render(
-        Path(args.project).expanduser(),
+        project_path,
         args.episode,
-        Path(args.output).expanduser() if args.output else None,
+        requested_output,
     )
     print_json({"ok": True, "output": str(output)})
     return 0
@@ -2893,6 +3027,8 @@ SPOKEN_DELIVERY_MODES = frozenset({
 STRUCTURED_DEVELOPMENT_TYPES = {
     "source_review",
     "source_corpus",
+    "chapter_analysis_registry",
+    "rolling_source_progress",
     "source_event_index",
     "batch_source_scope",
     "batch_source_detail",
@@ -3091,11 +3227,43 @@ def state_expected_episodes_hint(state: dict[str, Any]) -> int | None:
     return value if type(value) is int and value > 0 else None
 
 
-def project_expected_episodes(project_path: Path, state: dict[str, Any]) -> int | None:
-    candidates = latest_records_of_type(state, "project_spec")
-    if len(candidates) != 1:
+def effective_confirmed_project_spec_record(
+    project_path: Path, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """返回最高版本的有效确认项目规格，忽略其后的草稿或待确认版本。"""
+    records = state.get("artifacts", {}).get("project_spec", [])
+    if not isinstance(records, list):
         return None
-    _, record = candidates[0]
+    candidates = sorted(
+        (record for record in records if isinstance(record, dict)),
+        key=version_sort_key,
+        reverse=True,
+    )
+    for record in candidates:
+        version = record.get("version")
+        if record.get("status") != "confirmed" or type(version) is not int:
+            continue
+        if not has_active_approval(state, "project_spec", version):
+            continue
+        path = path_from_record(project_path, record.get("path"))
+        if (
+            path is None
+            or not path.is_file()
+            or sha256_file(path) != record.get("sha256")
+            or path.stat().st_size != record.get("size_bytes")
+        ):
+            continue
+        dependencies = record.get("depends_on")
+        if dependencies != []:
+            continue
+        return record
+    return None
+
+
+def project_expected_episodes(project_path: Path, state: dict[str, Any]) -> int | None:
+    record = effective_confirmed_project_spec_record(project_path, state)
+    if record is None:
+        return None
     path = path_from_record(project_path, record.get("path"))
     try:
         payload = (
@@ -3105,19 +3273,39 @@ def project_expected_episodes(project_path: Path, state: dict[str, Any]) -> int 
         )
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
-    expected = payload.get("expected_episodes") if isinstance(payload, dict) else None
+    if isinstance(payload, dict) and payload.get("scope_mode") == "rolling_batch" and payload.get("schema_version") == 2:
+        expected = payload.get("final_expected_episodes")
+    else:
+        expected = payload.get("expected_episodes") if isinstance(payload, dict) else None
     return expected if type(expected) is int and expected > 0 else None
 
 
 def confirmed_project_spec_payload(
     project_path: Path, state: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """当前唯一一份最新项目规格的 JSON payload；无法解析时返回 None。"""
-    candidates = latest_records_of_type(state, "project_spec")
-    if len(candidates) != 1:
+    """当前有效确认项目规格；更新版本未确认时继续使用上一份有效确认。"""
+    record = effective_confirmed_project_spec_record(project_path, state)
+    if record is None:
         return None
-    _, record = candidates[0]
     return load_project_spec_payload(project_path, record)
+
+
+def confirmed_episode_ids(state: dict[str, Any]) -> list[str]:
+    batches = state.get("batches", {})
+    if not isinstance(batches, dict):
+        return []
+    values: set[str] = set()
+    for batch in batches.values():
+        if not isinstance(batch, dict) or batch.get("status", "confirmed") != "confirmed":
+            continue
+        episode_ids = batch.get("episode_ids")
+        if isinstance(episode_ids, list):
+            values.update(
+                value
+                for value in episode_ids
+                if isinstance(value, str) and EPISODE_ID_RE.fullmatch(value)
+            )
+    return sorted(values, key=lambda value: int(value[1:]))
 
 
 def project_target_duration_seconds(
@@ -5846,6 +6034,28 @@ def validate_structured_development_artifact(
             )
         )
 
+    elif artifact_kind == "chapter_analysis_registry":
+        errors.extend(source_partition.validate_chapter_analysis_registry(payload))
+        for item in payload.get("records", []):
+            if not isinstance(item, dict) or item.get("analysis_status") != "analyzed":
+                continue
+            analysis_path = path_from_record(project_path, item.get("analysis_path"))
+            if (
+                analysis_path is None
+                or not analysis_path.is_file()
+                or sha256_file(analysis_path) != item.get("analysis_sha256")
+            ):
+                errors.append(
+                    issue(
+                        "analysis_registry_artifact_invalid",
+                        "章节分析文件不存在、越界或hash不一致",
+                        source_unit_id=item.get("source_unit_id"),
+                    )
+                )
+
+    elif artifact_kind == "rolling_source_progress":
+        errors.extend(source_partition.validate_rolling_source_progress(payload))
+
     elif artifact_kind == "batch_source_scope":
         scope = artifact_key.split(":", 1)[1] if ":" in artifact_key else ""
         batch_id = payload.get("batch_id")
@@ -6150,15 +6360,36 @@ def validate_structured_development_artifact(
                         errors.append(issue("event_entity_invalid", "canonical entity 必须是对象", entity_index=entity_index))
                         continue
                     entity_id = entity.get("entity_id")
-                    if (
-                        not isinstance(entity_id, str)
-                        or not re.fullmatch(r"(?:C\d{3,6}|(?:CHAR|LOC|PROP)-[A-Z0-9_.-]+)", entity_id)
-                        or entity_id in canonical_entity_ids
-                    ):
-                        errors.append(issue("event_entity_id_invalid", "entity_id 必须使用 C001 或 CHAR-/LOC-/PROP- 规范格式且全局唯一", entity_index=entity_index))
+                    entity_type = entity.get("entity_type")
+                    patterns = {
+                        "character": r"(?:C\d{3,6}|CHAR-[A-Z0-9_.-]+)",
+                        "location": r"(?:L\d{3,6}|LOC-[A-Z0-9_.-]+)",
+                        "prop": r"(?:P\d{3,6}|PROP-[A-Z0-9_.-]+)",
+                    }
+                    pattern = patterns.get(entity_type)
+                    if not isinstance(entity_id, str) or pattern is None or not re.fullmatch(pattern, entity_id):
+                        errors.append(
+                            issue(
+                                "event_entity_id_invalid",
+                                "entity_id 必须与 entity_type 匹配：character 使用 C001/CHAR-，location 使用 L001/LOC-，prop 使用 P001/PROP-",
+                                entity_index=entity_index,
+                                entity_id=entity_id,
+                                entity_type=entity_type,
+                            )
+                        )
+                    elif entity_id in canonical_entity_ids:
+                        errors.append(
+                            issue(
+                                "event_entity_id_invalid",
+                                "canonical entity_id 必须全局唯一",
+                                entity_index=entity_index,
+                                entity_id=entity_id,
+                                entity_type=entity_type,
+                            )
+                        )
                     else:
                         canonical_entity_ids.add(entity_id)
-                    if entity.get("entity_type") not in {"character", "location", "prop"}:
+                    if entity_type not in {"character", "location", "prop"}:
                         errors.append(issue("event_entity_type_invalid", "entity_type 只能为 character/location/prop", entity_index=entity_index))
                     if not isinstance(entity.get("canonical_name"), str) or not entity["canonical_name"].strip():
                         errors.append(issue("event_entity_name_missing", "canonical entity 缺少 canonical_name", entity_index=entity_index))
@@ -7257,6 +7488,15 @@ def validate_state(project_path: Path) -> dict[str, Any]:
             script_path,
             target_duration_seconds=handoff_target_duration,
             chars_per_second=handoff_chars_per_second,
+        )
+        warnings.extend(
+            {
+                **item,
+                "artifact_key": key,
+                "version": record.get("version"),
+            }
+            for item in script_result.get("warnings", [])
+            if isinstance(item, dict)
         )
         if not script_result["valid"]:
             errors.append(
@@ -10372,6 +10612,11 @@ def build_parser() -> argparse.ArgumentParser:
         "episode_ids", nargs="+", help="批次包含的集号，如 E001 E002"
     )
     define_batch_parser.add_argument("--note", help="批次说明")
+    define_batch_parser.add_argument(
+        "--confirmed-by-user",
+        action="store_true",
+        help="rolling_batch schema v2新增批次时确认用户已明确授权该批次范围",
+    )
     define_batch_parser.set_defaults(handler=command_define_batch)
 
     stage_parser = subparsers.add_parser("set-stage", help="设置工作流阶段状态")
@@ -10458,6 +10703,40 @@ def build_parser() -> argparse.ArgumentParser:
     merge_shards_parser.add_argument("--shard-dir", required=True, help="项目内分片结果目录")
     merge_shards_parser.add_argument("--output", required=True, help="项目内合并结果输出路径")
     merge_shards_parser.set_defaults(handler=command_merge_source_analysis_shards)
+
+    register_analysis_parser = subparsers.add_parser(
+        "register-source-analysis",
+        help="把章节分析结果按章节哈希和契约版本幂等登记到新的registry文件",
+    )
+    register_analysis_parser.add_argument("project", help="项目目录")
+    register_analysis_parser.add_argument("--source-corpus", required=True, help="项目内source_corpus JSON")
+    register_analysis_parser.add_argument("--registry", required=True, help="项目内chapter registry JSON")
+    register_analysis_parser.add_argument("--source-unit-id", required=True)
+    register_analysis_parser.add_argument("--analysis", required=True, help="项目内章节分析JSON")
+    register_analysis_parser.add_argument("--contract-version", type=int, required=True)
+    register_analysis_parser.add_argument("--output", required=True, help="项目内新registry输出路径")
+    register_analysis_parser.set_defaults(handler=command_register_source_analysis)
+
+    rolling_window_parser = subparsers.add_parser(
+        "plan-rolling-source-window",
+        help="优先复用carryover和已分析章节，只规划下一批需要的新章节",
+    )
+    rolling_window_parser.add_argument("project", help="项目目录")
+    rolling_window_parser.add_argument("--source-corpus", required=True)
+    rolling_window_parser.add_argument("--registry", required=True)
+    rolling_window_parser.add_argument("--progress", required=True)
+    rolling_window_parser.add_argument("--window-size", type=int, default=3)
+    rolling_window_parser.add_argument("--output", required=True)
+    rolling_window_parser.set_defaults(handler=command_plan_rolling_source_window)
+
+    context_parser = subparsers.add_parser(
+        "build-production-context-manifest",
+        help="生成生产任务允许加载的最小插件上下文清单",
+    )
+    context_parser.add_argument("project", help="项目目录")
+    context_parser.add_argument("--stage", required=True, choices=tuple(STAGES))
+    context_parser.add_argument("--output", required=True, help="项目内清单输出路径")
+    context_parser.set_defaults(handler=command_build_production_context_manifest)
 
     episode_delivery_parser = subparsers.add_parser(
         "render-episode-delivery", help="从同版本剧本、人物锚点和分镜计划生成逐集DOCX与HTML"
