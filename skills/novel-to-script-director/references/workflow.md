@@ -86,6 +86,13 @@ python3 <技能目录>/scripts/project_tool.py show-agent-runtime <项目目录>
 
 自2026-08-03起，四个运行时入口、任务包、结果信封、幂等键、宿主任务绑定、检查点状态、项目状态锁、串行/独立调度和两次失败阻断为冻结兼容面。新增流程只能复用这些接口；不得让工作智能体直接写状态、绕过候选验收、改变幂等键组成或把失联任务无限标记为活动。
 
+### 校验与故事板复用
+
+- `validate_state`、`confirmed_record_is_usable`和`matching_boundary_review`在一次顶层命令内共享`ValidationContext`。缓存键包含制品键、版本、当前文件散列和依赖闭包签名；任一绑定上游变化都会使父节点失效。只缓存已完成结果，循环检测中的临时状态不写入缓存。
+- `validate-handoff`把同一次项目校验结果、已加载状态和上下文传给`validate-breakdowns`，不能为了提速跳过制作提取、连续性、审批、版本或追溯检查。
+- `episode_delivery_inputs`读取并校验分镜计划、人物锚点和交付依赖后，将只读payload传给renderer；renderer不得再次读取这些输入。
+- 故事板缓存位于当前项目`.ai-director/runtime/render-cache/storyboards/`，输入指纹覆盖分镜计划、台词表、项目规格和四类锚点的版本与散列。两个HTML交付位置必须从同一缓存文件原子复制；指纹变化时重新渲染，旧缓存不得冒充新版本。
+
 ## 分层索引与全剧骨架
 
 - `SourceEventIndex.units[].granularity` 使用 `unit_detail` 或 `chapter_summary`。前者记录完整事件因果、行动、结果和状态变化；后者用于先建立章节级摘要，只强制事件摘要与原著引用。

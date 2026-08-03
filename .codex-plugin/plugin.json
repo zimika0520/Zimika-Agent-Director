@@ -1,7 +1,7 @@
 {
   "name": "ai-director",
-  "version": "0.8.8",
-  "description": "An AI screenwriter/director workflow with file-backed single-layer agent orchestration, idempotent task recovery, serialized project state, and per-episode DOCX+HTML delivery.",
+  "version": "0.8.9",
+  "description": "An AI screenwriter/director workflow with run-scoped DAG validation memoization, reusable handoff scans, idempotent agent recovery, and fingerprinted per-episode DOCX+HTML delivery.",
   "author": {
     "name": "Shinchan-crayon"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "AI导演",
     "shortDescription": "长篇小说动态分片并发解析，逐集交付剧本与可执行HTML故事板。",
-    "longDescription": "AI导演 v0.8.8 按原著解析、改编定位、改编圣经、轻量全剧骨架、批次原著范围与逐单元细化、批次大纲、分集剧本和制作提取完成小说改剧本。任意长度小说按章节与事件动态分片，分析分片可并发，项目状态由单一写入者合并；不按固定总字数硬切。每个批次独立通过内容边界、制作就绪、连续性快照和交付审核。每集可确定性输出文学剧本 DOCX 与 HTML 故事板；人物锚点包含正面头肩肖像及全身正面、侧面、背面三视图描述，分镜包含结构化景别与镜头运动。通用视频提示词经过人物、空间、声音、对白、镜头运动、负面约束和屏幕文字后期方案的可执行性门禁。插件不生成图片、不嵌入 Base64、不提交视频任务，也不调用配音或剪辑接口。v0.8.8新增单层宿主智能体编排、文件化任务包与结果信封、幂等检查点恢复、项目状态锁、独立/串行任务调度，以及429、流式断开和上下文超限的分类恢复；并继承v0.8.6的现场/非现场人物分离、电话声音与VO/OS解析和口述cue交付模式一致性校验。",
+    "longDescription": "AI导演 v0.8.9 按原著解析、改编定位、改编圣经、轻量全剧骨架、批次原著范围与逐单元细化、批次大纲、分集剧本和制作提取完成小说改剧本。任意长度小说按章节与事件动态分片，分析分片可并发，项目状态由单一写入者合并；不按固定总字数硬切。每个批次独立通过内容边界、制作就绪、连续性快照和交付审核。每集可确定性输出文学剧本 DOCX 与 HTML 故事板；人物锚点包含正面头肩肖像及全身正面、侧面、背面三视图描述，分镜包含结构化景别与镜头运动。通用视频提示词经过人物、空间、声音、对白、镜头运动、负面约束和屏幕文字后期方案的可执行性门禁。插件不生成图片、不嵌入 Base64、不提交视频任务，也不调用配音或剪辑接口。v0.8.9新增单次命令内的依赖DAG校验缓存、handoff与breakdown共享校验状态、逐集交付输入复用，以及按输入版本和散列失效的故事板渲染缓存；并继承v0.8.8的单层宿主编排、幂等检查点恢复、项目状态锁、独立/串行调度和分类错误恢复。",
     "developerName": "Shinchan-crayon",
     "category": "Productivity",
     "capabilities": [
@@ -17,6 +17,8 @@
       "文件化任务包、结果信封、幂等键与检查点恢复",
       "项目状态锁、原子写入和串行/独立任务调度",
       "429、流式断开与上下文超限分类恢复",
+      "单次命令依赖DAG校验缓存与handoff扫描复用",
+      "分镜输入指纹缓存与双位置HTML确定性复用",
       "生产上下文最小加载清单",
       "rolling_batch未知最终集数与用户确认扩批",
       "章节分析幂等登记与carryover优先复用",

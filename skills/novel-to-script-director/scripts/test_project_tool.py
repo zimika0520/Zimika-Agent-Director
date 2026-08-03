@@ -9,8 +9,10 @@ import json
 import tempfile
 import unittest
 import zipfile
+from collections import Counter
 from types import SimpleNamespace
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).with_name("project_tool.py")
@@ -3203,7 +3205,12 @@ class ProjectToolTests(unittest.TestCase):
             ],
         }
 
-    def approve_shot_plan_with_review(self, plan_version: int) -> None:
+    def approve_shot_plan_with_review(
+        self,
+        plan_version: int,
+        *,
+        file_tag: str = "AI分镜",
+    ) -> None:
         review_version = self.register_boundary_review(
             "ai_video_boundary_review:E001",
             "ai_shot_plan:E001",
@@ -3218,7 +3225,7 @@ class ProjectToolTests(unittest.TestCase):
                 "source_refs": ["EV-0001"],
             },
             "passed",
-            file_tag="AI分镜",
+            file_tag=file_tag,
         )
         self.update_artifact_json(
             "ai_video_boundary_review:E001",
@@ -3383,6 +3390,210 @@ class ProjectToolTests(unittest.TestCase):
         html_text = (output_dir / "E001_故事板.html").read_text(encoding="utf-8")
         self.assertIn("景别：", html_text)
         self.assertIn("镜头运动：", html_text)
+
+    def test_validation_context_memoizes_shared_dependency_dag(self) -> None:
+        self.create_ready_project()
+        context_type = getattr(project_tool, "ValidationContext", None)
+        self.assertIsNotNone(context_type, "缺少单次校验运行上下文")
+        state = self.state()
+        counts = Counter()
+        original = project_tool.validate_dependency_shape
+
+        def counted(key, dependencies):
+            counts[key] += 1
+            return original(key, dependencies)
+
+        with mock.patch.object(
+            project_tool, "validate_dependency_shape", side_effect=counted
+        ):
+            context = context_type()
+            for key in ("quality_report", "production_readiness_report"):
+                record = project_tool.latest_record(state, key)
+                self.assertTrue(
+                    project_tool.confirmed_record_is_usable(
+                        state,
+                        key,
+                        record,
+                        self.project,
+                        context=context,
+                    )
+                )
+
+        self.assertEqual(counts["project_spec"], 1)
+        self.assertEqual(counts["episode_script:E001"], 1)
+        self.assertEqual(counts["quality_report"], 1)
+
+    def test_validation_context_invalidates_when_upstream_hash_changes(self) -> None:
+        self.create_ready_project()
+        context_type = getattr(project_tool, "ValidationContext", None)
+        self.assertIsNotNone(context_type, "缺少单次校验运行上下文")
+        state = self.state()
+        parent_key = "quality_report"
+        parent_record = project_tool.latest_record(state, parent_key)
+        upstream_record = project_tool.latest_record(state, "project_spec")
+        self.assertIsInstance(parent_record, dict)
+        self.assertIsInstance(upstream_record, dict)
+        path = self.project / upstream_record["path"]
+        counts = Counter()
+        original = project_tool.validate_dependency_shape
+
+        def counted(key, dependencies):
+            counts[key] += 1
+            return original(key, dependencies)
+
+        with mock.patch.object(
+            project_tool, "validate_dependency_shape", side_effect=counted
+        ):
+            context = context_type()
+            self.assertTrue(
+                project_tool.confirmed_record_is_usable(
+                    state,
+                    parent_key,
+                    parent_record,
+                    self.project,
+                    context=context,
+                )
+            )
+            path.write_text(
+                path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            upstream_record["sha256"] = project_tool.sha256_file(path)
+            upstream_record["size_bytes"] = path.stat().st_size
+            self.assertTrue(
+                project_tool.confirmed_record_is_usable(
+                    state,
+                    parent_key,
+                    parent_record,
+                    self.project,
+                    context=context,
+                )
+            )
+
+        self.assertEqual(counts[parent_key], 2)
+        self.assertEqual(counts["project_spec"], 2)
+
+    def test_validate_handoff_reuses_single_full_state_validation(self) -> None:
+        self.create_ready_project()
+        calls = 0
+        original = project_tool.validate_state
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        with mock.patch.object(project_tool, "validate_state", side_effect=counted):
+            result = project_tool.validate_handoff_state(
+                self.project,
+                expected_episodes=1,
+            )
+
+        self.assertTrue(result["ready"], result)
+        self.assertEqual(calls, 1)
+
+    def test_render_episode_delivery_reuses_preloaded_storyboard_inputs(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划V1.json",
+            json.dumps(self.shot_plan_payload(), ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        self.approve_shot_plan_with_review(plan_version)
+        state = self.state()
+        plan_record = project_tool.latest_record(state, "ai_shot_plan:E001")
+        anchor_key = next(
+            key for key in state["artifacts"] if key.startswith("character_anchor:")
+        )
+        anchor_record = project_tool.latest_record(state, anchor_key)
+        watched = {
+            (self.project / plan_record["path"]).resolve(): 0,
+            (self.project / anchor_record["path"]).resolve(): 0,
+        }
+        original = Path.read_text
+
+        def counted(path, *args, **kwargs):
+            resolved = path.resolve()
+            if resolved in watched:
+                watched[resolved] += 1
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", new=counted):
+            code, payload = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(set(watched.values()), {1})
+
+    def test_storyboard_outputs_share_one_render_and_invalidate_on_new_plan(self) -> None:
+        import render_storyboard
+
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        self.approve_shot_plan_with_review(plan_version)
+        collect_calls = 0
+        original = render_storyboard.collect_anchors
+
+        def counted(*args, **kwargs):
+            nonlocal collect_calls
+            collect_calls += 1
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            render_storyboard, "collect_anchors", side_effect=counted
+        ):
+            code, first = self.run_cli(
+                "render-storyboard", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, first)
+            code, delivery = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, delivery)
+            execution_html = self.project / "10_AI视频执行包/E001_故事板.html"
+            delivery_html = (
+                self.project
+                / "09_定稿交付/分集交付/E001/E001_故事板.html"
+            )
+            first_text = execution_html.read_text(encoding="utf-8")
+            self.assertEqual(
+                first_text,
+                delivery_html.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(collect_calls, 4)
+
+            updated_plan = self.shot_plan_payload()
+            updated_plan["hard_blocks"] = ["输入版本变化后必须重新渲染"]
+            plan_version = self.register_artifact(
+                "ai_shot_plan:E001",
+                "10_AI视频执行包/E001_分镜计划V2.json",
+                json.dumps(updated_plan, ensure_ascii=False),
+                self.shot_plan_dependencies(),
+            )
+            self.approve_shot_plan_with_review(
+                plan_version,
+                file_tag="AI分镜V2",
+            )
+            code, updated = self.run_cli(
+                "render-storyboard", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, updated)
+
+        self.assertEqual(collect_calls, 8)
+        self.assertNotEqual(
+            first_text,
+            execution_html.read_text(encoding="utf-8"),
+        )
 
     def test_render_storyboard_resolves_scoped_dialogue_cue_sheet_dependency(self) -> None:
         import render_storyboard

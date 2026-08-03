@@ -11,16 +11,20 @@ dialogue_cue_sheet、四类锚点、project_spec。只读,不改任何项目状�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
+import os
+import shutil
 import sys
-from datetime import datetime
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import shot_contracts
 
 STATE_FILENAME = "project_state.json"
+RENDER_CONTRACT_VERSION = 2
 
 # 参考色板(dataviz 默认,已通过六项校验;场景按登记顺序取固定槽位,不循环)
 SCENE_SLOTS_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
@@ -118,12 +122,21 @@ def confirmed_dependency(
     return latest_confirmed(state, artifact_prefix)
 
 
-def collect_anchors(state: dict[str, Any], project_path: Path, prefix: str) -> list[tuple[str, str]]:
+def collect_anchors(
+    state: dict[str, Any],
+    project_path: Path,
+    prefix: str,
+    preloaded: dict[str, Any] | None = None,
+) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for key in sorted(state.get("artifacts", {})):
         if key == prefix or key.startswith(prefix + ":"):
             record = latest_confirmed(state, key)
-            content = read_artifact(project_path, record)
+            content = (
+                preloaded[key]
+                if isinstance(preloaded, dict) and key in preloaded
+                else read_artifact(project_path, record)
+            )
             if isinstance(content, dict):
                 turnaround = content.get("turnaround_prompt")
                 full_text = turnaround.get("full_text") if isinstance(turnaround, dict) else None
@@ -166,19 +179,157 @@ def duration_class(duration: Any) -> str:
     return ""
 
 
-def render(project_path: Path, episode: str, output: Path | None = None) -> Path:
+def record_fingerprint(
+    project_path: Path,
+    key: str,
+    record: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {"artifact_key": key, "record": None}
+    digest = record.get("sha256")
+    if not isinstance(digest, str) or not digest:
+        path = project_path / str(record.get("path"))
+        if path.is_file():
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "artifact_key": key,
+        "version": record.get("version"),
+        "path": record.get("path"),
+        "sha256": digest,
+        "size_bytes": record.get("size_bytes"),
+    }
+
+
+def storyboard_input_fingerprint(
+    project_path: Path,
+    state: dict[str, Any],
+    episode: str,
+    plan_record: dict[str, Any],
+) -> str:
+    records: list[dict[str, Any]] = [
+        record_fingerprint(project_path, f"ai_shot_plan:{episode}", plan_record),
+        record_fingerprint(
+            project_path,
+            "dialogue_cue_sheet",
+            confirmed_dependency(state, plan_record, "dialogue_cue_sheet"),
+        ),
+        record_fingerprint(
+            project_path,
+            "project_spec",
+            latest_confirmed(state, "project_spec"),
+        ),
+    ]
+    for prefix in (
+        "style_anchor",
+        "character_anchor",
+        "scene_anchor",
+        "prop_anchor",
+    ):
+        for key in sorted(state.get("artifacts", {})):
+            if key == prefix or key.startswith(prefix + ":"):
+                records.append(
+                    record_fingerprint(
+                        project_path,
+                        key,
+                        latest_confirmed(state, key),
+                    )
+                )
+    payload = {
+        "render_contract_version": RENDER_CONTRACT_VERSION,
+        "episode": episode,
+        "project_name": state.get("name"),
+        "records": records,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copyfile(source, temporary_path)
+        os.replace(temporary_path, destination)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def render(
+    project_path: Path,
+    episode: str,
+    output: Path | None = None,
+    *,
+    state: dict[str, Any] | None = None,
+    preloaded: dict[str, Any] | None = None,
+) -> Path:
     project_path = project_path.resolve()
-    state = load_state(project_path)
+    state = state if isinstance(state, dict) else load_state(project_path)
     episode = episode.upper()
     plan_key = f"ai_shot_plan:{episode}"
     plan_record = latest_confirmed(state, plan_key)
-    plan = read_artifact(project_path, plan_record)
+    if not isinstance(plan_record, dict):
+        raise SystemExit(f"没有已确认的 {plan_key},无法渲染;先完成分镜计划并过边界门禁")
+    if output is None:
+        output = project_path / "10_AI视频执行包" / f"{episode}_故事板.html"
+    fingerprint = storyboard_input_fingerprint(
+        project_path,
+        state,
+        episode,
+        plan_record,
+    )
+    cache_path = (
+        project_path
+        / ".ai-director"
+        / "runtime"
+        / "render-cache"
+        / "storyboards"
+        / f"{episode}-{fingerprint}.html"
+    )
+    if cache_path.is_file():
+        atomic_copy(cache_path, output)
+        return output
+
+    plan = (
+        preloaded[plan_key]
+        if isinstance(preloaded, dict) and plan_key in preloaded
+        else read_artifact(project_path, plan_record)
+    )
     if not isinstance(plan, dict):
         raise SystemExit(f"没有已确认的 {plan_key},无法渲染;先完成分镜计划并过边界门禁")
 
-    cue_sheet = read_artifact(
-        project_path,
-        confirmed_dependency(state, plan_record, "dialogue_cue_sheet"),
+    cue_record = confirmed_dependency(state, plan_record, "dialogue_cue_sheet")
+    cue_sheet = (
+        preloaded["dialogue_cue_sheet"]
+        if isinstance(preloaded, dict) and "dialogue_cue_sheet" in preloaded
+        else read_artifact(project_path, cue_record)
     )
     cues: dict[str, dict[str, Any]] = {}
     if isinstance(cue_sheet, dict):
@@ -186,7 +337,12 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
             if isinstance(cue, dict) and isinstance(cue.get("cue_id"), str):
                 cues[cue["cue_id"]] = cue
 
-    spec = read_artifact(project_path, latest_confirmed(state, "project_spec"))
+    spec_record = latest_confirmed(state, "project_spec")
+    spec = (
+        preloaded["project_spec"]
+        if isinstance(preloaded, dict) and "project_spec" in preloaded
+        else read_artifact(project_path, spec_record)
+    )
     project_name = state.get("name", project_path.name)
 
     units = [unit for unit in plan.get("units", []) if isinstance(unit, dict)]
@@ -365,7 +521,7 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
         ("场景锚点", "scene_anchor"),
         ("道具锚点", "prop_anchor"),
     ):
-        anchors = collect_anchors(state, project_path, prefix)
+        anchors = collect_anchors(state, project_path, prefix, preloaded)
         if not anchors:
             continue
         blocks = "".join(
@@ -388,7 +544,7 @@ def render(project_path: Path, episode: str, output: Path | None = None) -> Path
         )
 
     budget = plan.get("asset_budget") or {}
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    generated_at = str(plan_record.get("registered_at") or "")
     version = plan_record.get("version") if plan_record else "?"
 
     page = f"""<!DOCTYPE html>
@@ -509,10 +665,8 @@ document.querySelectorAll('[data-copy]').forEach(function(btn) {{
 </body>
 </html>
 """
-    if output is None:
-        output = project_path / "10_AI视频执行包" / f"{episode}_故事板.html"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(page, encoding="utf-8")
+    atomic_write_text(cache_path, page)
+    atomic_copy(cache_path, output)
     return output
 
 

@@ -768,6 +768,21 @@ class ToolError(Exception):
     """用户可修正的 CLI 错误。"""
 
 
+class ValidationContext:
+    """一次顶层校验命令内共享的只读缓存；命令结束后即丢弃。"""
+
+    def __init__(self) -> None:
+        self.project_path: Path | None = None
+        self.state: dict[str, Any] | None = None
+        self.project_result: dict[str, Any] | None = None
+        self.file_hashes: dict[tuple[str, int, int, int], str] = {}
+        self.json_payloads: dict[tuple[str, int, str], dict[str, Any]] = {}
+        self.confirmed_results: dict[tuple[Any, ...], bool] = {}
+        self.boundary_results: dict[
+            tuple[Any, ...], tuple[str, dict[str, Any]] | None
+        ] = {}
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -808,6 +823,52 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validation_file_signature(
+    path: Path,
+    context: ValidationContext,
+) -> tuple[int, str] | None:
+    """返回本次校验中的文件大小和哈希；文件变化后自动使用新键重算。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    cache_key = (
+        str(path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        stat.st_size,
+    )
+    digest = context.file_hashes.get(cache_key)
+    if digest is None:
+        try:
+            digest = sha256_file(path)
+        except OSError:
+            return None
+        context.file_hashes[cache_key] = digest
+    return stat.st_size, digest
+
+
+def read_json_file_cached(
+    path: Path,
+    context: ValidationContext,
+) -> dict[str, Any]:
+    signature = validation_file_signature(path, context)
+    if signature is None:
+        raise ToolError(f"无法读取 JSON：{path}")
+    cache_key = (str(path.resolve()), signature[0], signature[1])
+    cached = context.json_payloads.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ToolError(f"无法读取 JSON：{path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ToolError(f"JSON 顶层必须是对象：{path}")
+    context.json_payloads[cache_key] = payload
+    return payload
 
 
 def print_json(payload: Any) -> None:
@@ -1238,12 +1299,147 @@ def validate_dependency_shape(
         )
 
 
+def artifact_validation_signature(
+    project_path: Path | None,
+    key: str,
+    record: dict[str, Any],
+    context: ValidationContext,
+) -> tuple[Any, ...] | None:
+    version = record.get("version")
+    if type(version) is not int:
+        return None
+    if project_path is None:
+        file_signature: tuple[int, str] | None = (
+            record.get("size_bytes"),
+            record.get("sha256"),
+        )
+    else:
+        artifact_path = path_from_record(project_path, record.get("path"))
+        if artifact_path is None or not artifact_path.is_file():
+            return None
+        file_signature = validation_file_signature(artifact_path, context)
+        if file_signature is None:
+            return None
+        if (
+            file_signature[0] != record.get("size_bytes")
+            or file_signature[1] != record.get("sha256")
+        ):
+            return None
+    return (
+        key,
+        version,
+        record.get("status"),
+        record.get("sha256"),
+        record.get("size_bytes"),
+        file_signature,
+    )
+
+
+def artifact_validation_cache_key(
+    state: dict[str, Any],
+    project_path: Path | None,
+    key: str,
+    record: dict[str, Any],
+    context: ValidationContext,
+) -> tuple[Any, ...] | None:
+    """Build a cache key that changes when any bound upstream input changes."""
+    version = record.get("version")
+    if type(version) is not int:
+        return None
+    if artifact_validation_signature(project_path, key, record, context) is None:
+        return None
+    pending: list[tuple[str, dict[str, Any]]] = [(key, record)]
+    seen: set[tuple[str, int]] = set()
+    signatures: list[tuple[Any, ...]] = []
+    while pending:
+        current_key, current_record = pending.pop()
+        current_version = current_record.get("version")
+        if type(current_version) is not int:
+            signatures.append(
+                ("invalid_version", current_key, type(current_version).__name__)
+            )
+            continue
+        reference = (current_key, current_version)
+        if reference in seen:
+            continue
+        seen.add(reference)
+        own_signature = artifact_validation_signature(
+            project_path, current_key, current_record, context
+        )
+        dependency_refs: list[tuple[Any, ...]] = []
+        dependencies = current_record.get("depends_on")
+        if not isinstance(dependencies, list):
+            dependency_refs.append(("invalid_dependencies",))
+        else:
+            for index, dependency in enumerate(dependencies):
+                if not isinstance(dependency, dict):
+                    dependency_refs.append(
+                        (
+                            "invalid_dependency",
+                            index,
+                            type(dependency).__name__,
+                        )
+                    )
+                    continue
+                dep_key = dependency.get("artifact_key")
+                dep_version = dependency.get("version")
+                dep_record = (
+                    latest_record(state, dep_key)
+                    if isinstance(dep_key, str)
+                    else None
+                )
+                dependency_refs.append(
+                    (
+                        index,
+                        dep_key,
+                        dep_version,
+                        dep_record.get("version")
+                        if isinstance(dep_record, dict)
+                        else None,
+                    )
+                )
+                if isinstance(dep_key, str) and isinstance(dep_record, dict):
+                    pending.append((dep_key, dep_record))
+
+        try:
+            review_type = BOUNDARY_REVIEW_FOR_TARGET.get(
+                artifact_type(current_key)
+            )
+        except ToolError:
+            review_type = None
+        review_refs: list[tuple[str, Any]] = []
+        if review_type is not None:
+            for review_key, review_record in latest_records_of_type(
+                state, review_type
+            ):
+                review_refs.append(
+                    (review_key, review_record.get("version"))
+                )
+                pending.append((review_key, review_record))
+        signatures.append(
+            (
+                current_key,
+                current_version,
+                own_signature,
+                has_active_approval(
+                    state, current_key, current_version
+                ),
+                tuple(dependency_refs),
+                review_type,
+                tuple(review_refs),
+            )
+        )
+    return key, version, tuple(sorted(signatures, key=lambda item: str(item[:2])))
+
+
 def record_is_shallow_current(
     state: dict[str, Any],
     key: str,
     record: dict[str, Any],
     project_path: Path | None,
     allowed_statuses: frozenset[str],
+    *,
+    context: ValidationContext | None = None,
 ) -> bool:
     """检查当前版本与文件完整性，但不递归检查依赖。
 
@@ -1259,16 +1455,8 @@ def record_is_shallow_current(
         return False
     if status == "confirmed" and not has_active_approval(state, key, version):
         return False
-    if project_path is not None:
-        artifact_path = path_from_record(project_path, record.get("path"))
-        if (
-            artifact_path is None
-            or not artifact_path.is_file()
-            or sha256_file(artifact_path) != record.get("sha256")
-            or artifact_path.stat().st_size != record.get("size_bytes")
-        ):
-            return False
-    return True
+    context = context or ValidationContext()
+    return artifact_validation_signature(project_path, key, record, context) is not None
 
 
 def matching_boundary_review(
@@ -1277,41 +1465,74 @@ def matching_boundary_review(
     target_record: dict[str, Any],
     project_path: Path | None,
     visiting: set[tuple[str, int]] | None = None,
+    *,
+    context: ValidationContext | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     """返回精确绑定目标当前版本且结论通过的已确认边界报告。"""
+    context = context or ValidationContext()
     target_type = artifact_type(target_key)
     review_type = BOUNDARY_REVIEW_FOR_TARGET.get(target_type)
     target_version = target_record.get("version")
     if review_type is None or type(target_version) is not int:
         return None
+    target_signature = artifact_validation_cache_key(
+        state, project_path, target_key, target_record, context
+    )
+    review_candidates = latest_records_of_type(state, review_type)
+    review_signatures = tuple(
+        artifact_validation_cache_key(
+            state, project_path, key, record, context
+        )
+        for key, record in review_candidates
+    )
+    cache_key = (
+        target_key,
+        target_version,
+        target_signature,
+        review_type,
+        review_signatures,
+    )
+    if cache_key in context.boundary_results:
+        return context.boundary_results[cache_key]
     target_ref = (target_key, target_version)
     matches: list[tuple[str, dict[str, Any]]] = []
-    for review_key, review_record in latest_records_of_type(state, review_type):
+    for review_key, review_record in review_candidates:
         if target_ref not in record_dependency_refs(review_record):
             continue
         if not confirmed_record_is_usable(
-            state, review_key, review_record, project_path, visiting
+            state,
+            review_key,
+            review_record,
+            project_path,
+            visiting,
+            context=context,
         ):
             continue
         if project_path is None:
             matches.append((review_key, review_record))
             continue
         if validate_structured_development_artifact(
-            project_path, state, review_key, review_record
+            project_path,
+            state,
+            review_key,
+            review_record,
+            context=context,
         ):
             continue
         report_path = path_from_record(project_path, review_record.get("path"))
         try:
             report = (
-                json.loads(report_path.read_text(encoding="utf-8-sig"))
+                read_json_file_cached(report_path, context)
                 if report_path and report_path.suffix.lower() == ".json"
                 else None
             )
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError, ToolError):
             report = None
         if isinstance(report, dict) and report.get("conclusion") == "passed":
             matches.append((review_key, review_record))
-    return matches[0] if len(matches) == 1 else None
+    result = matches[0] if len(matches) == 1 else None
+    context.boundary_results[cache_key] = result
+    return result
 
 
 def confirmed_record_is_usable(
@@ -1320,7 +1541,10 @@ def confirmed_record_is_usable(
     record: dict[str, Any],
     project_path: Path | None = None,
     visiting: set[tuple[str, int]] | None = None,
+    *,
+    context: ValidationContext | None = None,
 ) -> bool:
+    context = context or ValidationContext()
     version = record.get("version")
     reference = (key, version)
     if type(version) is not int:
@@ -1330,36 +1554,39 @@ def confirmed_record_is_usable(
         return False
     if not has_active_approval(state, key, version):
         return False
-    if project_path is not None:
-        artifact_path = path_from_record(project_path, record.get("path"))
-        if (
-            artifact_path is None
-            or not artifact_path.is_file()
-            or sha256_file(artifact_path) != record.get("sha256")
-            or artifact_path.stat().st_size != record.get("size_bytes")
-        ):
-            return False
+    cache_key = artifact_validation_cache_key(
+        state, project_path, key, record, context
+    )
+    if cache_key is None:
+        return False
+    if cache_key in context.confirmed_results:
+        return context.confirmed_results[cache_key]
+
+    def finish(value: bool) -> bool:
+        context.confirmed_results[cache_key] = value
+        return value
+
     visiting = set() if visiting is None else set(visiting)
     if reference in visiting:
         return False
     visiting.add(reference)
     dependencies = record.get("depends_on")
     if not isinstance(dependencies, list):
-        return False
+        return finish(False)
     try:
         validate_dependency_shape(key, dependencies)
     except ToolError:
-        return False
+        return finish(False)
     record_type = artifact_type(key)
     review_target_type = BOUNDARY_TARGET_FOR_REVIEW.get(record_type)
     for dependency in dependencies:
         if not isinstance(dependency, dict):
-            return False
+            return finish(False)
         dep_key = dependency.get("artifact_key")
         dep_version = dependency.get("version")
         dep_record = latest_record(state, dep_key) if isinstance(dep_key, str) else None
         if dep_record is None or dep_record.get("version") != dep_version:
-            return False
+            return finish(False)
         dep_type = artifact_type(dep_key)
         if review_target_type is not None and dep_type == review_target_type:
             if not record_is_shallow_current(
@@ -1368,18 +1595,29 @@ def confirmed_record_is_usable(
                 dep_record,
                 project_path,
                 frozenset({"awaiting_approval", "confirmed"}),
+                context=context,
             ):
-                return False
+                return finish(False)
             continue
         if not confirmed_record_is_usable(
-            state, dep_key, dep_record, project_path, visiting
+            state,
+            dep_key,
+            dep_record,
+            project_path,
+            visiting,
+            context=context,
         ):
-            return False
+            return finish(False)
     if record_type in BOUNDARY_REVIEW_FOR_TARGET and matching_boundary_review(
-        state, key, record, project_path, visiting
+        state,
+        key,
+        record,
+        project_path,
+        visiting,
+        context=context,
     ) is None:
-        return False
-    return True
+        return finish(False)
+    return finish(True)
 
 
 def load_project_spec_payload(
@@ -3893,13 +4131,15 @@ def command_startup_preflight(args: argparse.Namespace) -> int:
 def episode_delivery_inputs(
     project_path: Path, state: dict[str, Any], episode: str
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    context = ValidationContext()
     errors: list[dict[str, Any]] = []
     dependencies: list[dict[str, Any]] = []
+    storyboard_payloads: dict[str, Any] = {}
 
     def require_current(key: str, label: str) -> dict[str, Any] | None:
         record = latest_record(state, key)
         if not isinstance(record, dict) or not confirmed_record_is_usable(
-            state, key, record, project_path
+            state, key, record, project_path, context=context
         ):
             errors.append(issue("episode_delivery_input_missing", f"缺少当前已确认{label}", artifact_key=key))
             return None
@@ -3911,22 +4151,30 @@ def episode_delivery_inputs(
     script_record = require_current(script_key, "分集剧本")
     plan_record = require_current(plan_key, "AI分镜计划")
     if isinstance(script_record, dict) and matching_boundary_review(
-        state, script_key, script_record, project_path
+        state, script_key, script_record, project_path, context=context
     ) is None:
         errors.append(issue("episode_delivery_script_review_missing", "分集剧本缺少当前 passed 内容边界报告"))
     if isinstance(plan_record, dict) and matching_boundary_review(
-        state, plan_key, plan_record, project_path
+        state, plan_key, plan_record, project_path, context=context
     ) is None:
         errors.append(issue("episode_delivery_shot_review_missing", "AI分镜计划缺少当前 passed 内容边界报告"))
 
-    roster_record = (
-        dependency_record_of_type(state, plan_record, "character_roster")[1]
+    roster_dependency = (
+        dependency_record_of_type(state, plan_record, "character_roster")
         if isinstance(plan_record, dict)
-        and dependency_record_of_type(state, plan_record, "character_roster") is not None
+        else None
+    )
+    roster_record = (
+        roster_dependency[1]
+        if roster_dependency is not None
         else latest_record(state, "character_roster")
     )
     if not isinstance(roster_record, dict) or not confirmed_record_is_usable(
-        state, "character_roster", roster_record, project_path
+        state,
+        "character_roster",
+        roster_record,
+        project_path,
+        context=context,
     ):
         errors.append(issue("episode_delivery_roster_missing", "缺少当前已确认角色提取表"))
         roster_payload = None
@@ -3939,7 +4187,10 @@ def episode_delivery_inputs(
     anchors: dict[str, dict[str, Any]] = {}
     if isinstance(plan_record, dict):
         plan_path = path_from_record(project_path, plan_record.get("path"))
-        plan_payload = read_json_file(plan_path) if plan_path else None
+        plan_payload = (
+            read_json_file_cached(plan_path, context) if plan_path else None
+        )
+        storyboard_payloads[plan_key] = plan_payload
         if not isinstance(plan_payload, dict) or plan_payload.get("shot_language_contract_version") != 2:
             errors.append(issue("episode_delivery_shot_contract_v2_required", "逐集交付要求 shot_language_contract_version=2"))
         for dependency in plan_record.get("depends_on", []):
@@ -3958,7 +4209,7 @@ def episode_delivery_inputs(
                 None,
             ) if type(version) is int else None
             if not isinstance(record, dict) or not confirmed_record_is_usable(
-                state, key, record, project_path
+                state, key, record, project_path, context=context
             ):
                 errors.append(issue("episode_delivery_anchor_missing", "人物锚点不是当前可用确认版本", artifact_key=key))
                 continue
@@ -3966,12 +4217,13 @@ def episode_delivery_inputs(
             if anchor_path is None or anchor_path.suffix.lower() != ".json":
                 errors.append(issue("episode_delivery_anchor_v2_required", "逐集交付要求 JSON 人物锚点v2", artifact_key=key))
                 continue
-            payload = read_json_file(anchor_path)
+            payload = read_json_file_cached(anchor_path, context)
             anchor_errors = validate_character_anchor_payload(payload)
             if anchor_errors:
                 errors.extend(anchor_errors)
                 continue
             anchors[payload["character_id"]] = payload
+            storyboard_payloads[key] = payload
             dependencies.append({"artifact_key": key, "version": version})
 
     script_text: str | None = None
@@ -3993,6 +4245,7 @@ def episode_delivery_inputs(
             "anchors": anchors,
             "plan": plan_payload,
             "dependencies": dependencies,
+            "storyboard_payloads": storyboard_payloads,
         },
         errors,
     )
@@ -4042,7 +4295,11 @@ def command_render_episode_delivery(args: argparse.Namespace) -> int:
         output_dir / f"{episode}_剧本.docx",
     )
     html_output = render_storyboard.render(
-        project_path, episode, output_dir / f"{episode}_故事板.html"
+        project_path,
+        episode,
+        output_dir / f"{episode}_故事板.html",
+        state=state,
+        preloaded=inputs["storyboard_payloads"],
     )
     print_json(
         {
@@ -4059,12 +4316,21 @@ def command_render_storyboard(args: argparse.Namespace) -> int:
     """委托 render_storyboard 模块,把已确认分镜计划渲染成 HTML 故事板(只读)。"""
     import render_storyboard
 
-    project_path, _state = load_state(args.project)
+    project_path, state = load_state(args.project)
+    episode = str(args.episode).upper()
+    if not EPISODE_ID_RE.fullmatch(episode):
+        raise ToolError("集号必须使用 E001 形式")
+    inputs, errors = episode_delivery_inputs(project_path, state, episode)
+    if errors:
+        codes = "、".join(dict.fromkeys(item["code"] for item in errors))
+        raise ToolError(f"故事板渲染未就绪：{codes}")
     requested_output = resolve_project_output(project_path, args.output) if args.output else None
     output = render_storyboard.render(
         project_path,
-        args.episode,
+        episode,
         requested_output,
+        state=state,
+        preloaded=inputs["storyboard_payloads"],
     )
     print_json({"ok": True, "output": str(output)})
     return 0
@@ -4268,15 +4534,21 @@ def load_json_artifact_payload(
     artifact_key: str,
     record: dict[str, Any],
     errors: list[dict[str, Any]],
+    *,
+    context: ValidationContext | None = None,
 ) -> dict[str, Any] | None:
     artifact_path = path_from_record(project_path, record.get("path"))
     try:
         payload = (
-            json.loads(artifact_path.read_text(encoding="utf-8-sig"))
+            (
+                read_json_file_cached(artifact_path, context)
+                if context is not None
+                else json.loads(artifact_path.read_text(encoding="utf-8-sig"))
+            )
             if artifact_path and artifact_path.suffix.lower() == ".json"
             else None
         )
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError, ToolError):
         payload = None
     if not isinstance(payload, dict):
         errors.append(
@@ -7100,12 +7372,21 @@ def validate_structured_development_artifact(
     state: dict[str, Any],
     artifact_key: str,
     record: dict[str, Any],
+    *,
+    context: ValidationContext | None = None,
 ) -> list[dict[str, Any]]:
+    context = context or ValidationContext()
     errors: list[dict[str, Any]] = []
     artifact_kind = record.get("artifact_type")
     if artifact_kind not in STRUCTURED_DEVELOPMENT_TYPES:
         return errors
-    payload = load_json_artifact_payload(project_path, artifact_key, record, errors)
+    payload = load_json_artifact_payload(
+        project_path,
+        artifact_key,
+        record,
+        errors,
+        context=context,
+    )
     if payload is None:
         return errors
     if artifact_kind == "source_review":
@@ -8229,7 +8510,11 @@ def validate_structured_development_artifact(
             ), None) if isinstance(target_key, str) else None
             if isinstance(target_record, dict):
                 target_validation_errors = validate_structured_development_artifact(
-                    project_path, state, target_key, target_record
+                    project_path,
+                    state,
+                    target_key,
+                    target_record,
+                    context=context,
                 )
             else:
                 target_validation_errors = [issue("boundary_target_missing", "审核目标制品不存在")]
@@ -8287,32 +8572,48 @@ def validate_structured_development_artifact(
     return errors
 
 
-def validate_state(project_path: Path) -> dict[str, Any]:
+def validate_state(
+    project_path: Path,
+    context: ValidationContext | None = None,
+) -> dict[str, Any]:
+    context = context or ValidationContext()
+    project_path = project_path.resolve()
+    if context.project_path is None:
+        context.project_path = project_path
+    elif context.project_path != project_path:
+        raise ToolError("ValidationContext 不能跨项目复用")
+    if context.project_result is not None:
+        return context.project_result
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     path = project_path / STATE_FILENAME
     if not path.is_file():
-        return {
+        result = {
             "valid": False,
             "project": str(project_path),
             "errors": [issue("state_missing", f"缺少 {STATE_FILENAME}")],
             "warnings": [],
             "summary": {"error_count": 1, "warning_count": 0},
         }
+        context.project_result = result
+        return result
     try:
         with path.open("r", encoding="utf-8") as handle:
             state = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
-        return {
+        result = {
             "valid": False,
             "project": str(project_path),
             "errors": [issue("state_unreadable", f"无法读取状态：{exc}")],
             "warnings": [],
             "summary": {"error_count": 1, "warning_count": 0},
         }
+        context.project_result = result
+        return result
     if not isinstance(state, dict):
         errors.append(issue("state_not_object", "状态顶层必须是 JSON 对象"))
         state = {}
+    context.state = state
 
     if type(state.get("schema_version")) is not int or state.get("schema_version") != SCHEMA_VERSION:
         errors.append(
@@ -8543,7 +8844,7 @@ def validate_state(project_path: Path) -> dict[str, Any]:
         if current is None:
             continue
         if current.get("status") == "confirmed" and not confirmed_record_is_usable(
-            state, key, current, project_path
+            state, key, current, project_path, context=context
         ):
             errors.append(
                 issue(
@@ -8561,14 +8862,24 @@ def validate_state(project_path: Path) -> dict[str, Any]:
                 continue
             errors.extend(
                 validate_structured_development_artifact(
-                    project_path, state, key, record
+                    project_path,
+                    state,
+                    key,
+                    record,
+                    context=context,
                 )
             )
 
     for key, record in latest_records_of_type(state, "series_map"):
         if record.get("status") not in {"awaiting_approval", "confirmed"}:
             continue
-        payload = load_json_artifact_payload(project_path, key, record, errors)
+        payload = load_json_artifact_payload(
+            project_path,
+            key,
+            record,
+            errors,
+            context=context,
+        )
         if payload is not None:
             errors.extend(
                 validate_series_map_payload(
@@ -8656,7 +8967,7 @@ def validate_state(project_path: Path) -> dict[str, Any]:
         if not isinstance(state.get(field), list):
             errors.append(issue("field_invalid", f"{field} 必须是数组", field=field))
 
-    return {
+    result = {
         "valid": not errors,
         "project": str(project_path),
         "errors": errors,
@@ -8675,6 +8986,8 @@ def validate_state(project_path: Path) -> dict[str, Any]:
             "recommended_shot_units": DEFAULT_RECOMMENDED_SHOT_UNITS,
         },
     }
+    context.project_result = result
+    return result
 
 
 def command_validate_project(args: argparse.Namespace) -> int:
@@ -8710,7 +9023,8 @@ def validate_handoff_state(
     expected_episodes: int | None = None,
     require_final_package: bool = False,
 ) -> dict[str, Any]:
-    project_result = validate_state(project_path)
+    context = ValidationContext()
+    project_result = validate_state(project_path, context)
     errors = list(project_result.get("errors", []))
     warnings = list(project_result.get("warnings", []))
     selected: list[dict[str, Any]] = []
@@ -8737,7 +9051,10 @@ def validate_handoff_state(
             },
         }
 
-    _, state = load_state(project_path)
+    state = context.state
+    if not isinstance(state, dict):
+        _, state = load_state(project_path)
+        context.state = state
     selected_refs: set[tuple[str, int]] = set()
     specified_episode_count: int | None = None
 
@@ -8745,7 +9062,9 @@ def validate_handoff_state(
         (key, record)
         for key, record in latest_records_of_type(state, "project_spec")
         if key == "project_spec"
-        and confirmed_record_is_usable(state, key, record, project_path)
+        and confirmed_record_is_usable(
+            state, key, record, project_path, context=context
+        )
     ]
     if len(project_spec_candidates) == 1:
         project_spec_key, project_spec_record = project_spec_candidates[0]
@@ -8814,7 +9133,9 @@ def validate_handoff_state(
         (key, record)
         for key, record in latest_records_of_type(state, "series_map")
         if key == "series_map"
-        and confirmed_record_is_usable(state, key, record, project_path)
+        and confirmed_record_is_usable(
+            state, key, record, project_path, context=context
+        )
     ]
     if len(series_map_candidates) == 1:
         series_map_key, series_map_record = series_map_candidates[0]
@@ -8861,7 +9182,9 @@ def validate_handoff_state(
         )
 
     def approved_and_current(key: str, record: dict[str, Any]) -> bool:
-        return confirmed_record_is_usable(state, key, record, project_path)
+        return confirmed_record_is_usable(
+            state, key, record, project_path, context=context
+        )
 
     singleton_types = {
         "project_spec",
@@ -8974,6 +9297,9 @@ def validate_handoff_state(
         project_path,
         expected_episodes=expected_episodes,
         allow_awaiting=False,
+        validation_context=context,
+        project_result=project_result,
+        state=state,
     )
     errors.extend(breakdown_result.get("errors", []))
     warnings.extend(breakdown_result.get("warnings", []))
@@ -8997,6 +9323,7 @@ def validate_handoff_state(
                 continuity_key,
                 continuity_record,
                 expected_continuity_episodes,
+                context=context,
             )
         )
 
@@ -10792,7 +11119,10 @@ def validate_continuity_ledger_file(
     artifact_key: str,
     record: dict[str, Any],
     episode_records: dict[str, dict[str, Any]],
+    *,
+    context: ValidationContext | None = None,
 ) -> list[dict[str, Any]]:
+    context = context or ValidationContext()
     errors: list[dict[str, Any]] = []
     expected_script_sources = {
         (key, episode_record.get("version"))
@@ -10801,7 +11131,11 @@ def validate_continuity_ledger_file(
     expected_review_sources: set[tuple[str, int]] = set()
     for episode_key, episode_record in sorted(episode_records.items()):
         review_match = matching_boundary_review(
-            state, episode_key, episode_record, project_path
+            state,
+            episode_key,
+            episode_record,
+            project_path,
+            context=context,
         )
         if review_match is None:
             errors.append(
@@ -11028,8 +11362,13 @@ def validate_breakdowns_state(
     expected_episodes: int | None = None,
     allow_awaiting: bool = False,
     batch_id: str | None = None,
+    *,
+    validation_context: ValidationContext | None = None,
+    project_result: dict[str, Any] | None = None,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    project_result = validate_state(project_path)
+    context = validation_context or ValidationContext()
+    project_result = project_result or validate_state(project_path, context)
     errors = list(project_result.get("errors", []))
     warnings = list(project_result.get("warnings", []))
     if errors:
@@ -11040,7 +11379,11 @@ def validate_breakdowns_state(
             "warnings": warnings,
             "summary": {"error_count": len(errors), "warning_count": len(warnings)},
         }
-    _, state = load_state(project_path)
+    if state is None:
+        state = context.state
+    if not isinstance(state, dict):
+        _, state = load_state(project_path)
+        context.state = state
     allowed_statuses = {"confirmed"}
     if allow_awaiting:
         allowed_statuses.add("awaiting_approval")
@@ -11088,7 +11431,13 @@ def validate_breakdowns_state(
         if path is None or not path.is_file():
             continue
         expected_script_sources.add((key, record["version"]))
-        review_match = matching_boundary_review(state, key, record, project_path)
+        review_match = matching_boundary_review(
+            state,
+            key,
+            record,
+            project_path,
+            context=context,
+        )
         if review_match is None:
             errors.append(
                 issue(

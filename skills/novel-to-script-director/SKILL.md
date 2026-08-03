@@ -69,7 +69,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 ## 任意长度小说与受控并发
 
-不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体；工作智能体只写独立候选文件，由主任务调用CLI验收和登记。生产任务开始前运行 `startup-preflight`；实际规划、验收和恢复统一使用 `plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。`coordinator_slice`只表示逻辑业务片段，不创建第二级协调智能体。主任务必须回传当前活动宿主任务ID；缺少宿主、结果和检查点的活动任务进入`abandoned/recovery_required`，以相同幂等键最多受控重试一次，旧attempt不得形成第二个有效结果。
+不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体；工作智能体只写独立候选文件，由主任务调用CLI验收和登记。生产任务开始前运行 `startup-preflight`；实际规划、验收和恢复统一使用 `plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。`coordinator_slice`只表示逻辑业务片段，不创建第二级协调智能体。主任务必须回传当前活动宿主任务ID；缺少宿主、结果和检查点的活动任务进入`abandoned/recovery_required`，以相同幂等键最多受控重试一次，旧attempt不得形成第二个有效结果。同一顶层校验命令必须复用运行级依赖DAG与JSON payload缓存；该缓存不得跨命令持久化，文件版本或散列变化必须重新校验。
 
 生产来源分析必须维护`chapter_analysis_registry`和`rolling_source_progress`。相同`source_unit_id + content_sha256 + analysis_contract_version`不得重复分析；下一批先复用carryover，再从`next_read_start`规划新章节。使用`register-source-analysis`登记新的registry文件，使用`plan-rolling-source-window`生成增量窗口。所有输入输出必须位于显式项目根目录内。
 
@@ -192,7 +192,7 @@ python3 <技能目录>/scripts/project_tool.py build-handoff <项目目录> --se
 
 - 按 [ai-video-production.md](references/ai-video-production.md) 执行：①建立或更新风格/角色/场景/道具四类锚点（带版本号的规范制品）；②生成模型无关的 `ai_shot_plan:E001`（含每单元通用中文提示词），登记 `awaiting_approval` 后先过 `ai_video_boundary_review:E001` 前置门禁。**通用分镜计划就是默认最终交付**，不区分 Seedance/可灵/Veo 等平台。
 - 仅当用户点名需要某平台的参数化任务包时，才建立该模型的 `model_capability_profile` 并编译 `ai_video_execution_plan:E001:<模型>`；语义审查绑定在分镜计划层，编译不重审。
-- 分镜计划确认后运行 `project_tool.py render-storyboard <项目目录> <集号>` 生成 HTML 故事板供用户可视化检查（节奏时间轴、单元卡片、提示词复制、锚点资产表）；只读渲染，规范数据以 JSON 为准。
+- 分镜计划确认后运行 `project_tool.py render-storyboard <项目目录> <集号>` 生成 HTML 故事板供用户可视化检查（节奏时间轴、单元卡片、提示词复制、锚点资产表）；只读渲染，规范数据以 JSON 为准。相同输入版本与散列只实际渲染一次，AI执行包与逐集定稿位置通过项目内输入指纹缓存原子复制；输入变化必须重新渲染。
 - 只从当前已确认 `episode_script`、对应 `episode_boundary_review`、覆盖该集的制作提取数据和连续性台账生成，不覆盖文学剧本。`ai_video` 目标下提取表与锚点可按已确认批次滚动更新，绑定当前批次全部剧本版本即可交付该批次执行包。
 - 每个分镜单元必须绑定锚点版本；锚点更新后，引用它的计划自动标记失效，须换版重编。approve 时工具自动校验外形锁注入、台词逐条覆盖、单人对嘴、结构化状态链连续、切点时长理由、资产预算与提示词字段完整。
 - 兼容旧项目：`seedance_execution_plan:E001` 键仍受支持，按原 Seedance 专属流程校验。
