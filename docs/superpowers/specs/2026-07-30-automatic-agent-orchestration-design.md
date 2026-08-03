@@ -2,7 +2,7 @@
 
 日期：2026-07-30
 
-状态：设计已确认，运行时实现已落地；2026-08-03按宿主能力修订为单层编排并冻结接口
+状态：设计已确认，运行时实现已落地；2026-08-03按宿主能力修订为单层编排，并在v0.8.91补充生产执行控制
 
 ## 1. 问题
 
@@ -27,6 +27,8 @@
 5. 保持现有项目状态、内容边界、审批、版本、散列和交付门禁。
 6. 不降低原著依据、剧本质量、独立审核、连续性或制作就绪标准。
 7. 同一任务连续失败两次后停止，不无限重试、不跳过失败项。
+8. 正式小说执行与插件开发任务明确隔离，执行模式在项目运行链开始时锁定。
+9. 生产预检、委托授权、警告和阻断统一落在现有运行时状态中，不建立第二套状态系统。
 
 ## 3. 非目标
 
@@ -310,7 +312,7 @@ Python CLI不直接调用模型、不创建智能体，也不实现第二套内�
 
 ```text
 停止派发
-→ 等待可安全完成的当前任务
+→ 立即暂停无关活动任务
 → CLI保存检查点
 → 主任务关闭相关工作智能体
 → 主会话展示确认内容
@@ -352,25 +354,35 @@ Python CLI不直接调用模型、不创建智能体，也不实现第二套内�
 ### 13.3 幂等
 
 ```text
-idempotency_key =
-task_type
-+ 输入制品版本与散列
-+ batch/episode/source范围
-+ contract_version
+decision_identity =
+project_id
++ stage
++ operation
++ input_hash
++ target_hash
++ rule_version
++ runtime_version
++ plugin_version
++ output_contract_version
++ output_schema_version
+
+idempotency_key = sha256(decision_identity)
 ```
 
 同一幂等键只能产生一个有效结果。重试可以保留失败记录，但不能生成两个正式版本。
 
 ## 14. 最小CLI表面
 
-只增加三类薄命令，避免建设第二套Runtime：
+只保留四类薄命令，避免建设第二套Runtime：
 
 ```text
+startup-preflight
 plan-agent-slice
 accept-agent-result
 show-agent-runtime
 ```
 
+- `startup-preflight`：锁定生产/开发模式，记录环境指纹，复用或重跑一次性预检，并处理阻断解除；
 - `plan-agent-slice`：从现有项目状态生成下一自然业务片段和不可变任务包；
 - `accept-agent-result`：验证结果清单、候选文件和输入绑定，然后调用现有登记逻辑；
 - `show-agent-runtime`：输出当前逻辑业务片段、宿主任务绑定、阻塞原因、最近检查点和下一步。
@@ -427,15 +439,19 @@ show-agent-runtime
 
 不得同时重构与本目标无关的内容工作流、交付格式或AI视频契约。
 
-## 19. 阶段三接口冻结
+## 19. v0.8.91接口冻结
 
-自2026-08-03起，下列全局编排接口作为当前兼容基线冻结。后续简介模式或其他入口只能调用，不得复制、绕过或静默改变其语义：
+自2026-08-03 v0.8.91起，下列全局编排接口作为当前兼容基线冻结。后续简介模式或其他入口只能调用，不得复制、绕过或静默改变其语义：
 
 - 运行时入口：`startup-preflight`、`plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。
-- 任务包核心字段：`task_id`、`task_type`、`scope`、`attempt`、`max_attempts`、`idempotency_key`、`input_refs`、`allowed_read_paths`、`allowed_write_directory`、`acceptance_command`、`context_inheritance`、`scheduling_mode`、`scheduling_key`、`state_write_policy`、`supervisor_mode`、`host_task_id`、`host_task_status`、`recovery_state`。
+- 执行控制：`execution_mode`、`development_task_id`、预检环境指纹、委托授权、去重警告和单一活动阻断全部保存在现有`project_state.agent_runtime.execution_control`中。
+- 任务包核心字段：`task_id`、`task_type`、`scope`、`attempt`、`max_attempts`、`decision_identity`、`idempotency_key`、`input_refs`、`allowed_read_paths`、`allowed_write_directory`、`acceptance_command`、`context_inheritance`、`scheduling_mode`、`scheduling_key`、`state_write_policy`、`supervisor_mode`、`host_task_id`、`host_task_status`、`recovery_state`。`stage`和`operation`冻结在`decision_identity`内，不重复为顶层字段。
 - 结果信封核心字段：`task_id`、`idempotency_key`、`status`、`candidate_output_paths`、`error_code`和五类耗时加`error_class`的`telemetry`。
-- 幂等键继续由任务类型、业务范围、输入版本与散列及契约版本决定；重试只增加`attempt`。
+- 幂等键由项目、阶段、操作、输入散列、目标范围、规则/运行时/插件版本和输出契约/schema版本组成；重试只增加`attempt`。
+- 生产模式禁止开发测试、设计审核、Skill和源码修改；开发模式必须绑定明确开发任务ID，模式不能在同一执行控制内切换。
+- 委托授权仅在相同项目、执行链、阶段、操作、输入、目标和规则范围内复用；不能替代内容新增授权或绕过强制门禁。
 - `planned/running`任务只有活动宿主ID、有效结果或有效检查点之一存在时才能复用；否则进入`abandoned/recovery_required`，第二次失联进入`blocked`。
+- 已完成任务仅在接受产物存在、散列一致且基础验收继续通过时复用；候选验收失败标记`acceptance_failed`并形成阻断检查点。
 - 同一幂等键只能有一个有效结果；旧attempt晚到结果必须拒绝。
 - 默认并发2并受`max_parallel_tasks`与`service_capacity`共同限制；独立任务可并行，串行任务、同调度键和项目状态写入不得并行。
 - `project_state.json`保持项目锁、进程锁和原子替换的单一写入语义。

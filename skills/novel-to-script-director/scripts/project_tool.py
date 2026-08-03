@@ -949,6 +949,7 @@ def empty_agent_runtime_state() -> dict[str, Any]:
         "error_counts": {},
         "max_parallel_tasks": agent_runtime.DEFAULT_MAX_PARALLEL_TASKS,
         "service_capacity": agent_runtime.DEFAULT_MAX_PARALLEL_TASKS,
+        "execution_control": agent_runtime.empty_execution_control(),
         "updated_at": now_iso(),
     }
 
@@ -3130,6 +3131,134 @@ def active_agent_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def pause_active_agent_tasks(
+    project_path: Path,
+    tasks: list[dict[str, Any]],
+    *,
+    blocker_id: str,
+    exclude_task_id: str | None = None,
+) -> list[str]:
+    targets = [
+        task
+        for task in active_agent_tasks(tasks)
+        if task.get("task_id") != exclude_task_id
+    ]
+    remaining_active_ids = sorted(
+        task["task_id"]
+        for task in active_agent_tasks(tasks)
+        if task not in targets
+    )
+    paused_ids: list[str] = []
+    for task in targets:
+        task["status"] = "paused"
+        task["host_task_status"] = "inactive"
+        task["recovery_state"] = "recovery_required"
+        task["paused_by_blocker_id"] = blocker_id
+        checkpoint_path = write_agent_checkpoint(
+            project_path,
+            run_id=task["run_id"],
+            task_id=task["task_id"],
+            idempotency_key=task["idempotency_key"],
+            status="recovery_required",
+            next_step="全局阻断解除后，使用原任务包和同一幂等键从检查点继续",
+            active_task_ids=remaining_active_ids,
+            result_path=task.get("result_path"),
+            failure_count=int(task.get("attempt", 0)),
+        )
+        task["last_checkpoint_path"] = checkpoint_path
+        task["updated_at"] = now_iso()
+        save_loaded_agent_task(task)
+        paused_ids.append(task["task_id"])
+    return sorted(paused_ids)
+
+
+def resume_tasks_paused_by_blocker(
+    project_path: Path,
+    tasks: list[dict[str, Any]],
+    blocker: dict[str, Any],
+) -> list[str]:
+    blocker_id = blocker.get("blocker_id")
+    paused_task_ids = sorted(set(blocker.get("paused_task_ids") or []))
+    resumable_tasks: list[dict[str, Any]] = []
+    for task_id in paused_task_ids:
+        task = next(
+            (item for item in tasks if item.get("task_id") == task_id),
+            None,
+        )
+        if (
+            not isinstance(task, dict)
+            or task.get("status") != "paused"
+            or task.get("paused_by_blocker_id") != blocker_id
+            or not isinstance(task.get("last_checkpoint_path"), str)
+        ):
+            raise ToolError(f"blocked_task_not_resumable:{task_id}")
+        checkpoint_path = project_path / task["last_checkpoint_path"]
+        if not checkpoint_path.is_file():
+            raise ToolError(f"blocked_task_checkpoint_missing:{task_id}")
+        resumable_tasks.append(task)
+
+    resumed_ids: list[str] = []
+    for task in resumable_tasks:
+        task["status"] = "planned"
+        task["host_task_id"] = None
+        task["host_task_status"] = "unbound"
+        task["recovery_state"] = "none"
+        task["activity_lease_expires_at"] = (
+            agent_runtime.planned_task_lease_expires_at()
+        )
+        task["resumed_from_checkpoint"] = task["last_checkpoint_path"]
+        task["resolved_blocker_id"] = blocker_id
+        task["resumed_at"] = now_iso()
+        task["updated_at"] = now_iso()
+        save_loaded_agent_task(task)
+        resumed_ids.append(task["task_id"])
+    return sorted(resumed_ids)
+
+
+def completed_agent_task_is_reusable(
+    project_path: Path,
+    task: dict[str, Any],
+) -> bool:
+    if not agent_runtime.accepted_outputs_are_intact(task, project_path):
+        return False
+    result_evidence = valid_agent_result(project_path, task)
+    if result_evidence is None:
+        return False
+    candidate_paths = [
+        record["path"]
+        for record in task.get("accepted_outputs", [])
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    ]
+    return not validate_agent_candidate(project_path, task, candidate_paths)
+
+
+def invalidate_completed_agent_task(
+    project_path: Path,
+    task: dict[str, Any],
+    active_task_ids: list[str],
+) -> str:
+    task["status"] = "invalidated"
+    task["host_task_status"] = "inactive"
+    task["recovery_state"] = "recovery_required"
+    task["invalidated_at"] = now_iso()
+    task["invalidation_reason"] = "accepted_output_missing_hash_mismatch_or_validation_failed"
+    checkpoint_path = write_agent_checkpoint(
+        project_path,
+        run_id=task["run_id"],
+        task_id=task["task_id"],
+        idempotency_key=task["idempotency_key"],
+        status="recovery_required",
+        next_step="已接受产物缺失、散列变化或基础校验失败，使用同一幂等键重新执行",
+        active_task_ids=active_task_ids,
+        result_path=task.get("result_path"),
+        failure_count=int(task.get("attempt", 0)),
+    )
+    task["last_checkpoint_path"] = checkpoint_path
+    task["updated_at"] = now_iso()
+    save_loaded_agent_task(task)
+    return checkpoint_path
+
+
 def agent_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
     runtime = state.get("agent_runtime")
     if not isinstance(runtime, dict):
@@ -3144,7 +3273,265 @@ def agent_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
     runtime.setdefault("error_counts", {})
     for field in agent_runtime.TIMING_FIELDS:
         runtime["timing_totals"].setdefault(field, 0.0)
+    agent_runtime.ensure_execution_control(runtime)
     return runtime
+
+
+def current_execution_context(
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    runtime = agent_runtime_state(state)
+    control = agent_runtime.ensure_execution_control(runtime)
+    environment = agent_runtime.runtime_environment_snapshot()
+    fingerprint = agent_runtime.build_preflight_fingerprint(
+        project_id=str(state.get("project_id") or ""),
+        project_schema_version=int(state.get("schema_version") or 0),
+        environment_snapshot=environment,
+    )
+    return control, environment, fingerprint
+
+
+def sync_execution_control_to_run(
+    project_path: Path,
+    control: dict[str, Any],
+) -> None:
+    run = load_agent_run(project_path)
+    run["execution_control"] = json.loads(
+        json.dumps(control, ensure_ascii=False)
+    )
+    run["execution_mode"] = control.get("execution_mode")
+    save_agent_run(project_path, run)
+
+
+def persist_execution_control(
+    project_path: Path,
+    state: dict[str, Any],
+    control: dict[str, Any],
+) -> None:
+    runtime = agent_runtime_state(state)
+    runtime["execution_control"] = control
+    runtime["updated_at"] = now_iso()
+    if control.get("status") == "blocked":
+        active = active_agent_tasks(load_agent_tasks(project_path))
+        active_ids = sorted(task["task_id"] for task in active)
+        active_host_task_ids = sorted(
+            {
+                task["host_task_id"]
+                for task in active
+                if isinstance(task.get("host_task_id"), str)
+                and task["host_task_id"]
+            }
+        )
+        runtime["status"] = "blocked"
+        runtime["active_task_ids"] = active_ids
+        runtime["active_host_task_ids"] = active_host_task_ids
+    save_state(project_path, state)
+    run = load_agent_run(project_path)
+    run["execution_control"] = json.loads(
+        json.dumps(control, ensure_ascii=False)
+    )
+    run["execution_mode"] = control.get("execution_mode")
+    if control.get("status") == "blocked":
+        run["status"] = "blocked"
+        run["active_task_ids"] = runtime["active_task_ids"]
+        run["active_host_task_ids"] = runtime["active_host_task_ids"]
+    save_agent_run(project_path, run)
+
+
+def migrate_legacy_agent_tasks(
+    project_path: Path,
+    state: dict[str, Any],
+    control: dict[str, Any],
+) -> list[str]:
+    migrated_task_ids: list[str] = []
+    execution_mode = str(control.get("execution_mode") or "")
+    for task in load_agent_tasks(project_path):
+        if isinstance(task.get("decision_identity"), dict):
+            continue
+        old_idempotency_key = task.get("idempotency_key")
+        scope = task.get("scope")
+        input_refs = task.get("input_refs")
+        if (
+            not isinstance(old_idempotency_key, str)
+            or not isinstance(scope, dict)
+            or not isinstance(input_refs, list)
+        ):
+            raise ToolError(
+                f"legacy_task_migration_failed:{task.get('task_id')}"
+            )
+        decision_identity = agent_runtime.build_decision_identity(
+            project_id=state["project_id"],
+            stage=str(
+                scope.get("stage")
+                or (
+                    task.get("task_type")
+                    if task.get("task_type") in STAGES
+                    else task.get("coordinator_slice")
+                )
+                or "legacy"
+            ),
+            operation=str(task.get("task_type") or "legacy"),
+            scope=scope,
+            input_refs=input_refs,
+            output_contract_version=int(task.get("contract_version") or 1),
+            output_schema_version=1,
+        )
+        new_idempotency_key = agent_runtime.build_idempotency_key(
+            decision_identity
+        )
+        task.update(
+            {
+                "legacy_idempotency_key": old_idempotency_key,
+                "legacy_runtime_version": "1",
+                "idempotency_key": new_idempotency_key,
+                "decision_identity": decision_identity,
+                "execution_mode": execution_mode,
+                "execution_policy": agent_runtime.execution_policy(
+                    execution_mode
+                ),
+                "authorization_id": (
+                    f"AUTH-LEGACY-{old_idempotency_key[:12]}"
+                ),
+                "migrated_at": now_iso(),
+            }
+        )
+
+        result_path = agent_runtime.result_path_for(
+            project_path, task["task_id"]
+        )
+        result: dict[str, Any] | None = None
+        if result_path.is_file():
+            result = agent_runtime.read_json(result_path)
+            if result.get("idempotency_key") == old_idempotency_key:
+                result["legacy_idempotency_key"] = old_idempotency_key
+                result["idempotency_key"] = new_idempotency_key
+                agent_runtime.atomic_write_json(result_path, result)
+
+        for checkpoint_path in agent_runtime.runtime_paths(project_path)[
+            "checkpoints"
+        ].glob("*.json"):
+            try:
+                checkpoint = agent_runtime.read_json(checkpoint_path)
+            except agent_runtime.AgentRuntimeError:
+                continue
+            if (
+                checkpoint.get("task_id") == task.get("task_id")
+                and checkpoint.get("idempotency_key")
+                == old_idempotency_key
+            ):
+                checkpoint["legacy_idempotency_key"] = old_idempotency_key
+                checkpoint["idempotency_key"] = new_idempotency_key
+                agent_runtime.atomic_write_json(
+                    checkpoint_path, checkpoint
+                )
+
+        if (
+            task.get("status") in {"accepted", "completed"}
+            and isinstance(result, dict)
+            and result.get("status") == "completed"
+            and not agent_runtime.validate_result_envelope(
+                task, result, project_path
+            )
+        ):
+            candidate_paths = result.get("candidate_output_paths")
+            if (
+                isinstance(candidate_paths, list)
+                and not validate_agent_candidate(
+                    project_path, task, candidate_paths
+                )
+            ):
+                task["accepted_outputs"] = (
+                    agent_runtime.accepted_output_records(
+                        project_path, candidate_paths
+                    )
+                )
+
+        save_loaded_agent_task(task)
+        migrated_task_ids.append(task["task_id"])
+        append_history(
+            state,
+            "agent_task_runtime_migrated",
+            {
+                "task_id": task["task_id"],
+                "legacy_idempotency_key": old_idempotency_key,
+                "idempotency_key": new_idempotency_key,
+            },
+        )
+    return sorted(migrated_task_ids)
+
+
+def rebase_legacy_agent_task_identity(
+    project_path: Path,
+    task: dict[str, Any],
+    decision_identity: dict[str, Any],
+) -> bool:
+    legacy_idempotency_key = task.get("legacy_idempotency_key")
+    if not isinstance(legacy_idempotency_key, str):
+        return False
+    new_idempotency_key = agent_runtime.build_idempotency_key(
+        decision_identity
+    )
+    previous_idempotency_key = task.get("idempotency_key")
+    if (
+        previous_idempotency_key == new_idempotency_key
+        and task.get("decision_identity") == decision_identity
+    ):
+        return False
+    task["decision_identity"] = decision_identity
+    task["idempotency_key"] = new_idempotency_key
+    task["identity_rebased_at"] = now_iso()
+
+    result_path = agent_runtime.result_path_for(
+        project_path, task["task_id"]
+    )
+    if result_path.is_file():
+        result = agent_runtime.read_json(result_path)
+        if result.get("idempotency_key") in {
+            previous_idempotency_key,
+            legacy_idempotency_key,
+        }:
+            result["legacy_idempotency_key"] = legacy_idempotency_key
+            result["idempotency_key"] = new_idempotency_key
+            agent_runtime.atomic_write_json(result_path, result)
+
+    for checkpoint_path in agent_runtime.runtime_paths(project_path)[
+        "checkpoints"
+    ].glob("*.json"):
+        try:
+            checkpoint = agent_runtime.read_json(checkpoint_path)
+        except agent_runtime.AgentRuntimeError:
+            continue
+        if (
+            checkpoint.get("task_id") == task.get("task_id")
+            and checkpoint.get("idempotency_key")
+            in {previous_idempotency_key, legacy_idempotency_key}
+        ):
+            checkpoint["legacy_idempotency_key"] = legacy_idempotency_key
+            checkpoint["idempotency_key"] = new_idempotency_key
+            agent_runtime.atomic_write_json(checkpoint_path, checkpoint)
+
+    save_loaded_agent_task(task)
+    return True
+
+
+def require_execution_ready(
+    project_path: Path,
+    state: dict[str, Any],
+    *,
+    allow_active_blocker: bool = False,
+) -> tuple[dict[str, Any], str]:
+    control, _environment, fingerprint = current_execution_context(state)
+    try:
+        agent_runtime.require_execution_ready(
+            control,
+            fingerprint=fingerprint,
+            allow_active_blocker=allow_active_blocker,
+        )
+    except agent_runtime.AgentRuntimeError:
+        save_state(project_path, state)
+        sync_execution_control_to_run(project_path, control)
+        raise
+    return control, fingerprint
 
 
 def load_agent_run(project_path: Path) -> dict[str, Any]:
@@ -3281,6 +3668,83 @@ def persist_agent_reconciliation(
 ) -> None:
     if not records:
         return
+    runtime = agent_runtime_state(state)
+    control = agent_runtime.ensure_execution_control(runtime)
+    blocked_record = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("status") == "blocked"
+        ),
+        None,
+    )
+    if blocked_record is not None:
+        blocked_task = next(
+            (
+                task
+                for task in tasks
+                if task.get("task_id") == blocked_record["task_id"]
+            ),
+            None,
+        )
+        decision_identity = (
+            blocked_task.get("decision_identity")
+            if isinstance(blocked_task, dict)
+            else None
+        )
+        scope_signature = (
+            agent_runtime.delegation_scope_signature(
+                project_id=state["project_id"],
+                run_id=blocked_task["run_id"],
+                decision_identity=decision_identity,
+            )
+            if isinstance(decision_identity, dict)
+            else blocked_record["idempotency_key"]
+        )
+        blocker, blocker_reused = agent_runtime.activate_blocker(
+            control,
+            severity="host_task_lost",
+            codes=["two_hostless_attempts_blocked"],
+            scope_signature=scope_signature,
+            input_hash=(
+                decision_identity.get(
+                    "input_hash", blocked_record["idempotency_key"]
+                )
+                if isinstance(decision_identity, dict)
+                else blocked_record["idempotency_key"]
+            ),
+            authorization_id=(
+                blocked_task.get("authorization_id")
+                if isinstance(blocked_task, dict)
+                else None
+            ),
+            task_id=blocked_record["task_id"],
+        )
+        paused_ids = pause_active_agent_tasks(
+            project_path,
+            tasks,
+            blocker_id=blocker["blocker_id"],
+            exclude_task_id=blocked_record["task_id"],
+        )
+        blocker["checkpoint_path"] = blocked_record["checkpoint_path"]
+        blocker["paused_task_ids"] = paused_ids
+        agent_runtime.mark_execution_failure(
+            control,
+            task_id=blocked_record["task_id"],
+            error_code="host_task_lost",
+        )
+        append_history(
+            state,
+            "execution_blocked",
+            {
+                "blocker_id": blocker["blocker_id"],
+                "severity": blocker["severity"],
+                "codes": blocker["codes"],
+                "paused_task_ids": paused_ids,
+                "reused": blocker_reused,
+            },
+        )
+
     active = active_agent_tasks(tasks)
     active_ids = sorted(task["task_id"] for task in active)
     active_host_task_ids = sorted(
@@ -3291,8 +3755,12 @@ def persist_agent_reconciliation(
             and task["host_task_id"]
         }
     )
-    last = records[-1]
-    status = "blocked" if last["status"] == "blocked" else "recovery_required"
+    last = blocked_record or records[-1]
+    status = (
+        "blocked"
+        if blocked_record is not None
+        else "recovery_required"
+    )
     run = load_agent_run(project_path)
     run.update(
         {
@@ -3301,10 +3769,12 @@ def persist_agent_reconciliation(
             "active_host_task_ids": active_host_task_ids,
             "last_task_id": last["task_id"],
             "last_checkpoint_path": last["checkpoint_path"],
+            "execution_control": json.loads(
+                json.dumps(control, ensure_ascii=False)
+            ),
         }
     )
     save_agent_run(project_path, run)
-    runtime = agent_runtime_state(state)
     runtime.update(
         {
             "orchestration_mode": "single_layer_host",
@@ -3313,6 +3783,7 @@ def persist_agent_reconciliation(
             "active_host_task_ids": active_host_task_ids,
             "last_task_id": last["task_id"],
             "last_checkpoint_path": last["checkpoint_path"],
+            "execution_control": control,
             "updated_at": now_iso(),
         }
     )
@@ -3409,10 +3880,87 @@ def validate_agent_candidate(
 
 def command_plan_agent_slice(args: argparse.Namespace) -> int:
     project_path, state = load_state(args.project)
+    control, _fingerprint = require_execution_ready(project_path, state)
     scope = agent_scope_from_json(args.scope_json)
     input_refs = agent_input_refs_from_args(project_path, args.input_ref)
     if args.contract_version < 1:
         raise ToolError("--contract-version 必须是正整数")
+    stage = args.stage or scope.get("stage") or args.coordinator_slice
+    operation = args.operation or args.task_type
+    execution_mode = str(control.get("execution_mode") or "")
+    agent_runtime.validate_operation_for_mode(
+        execution_mode,
+        operation,
+        args.task_type,
+    )
+    decision_identity = agent_runtime.build_decision_identity(
+        project_id=state["project_id"],
+        stage=stage,
+        operation=operation,
+        scope=scope,
+        input_refs=input_refs,
+        output_contract_version=args.contract_version,
+        output_schema_version=args.output_schema_version,
+    )
+    authorization, authorization_reused = (
+        agent_runtime.resolve_delegation_authorization(
+            control,
+            project_id=state["project_id"],
+            run_id=args.run_id,
+            decision_identity=decision_identity,
+            directive=args.delegation_directive,
+        )
+    )
+    warning_records = [
+        agent_runtime.record_decision_warning(
+            control,
+            code=warning,
+            scope_signature=authorization["scope_signature"],
+            authorization_id=authorization["authorization_id"],
+        )
+        for warning in sorted(set(args.warning or []))
+    ]
+    tasks = load_agent_tasks(project_path)
+    if args.major_ambiguity:
+        blocker, blocker_reused = agent_runtime.activate_blocker(
+            control,
+            severity="major_ambiguity",
+            codes=args.major_ambiguity,
+            scope_signature=authorization["scope_signature"],
+            input_hash=decision_identity["input_hash"],
+            authorization_id=authorization["authorization_id"],
+        )
+        paused_task_ids = pause_active_agent_tasks(
+            project_path,
+            tasks,
+            blocker_id=blocker["blocker_id"],
+        )
+        checkpoint_path = write_agent_checkpoint(
+            project_path,
+            run_id=args.run_id,
+            task_id=None,
+            idempotency_key=None,
+            status="blocked",
+            next_step="重大歧义已阻断全部无关任务；取得具体澄清或修复输入后从检查点继续",
+            active_task_ids=[],
+        )
+        blocker["checkpoint_path"] = checkpoint_path
+        blocker["paused_task_ids"] = paused_task_ids
+        append_history(
+            state,
+            "execution_blocked",
+            {
+                "blocker_id": blocker["blocker_id"],
+                "severity": blocker["severity"],
+                "codes": blocker["codes"],
+                "paused_task_ids": paused_task_ids,
+                "reused": blocker_reused,
+            },
+        )
+        persist_execution_control(project_path, state, control)
+        raise ToolError(
+            f"major_ambiguity_blocked:{blocker['blocker_id']}"
+        )
     active_host_task_ids = set(args.active_host_task_id or [])
     if args.host_task_id:
         active_host_task_ids.add(args.host_task_id)
@@ -3440,10 +3988,30 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
     scheduling_key = args.scheduling_key or agent_runtime.canonical_sha256(
         {"coordinator_slice": args.coordinator_slice, "scope": scope}
     )
-    idempotency_key = agent_runtime.build_idempotency_key(
-        args.task_type, scope, input_refs, args.contract_version
+    idempotency_key = agent_runtime.build_idempotency_key(decision_identity)
+    legacy_idempotency_key = agent_runtime.build_legacy_idempotency_key(
+        args.task_type,
+        scope,
+        input_refs,
+        args.contract_version,
     )
-    tasks = load_agent_tasks(project_path)
+    rebased_legacy_task_ids = []
+    for task in tasks:
+        if task.get("legacy_idempotency_key") != legacy_idempotency_key:
+            continue
+        if rebase_legacy_agent_task_identity(
+            project_path, task, decision_identity
+        ):
+            rebased_legacy_task_ids.append(task["task_id"])
+    if rebased_legacy_task_ids:
+        append_history(
+            state,
+            "legacy_agent_task_identity_rebased",
+            {
+                "task_ids": sorted(rebased_legacy_task_ids),
+                "idempotency_key": idempotency_key,
+            },
+        )
     initial_matching = sorted(
         (
             task
@@ -3466,6 +4034,8 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
     reconciliation_records: list[dict[str, Any]] = []
     for task in active_agent_tasks(tasks):
         if task.get("task_id") == bind_task_id:
+            continue
+        if agent_runtime.planned_task_is_active(task):
             continue
         result_evidence = valid_agent_result(project_path, task)
         if result_evidence is not None:
@@ -3539,14 +4109,46 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
         key=lambda task: int(task.get("attempt", 0)),
     )
     latest = matching[-1] if matching else None
+    invalidated_task_id: str | None = None
     if latest is not None:
         if latest.get("status") in {"accepted", "completed"}:
-            return _print_agent_reuse(
-                project_path, latest, "completed_result_reused"
+            if completed_agent_task_is_reusable(project_path, latest):
+                persist_execution_control(project_path, state, control)
+                return _print_agent_reuse(
+                    project_path,
+                    latest,
+                    "completed_result_reused",
+                    authorization=authorization,
+                    authorization_reused=authorization_reused,
+                    warning_count=len(warning_records),
+                )
+            invalidated_task_id = latest["task_id"]
+            invalidate_completed_agent_task(
+                project_path,
+                latest,
+                [
+                    task["task_id"]
+                    for task in active_agent_tasks(tasks)
+                    if task.get("task_id") != latest.get("task_id")
+                ],
+            )
+            append_history(
+                state,
+                "agent_completed_result_invalidated",
+                {
+                    "task_id": latest["task_id"],
+                    "idempotency_key": latest["idempotency_key"],
+                },
             )
         if latest.get("status") == "result_ready":
+            persist_execution_control(project_path, state, control)
             return _print_agent_reuse(
-                project_path, latest, "result_pending_acceptance"
+                project_path,
+                latest,
+                "result_pending_acceptance",
+                authorization=authorization,
+                authorization_reused=authorization_reused,
+                warning_count=len(warning_records),
             )
         if latest.get("status") in {"planned", "running"}:
             existing_host_task_id = latest.get("host_task_id")
@@ -3599,19 +4201,37 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
                     },
                 )
                 save_state(project_path, state)
+                sync_execution_control_to_run(project_path, control)
                 return _print_agent_reuse(
                     project_path,
                     latest,
                     "active_host_task_reused",
+                    authorization=authorization,
+                    authorization_reused=authorization_reused,
+                    warning_count=len(warning_records),
                 )
             if (
                 existing_host_task_id
                 and existing_host_task_id in active_host_task_ids
             ):
+                persist_execution_control(project_path, state, control)
                 return _print_agent_reuse(
                     project_path,
                     latest,
                     "active_host_task_reused",
+                    authorization=authorization,
+                    authorization_reused=authorization_reused,
+                    warning_count=len(warning_records),
+                )
+            if agent_runtime.planned_task_is_active(latest):
+                persist_execution_control(project_path, state, control)
+                return _print_agent_reuse(
+                    project_path,
+                    latest,
+                    "active_planned_task_reused",
+                    authorization=authorization,
+                    authorization_reused=authorization_reused,
+                    warning_count=len(warning_records),
                 )
             raise ToolError(
                 "active_task_without_host_evidence：活动任务缺少宿主、结果或检查点依据"
@@ -3644,6 +4264,9 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
         allowed_write_directory=allowed_write_directory,
         acceptance_command=args.acceptance_command,
         contract_version=args.contract_version,
+        decision_identity=decision_identity,
+        execution_mode=execution_mode,
+        authorization_id=authorization["authorization_id"],
         coordinator_slice=args.coordinator_slice,
         artifact_key=args.artifact_key,
         max_parallel_tasks=max_parallel,
@@ -3681,6 +4304,10 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
             "max_parallel_tasks": max_parallel,
             "service_capacity": service_capacity,
             "effective_parallel_limit": effective_limit,
+            "execution_mode": execution_mode,
+            "execution_control": json.loads(
+                json.dumps(control, ensure_ascii=False)
+            ),
             "active_host_task_ids": sorted(active_host_task_ids),
             "active_task_ids": sorted(
                 [item["task_id"] for item in active] + [task_id]
@@ -3701,6 +4328,7 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
             "last_task_id": task_id,
             "max_parallel_tasks": max_parallel,
             "service_capacity": service_capacity,
+            "execution_control": control,
             "updated_at": now_iso(),
         }
     )
@@ -3713,6 +4341,9 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
             "task_type": args.task_type,
             "scheduling_mode": scheduling_mode,
             "effective_parallel_limit": effective_limit,
+            "authorization_id": authorization["authorization_id"],
+            "authorization_reused": authorization_reused,
+            "warning_count": len(warning_records),
         },
     )
     save_state(project_path, state)
@@ -3726,7 +4357,12 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
         "scheduling_mode": scheduling_mode,
         "effective_parallel_limit": effective_limit,
         "active_task_count": len(active) + 1,
+        "authorization_id": authorization["authorization_id"],
+        "authorization_reused": authorization_reused,
+        "warning_count": len(warning_records),
     }
+    if invalidated_task_id is not None:
+        response["recovered_from_invalid_task_id"] = invalidated_task_id
     matching_recovery = next(
         (
             record
@@ -3744,7 +4380,13 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
 
 
 def _print_agent_reuse(
-    project_path: Path, task: dict[str, Any], reason: str
+    project_path: Path,
+    task: dict[str, Any],
+    reason: str,
+    *,
+    authorization: dict[str, Any],
+    authorization_reused: bool,
+    warning_count: int,
 ) -> int:
     print_json(
         {
@@ -3763,13 +4405,173 @@ def _print_agent_reuse(
             "effective_parallel_limit": task.get(
                 "effective_parallel_limit", agent_runtime.DEFAULT_MAX_PARALLEL_TASKS
             ),
+            "authorization_id": authorization["authorization_id"],
+            "authorization_reused": authorization_reused,
+            "warning_count": warning_count,
         }
     )
     return 0
 
 
+CANDIDATE_RESULT_ERROR_CODES = {
+    "result_candidates_invalid",
+    "result_candidates_missing",
+    "candidate_output_missing",
+    "candidate_output_path_forbidden",
+}
+
+
+def result_errors_are_candidate_failures(
+    errors: list[dict[str, Any]],
+) -> bool:
+    return bool(errors) and all(
+        isinstance(error, dict)
+        and error.get("code") in CANDIDATE_RESULT_ERROR_CODES
+        for error in errors
+    )
+
+
+def block_agent_acceptance_failure(
+    project_path: Path,
+    state: dict[str, Any],
+    control: dict[str, Any],
+    task: dict[str, Any],
+    task_path: Path,
+    canonical_result_path: Path,
+    candidate_errors: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    remaining_active_tasks = [
+        item
+        for item in active_agent_tasks(load_agent_tasks(project_path))
+        if item.get("task_id") != task["task_id"]
+    ]
+    task["status"] = "acceptance_failed"
+    task["host_task_status"] = "completed"
+    task["recovery_state"] = "recovery_required"
+    task["result_path"] = agent_task_relative_path(
+        project_path, canonical_result_path
+    )
+    task["acceptance_errors"] = candidate_errors
+    task["updated_at"] = now_iso()
+    checkpoint_path = write_agent_checkpoint(
+        project_path,
+        run_id=task["run_id"],
+        task_id=task["task_id"],
+        idempotency_key=task["idempotency_key"],
+        status="recovery_required",
+        next_step="候选产物验收失败；修复候选或重新执行同一幂等任务后再验收",
+        active_task_ids=[
+            item["task_id"] for item in remaining_active_tasks
+        ],
+        result_path=task["result_path"],
+        failure_count=int(task.get("attempt", 0)),
+    )
+    task["last_checkpoint_path"] = checkpoint_path
+    agent_runtime.atomic_write_json(task_path, task)
+    decision_identity = task.get("decision_identity")
+    scope_signature = (
+        agent_runtime.delegation_scope_signature(
+            project_id=state["project_id"],
+            run_id=task["run_id"],
+            decision_identity=decision_identity,
+        )
+        if isinstance(decision_identity, dict)
+        else task["idempotency_key"]
+    )
+    blocker, blocker_reused = agent_runtime.activate_blocker(
+        control,
+        severity="acceptance_failure",
+        codes=[
+            "candidate_validation_failed",
+            *[
+                error.get("code")
+                for error in candidate_errors
+                if isinstance(error, dict)
+                and isinstance(error.get("code"), str)
+            ],
+        ],
+        scope_signature=scope_signature,
+        input_hash=(
+            decision_identity.get("input_hash", task["idempotency_key"])
+            if isinstance(decision_identity, dict)
+            else task["idempotency_key"]
+        ),
+        authorization_id=task.get("authorization_id"),
+        task_id=task["task_id"],
+    )
+    paused_ids = pause_active_agent_tasks(
+        project_path,
+        remaining_active_tasks,
+        blocker_id=blocker["blocker_id"],
+        exclude_task_id=task["task_id"],
+    )
+    blocker["checkpoint_path"] = checkpoint_path
+    blocker["paused_task_ids"] = paused_ids
+    agent_runtime.mark_execution_failure(
+        control,
+        task_id=task["task_id"],
+        error_code="candidate_validation_failed",
+    )
+    active = active_agent_tasks(load_agent_tasks(project_path))
+    active_ids = sorted(item["task_id"] for item in active)
+    active_host_task_ids = sorted(
+        {
+            item["host_task_id"]
+            for item in active
+            if isinstance(item.get("host_task_id"), str)
+            and item["host_task_id"]
+        }
+    )
+    run = load_agent_run(project_path)
+    run.update(
+        {
+            "run_id": task["run_id"],
+            "coordinator_slice": task["coordinator_slice"],
+            "status": "blocked",
+            "active_task_ids": active_ids,
+            "active_host_task_ids": active_host_task_ids,
+            "last_task_id": task["task_id"],
+            "last_checkpoint_path": checkpoint_path,
+            "execution_control": json.loads(
+                json.dumps(control, ensure_ascii=False)
+            ),
+        }
+    )
+    save_agent_run(project_path, run)
+    runtime = agent_runtime_state(state)
+    runtime.update(
+        {
+            "status": "blocked",
+            "run_id": task["run_id"],
+            "coordinator_slice": task["coordinator_slice"],
+            "active_task_ids": active_ids,
+            "active_host_task_ids": active_host_task_ids,
+            "last_task_id": task["task_id"],
+            "last_checkpoint_path": checkpoint_path,
+            "execution_control": control,
+            "updated_at": now_iso(),
+        }
+    )
+    append_history(
+        state,
+        "agent_candidate_acceptance_failed",
+        {
+            "task_id": task["task_id"],
+            "blocker_id": blocker["blocker_id"],
+            "checkpoint_path": checkpoint_path,
+            "paused_task_ids": paused_ids,
+            "reused": blocker_reused,
+            "error_codes": blocker["codes"],
+        },
+    )
+    save_state(project_path, state)
+    sync_execution_control_to_run(project_path, control)
+    return blocker, checkpoint_path
+
+
 def command_accept_agent_result(args: argparse.Namespace) -> int:
     project_path, state = load_state(args.project)
+    control, _fingerprint = require_execution_ready(project_path, state)
     task_path = agent_runtime.task_path_for(project_path, args.task_id)
     if not task_path.is_file():
         raise ToolError(f"任务不存在：{args.task_id}")
@@ -3808,29 +4610,88 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
             "accepted_result_already_exists：同一幂等键已经存在有效结果"
         )
     if task.get("status") in {"accepted", "completed"}:
-        print_json(
-            {
-                "ok": True,
-                "status": "accepted",
-                "reused": True,
-                "task_id": task["task_id"],
-                "result_path": task.get("result_path"),
-            }
+        if completed_agent_task_is_reusable(project_path, task):
+            print_json(
+                {
+                    "ok": True,
+                    "status": "accepted",
+                    "reused": True,
+                    "task_id": task["task_id"],
+                    "result_path": task.get("result_path"),
+                }
+            )
+            return 0
+        task["_path"] = task_path
+        checkpoint_path = invalidate_completed_agent_task(
+            project_path,
+            task,
+            [
+                item["task_id"]
+                for item in active_agent_tasks(
+                    load_agent_tasks(project_path)
+                )
+                if item.get("task_id") != task["task_id"]
+            ],
         )
-        return 0
+        task.pop("_path", None)
+        append_history(
+            state,
+            "agent_completed_result_invalidated",
+            {
+                "task_id": task["task_id"],
+                "idempotency_key": task["idempotency_key"],
+                "checkpoint_path": checkpoint_path,
+            },
+        )
+        persist_execution_control(project_path, state, control)
+        raise ToolError(
+            "accepted_result_invalidated：已接受产物缺失、散列变化或基础校验失败，请重新规划同一幂等任务"
+        )
     result_path = resolve_project_input(project_path, args.result)
     result = agent_runtime.read_json(result_path)
     result_errors = agent_runtime.validate_result_envelope(task, result, project_path)
+    canonical_result_path = agent_runtime.result_path_for(
+        project_path, args.task_id
+    )
     if result_errors:
+        if result_errors_are_candidate_failures(result_errors):
+            if result.get("idempotency_key") != task["idempotency_key"]:
+                result["legacy_idempotency_key"] = result.get(
+                    "idempotency_key"
+                )
+                result["idempotency_key"] = task["idempotency_key"]
+            agent_runtime.atomic_write_json(canonical_result_path, result)
+            runtime = agent_runtime_state(state)
+            update_agent_timing_and_errors(runtime, result["telemetry"])
+            blocker, checkpoint_path = block_agent_acceptance_failure(
+                project_path,
+                state,
+                control,
+                task,
+                task_path,
+                canonical_result_path,
+                result_errors,
+            )
+            raise ToolError(
+                json.dumps(
+                    {
+                        "error": "candidate_validation_failed",
+                        "errors": result_errors,
+                        "blocker_id": blocker["blocker_id"],
+                        "checkpoint_path": checkpoint_path,
+                    },
+                    ensure_ascii=False,
+                )
+            )
         raise ToolError(
             json.dumps(
                 {"error": "result_invalid", "errors": result_errors},
                 ensure_ascii=False,
             )
         )
-    canonical_result_path = agent_runtime.result_path_for(
-        project_path, args.task_id
-    )
+    if result.get("idempotency_key") != task["idempotency_key"]:
+        result["legacy_idempotency_key"] = result.get("idempotency_key")
+        result["idempotency_key"] = task["idempotency_key"]
     agent_runtime.atomic_write_json(canonical_result_path, result)
     telemetry = result["telemetry"]
     runtime = agent_runtime_state(state)
@@ -3865,6 +4726,11 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
         )
         task["updated_at"] = now_iso()
         agent_runtime.atomic_write_json(task_path, task)
+        agent_runtime.mark_execution_failure(
+            control,
+            task_id=task["task_id"],
+            error_code=result.get("error_code"),
+        )
         policy = task["recovery_policy"]
         if int(task["attempt"]) < int(task["max_attempts"]):
             checkpoint_status = "retryable"
@@ -3887,6 +4753,48 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
             result_path=task["result_path"],
             failure_count=int(task["attempt"]),
         )
+        if response_status == "blocked":
+            decision_identity = task.get("decision_identity")
+            scope_signature = (
+                agent_runtime.delegation_scope_signature(
+                    project_id=state["project_id"],
+                    run_id=task["run_id"],
+                    decision_identity=decision_identity,
+                )
+                if isinstance(decision_identity, dict)
+                else task["idempotency_key"]
+            )
+            blocker, _blocker_reused = agent_runtime.activate_blocker(
+                control,
+                severity="execution_failure",
+                codes=["two_failures_blocked", task["error_class"]],
+                scope_signature=scope_signature,
+                input_hash=(
+                    decision_identity.get("input_hash", task["idempotency_key"])
+                    if isinstance(decision_identity, dict)
+                    else task["idempotency_key"]
+                ),
+                authorization_id=task.get("authorization_id"),
+                task_id=task["task_id"],
+            )
+            paused_ids = pause_active_agent_tasks(
+                project_path,
+                remaining_active_tasks,
+                blocker_id=blocker["blocker_id"],
+                exclude_task_id=task["task_id"],
+            )
+            blocker["checkpoint_path"] = checkpoint_path
+            blocker["paused_task_ids"] = paused_ids
+            active = active_agent_tasks(load_agent_tasks(project_path))
+            active_ids = sorted(item["task_id"] for item in active)
+            active_host_task_ids = sorted(
+                {
+                    item["host_task_id"]
+                    for item in active
+                    if isinstance(item.get("host_task_id"), str)
+                    and item["host_task_id"]
+                }
+            )
         run.update(
             {
                 "run_id": task["run_id"],
@@ -3896,6 +4804,9 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
                 "active_host_task_ids": active_host_task_ids,
                 "last_task_id": task["task_id"],
                 "last_checkpoint_path": checkpoint_path,
+                "execution_control": json.loads(
+                    json.dumps(control, ensure_ascii=False)
+                ),
             }
         )
         save_agent_run(project_path, run)
@@ -3908,6 +4819,7 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
                 "active_host_task_ids": active_host_task_ids,
                 "last_task_id": task["task_id"],
                 "last_checkpoint_path": checkpoint_path,
+                "execution_control": control,
                 "updated_at": now_iso(),
             }
         )
@@ -3923,6 +4835,7 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
             },
         )
         save_state(project_path, state)
+        sync_execution_control_to_run(project_path, control)
         response: dict[str, Any] = {
             "ok": True,
             "status": response_status,
@@ -3941,9 +4854,23 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
         project_path, task, candidate_paths
     )
     if candidate_errors:
+        blocker, checkpoint_path = block_agent_acceptance_failure(
+            project_path,
+            state,
+            control,
+            task,
+            task_path,
+            canonical_result_path,
+            candidate_errors,
+        )
         raise ToolError(
             json.dumps(
-                {"error": "candidate_validation_failed", "errors": candidate_errors},
+                {
+                    "error": "candidate_validation_failed",
+                    "errors": candidate_errors,
+                    "blocker_id": blocker["blocker_id"],
+                    "checkpoint_path": checkpoint_path,
+                },
                 ensure_ascii=False,
             )
         )
@@ -3969,6 +4896,11 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
         registered_artifact = json.loads(captured.getvalue())
         project_path, state = load_state(project_path)
         runtime = agent_runtime_state(state)
+        control = agent_runtime.ensure_execution_control(runtime)
+    task["accepted_outputs"] = agent_runtime.accepted_output_records(
+        project_path,
+        candidate_paths,
+    )
     task["status"] = "accepted"
     task["host_task_status"] = "completed"
     task["result_path"] = agent_task_relative_path(
@@ -4000,6 +4932,9 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
             "active_host_task_ids": active_host_task_ids,
             "last_task_id": task["task_id"],
             "last_checkpoint_path": checkpoint_path,
+            "execution_control": json.loads(
+                json.dumps(control, ensure_ascii=False)
+            ),
         }
     )
     save_agent_run(project_path, run)
@@ -4012,6 +4947,7 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
             "active_host_task_ids": active_host_task_ids,
             "last_task_id": task["task_id"],
             "last_checkpoint_path": checkpoint_path,
+            "execution_control": control,
             "updated_at": now_iso(),
         }
     )
@@ -4025,6 +4961,7 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
         },
     )
     save_state(project_path, state)
+    sync_execution_control_to_run(project_path, control)
     response = {
         "ok": True,
         "status": "accepted",
@@ -4040,6 +4977,8 @@ def command_accept_agent_result(args: argparse.Namespace) -> int:
 
 def command_show_agent_runtime(args: argparse.Namespace) -> int:
     project_path, state = load_state(args.project)
+    runtime_state = agent_runtime_state(state)
+    control = agent_runtime.ensure_execution_control(runtime_state)
     paths = agent_runtime.ensure_runtime_directories(project_path)
     run = load_agent_run(project_path)
     checkpoints = sorted(
@@ -4055,8 +4994,8 @@ def command_show_agent_runtime(args: argparse.Namespace) -> int:
             "ok": True,
             "project_root": str(project_path),
             "run": run,
-            "agent_runtime": state.get("agent_runtime")
-            or empty_agent_runtime_state(),
+            "agent_runtime": runtime_state,
+            "execution_control": control,
             "active_tasks": [
                 {
                     "task_id": task.get("task_id"),
@@ -4078,51 +5017,191 @@ def command_show_agent_runtime(args: argparse.Namespace) -> int:
 
 def command_startup_preflight(args: argparse.Namespace) -> int:
     project_path, state = load_state(args.project)
-    validation = validate_state(project_path)
-    if not validation["valid"]:
-        raise ToolError(
-            json.dumps(
-                {
-                    "error": "startup_preflight_state_invalid",
-                    "errors": validation["errors"],
-                },
-                ensure_ascii=False,
+    runtime = agent_runtime_state(state)
+    control, environment, fingerprint = current_execution_context(state)
+    resumed_task_ids: list[str] = []
+    migrated_legacy_task_ids: list[str] = []
+    agent_runtime.lock_execution_mode(
+        control,
+        args.mode,
+        development_task_id=args.development_task_id,
+    )
+    if args.resolve_blocker_id:
+        active_blocker = control.get("active_blocker")
+        if (
+            not isinstance(active_blocker, dict)
+            or active_blocker.get("status") != "active"
+            or active_blocker.get("blocker_id") != args.resolve_blocker_id
+        ):
+            raise agent_runtime.AgentRuntimeError("active_blocker_not_found")
+        if not isinstance(args.resolution_note, str) or not args.resolution_note.strip():
+            raise agent_runtime.AgentRuntimeError(
+                "blocker_resolution_note_required"
             )
-        )
-    agent_runtime.ensure_runtime_directories(project_path)
-    with agent_runtime.project_state_write_lock(project_path):
-        lock_probe = True
+    should_run, rerun_reason = agent_runtime.preflight_action(
+        control, fingerprint
+    )
     required_contracts = (
+        "startup-preflight",
         "plan-agent-slice",
         "accept-agent-result",
         "show-agent-runtime",
     )
-    if not all(hasattr(agent_runtime, name) for name in (
-        "build_task_package",
-        "validate_result_envelope",
-        "make_checkpoint",
-    )):
-        raise ToolError("startup_preflight_runtime_contract_missing")
-    runtime = state.get("agent_runtime")
+    if should_run:
+        environment_errors = agent_runtime.validate_environment_snapshot(
+            environment
+        )
+        if environment_errors:
+            raise ToolError(
+                json.dumps(
+                    {
+                        "error": "startup_preflight_environment_invalid",
+                        "errors": environment_errors,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        validation = validate_state(project_path)
+        if not validation["valid"]:
+            raise ToolError(
+                json.dumps(
+                    {
+                        "error": "startup_preflight_state_invalid",
+                        "errors": validation["errors"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        agent_runtime.ensure_runtime_directories(project_path)
+        with agent_runtime.project_state_write_lock(project_path):
+            lock_probe = True
+        if not all(
+            hasattr(agent_runtime, name)
+            for name in (
+                "build_task_package",
+                "validate_result_envelope",
+                "make_checkpoint",
+                "require_execution_ready",
+                "resolve_delegation_authorization",
+            )
+        ):
+            raise ToolError("startup_preflight_runtime_contract_missing")
+        agent_runtime.mark_preflight_ready(
+            control,
+            fingerprint=fingerprint,
+            environment_snapshot=environment,
+        )
+    else:
+        validation = {"valid": True}
+        lock_probe = True
+    migrated_legacy_task_ids = migrate_legacy_agent_tasks(
+        project_path,
+        state,
+        control,
+    )
+    if args.resolve_blocker_id:
+        resolved_blocker = agent_runtime.resolve_active_blocker(
+            control,
+            blocker_id=args.resolve_blocker_id,
+            resolution_note=args.resolution_note,
+        )
+        resumed_task_ids = resume_tasks_paused_by_blocker(
+            project_path,
+            load_agent_tasks(project_path),
+            resolved_blocker,
+        )
+        append_history(
+            state,
+            "execution_blocker_resolved",
+            {
+                "blocker_id": resolved_blocker["blocker_id"],
+                "severity": resolved_blocker["severity"],
+                "resumed_task_ids": resumed_task_ids,
+            },
+        )
+    active = active_agent_tasks(load_agent_tasks(project_path))
+    active_task_ids = sorted(task["task_id"] for task in active)
+    active_host_task_ids = sorted(
+        {
+            task["host_task_id"]
+            for task in active
+            if isinstance(task.get("host_task_id"), str)
+            and task["host_task_id"]
+        }
+    )
+    orchestration_status = (
+        "blocked"
+        if control.get("status") == "blocked"
+        else "running"
+        if active_task_ids
+        else control["status"]
+    )
+    runtime["execution_control"] = control
+    runtime["status"] = orchestration_status
+    runtime["run_id"] = args.run_id
+    runtime["active_task_ids"] = active_task_ids
+    runtime["active_host_task_ids"] = active_host_task_ids
+    runtime["updated_at"] = now_iso()
+    append_history(
+        state,
+        "startup_preflight_reused" if not should_run else "startup_preflight_completed",
+        {
+            "run_id": args.run_id,
+            "execution_mode": control["execution_mode"],
+            "fingerprint": fingerprint,
+            "rerun_reason": rerun_reason,
+            "preflight_run_count": control["preflight"]["run_count"],
+        },
+    )
+    save_state(project_path, state)
+    run = load_agent_run(project_path)
+    run.update(
+        {
+            "run_id": args.run_id,
+            "status": orchestration_status,
+            "active_task_ids": active_task_ids,
+            "active_host_task_ids": active_host_task_ids,
+            "execution_mode": control.get("execution_mode"),
+            "execution_control": json.loads(
+                json.dumps(control, ensure_ascii=False)
+            ),
+        }
+    )
+    save_agent_run(project_path, run)
     print_json(
         {
             "ok": True,
-            "status": "ready",
+            "status": control["status"],
+            "reused": not should_run,
+            "rerun_reason": rerun_reason,
+            "preflight_run_count": control["preflight"]["run_count"],
+            "execution_mode": control["execution_mode"],
+            "resumed_task_ids": resumed_task_ids,
+            "legacy_tasks_migrated": len(migrated_legacy_task_ids),
+            "migrated_legacy_task_ids": migrated_legacy_task_ids,
             "run_scope": {
                 "runtime_directory": agent_runtime.RUNTIME_DIRECTORY,
                 "run_id": args.run_id,
                 "orchestration_mode": "single_layer_host",
+                "plugin_version": agent_runtime.PLUGIN_VERSION,
+                "runtime_version": agent_runtime.RUNTIME_VERSION,
+                "rule_version": agent_runtime.RULE_VERSION,
             },
             "flow": [
                 "state_read",
                 "runtime_directories",
                 "state_lock",
                 "command_contracts",
+                "execution_mode_lock",
+                "environment_fingerprint",
             ],
             "command_contracts": list(required_contracts),
             "state_valid": validation["valid"],
-            "runtime_initialized": isinstance(runtime, dict),
+            "runtime_initialized": True,
             "lock_probe": lock_probe,
+            "execution_policy": agent_runtime.execution_policy(
+                control["execution_mode"]
+            ),
         }
     )
     return 0
@@ -12301,6 +13380,37 @@ def build_parser() -> argparse.ArgumentParser:
     agent_slice_parser.add_argument("--coordinator-slice", required=True)
     agent_slice_parser.add_argument("--run-id", required=True)
     agent_slice_parser.add_argument(
+        "--stage",
+        choices=tuple(STAGES),
+        help="统一决策身份中的项目阶段；省略时从scope或协调片段推导",
+    )
+    agent_slice_parser.add_argument(
+        "--operation",
+        help="统一决策身份中的操作；省略时使用task-type",
+    )
+    agent_slice_parser.add_argument(
+        "--output-schema-version",
+        type=int,
+        default=1,
+        help="任务输出schema版本，参与统一幂等键",
+    )
+    agent_slice_parser.add_argument(
+        "--delegation-directive",
+        help="用户对当前项目、执行链和阶段的明确委托原话",
+    )
+    agent_slice_parser.add_argument(
+        "--warning",
+        action="append",
+        default=[],
+        help="普通警告代码；记录后继续，可重复传入",
+    )
+    agent_slice_parser.add_argument(
+        "--major-ambiguity",
+        action="append",
+        default=[],
+        help="重大歧义代码；出现后阻断当前执行链，可重复传入",
+    )
+    agent_slice_parser.add_argument(
         "--host-task-id",
         help="主任务创建的一次性工作智能体ID；重复规划时用于绑定当前attempt",
     )
@@ -12365,6 +13475,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight_parser.add_argument("project", help="项目目录")
     preflight_parser.add_argument("--run-id", default="PREFLIGHT")
+    preflight_parser.add_argument(
+        "--mode",
+        choices=tuple(sorted(agent_runtime.SUPPORTED_EXECUTION_MODES)),
+        default="production",
+    )
+    preflight_parser.add_argument(
+        "--development-task-id",
+        help="仅development模式必需的明确开发任务ID",
+    )
+    preflight_parser.add_argument(
+        "--resolve-blocker-id",
+        help="修复完成后显式解除的阻断ID",
+    )
+    preflight_parser.add_argument(
+        "--resolution-note",
+        help="解除阻断的具体修复或澄清说明",
+    )
     preflight_parser.set_defaults(handler=command_startup_preflight)
 
     episode_delivery_parser = subparsers.add_parser(

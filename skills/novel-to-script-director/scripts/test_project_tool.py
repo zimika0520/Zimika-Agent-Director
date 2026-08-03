@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -83,8 +84,15 @@ class ProjectToolTests(unittest.TestCase):
 
     def run_cli(self, *arguments: str) -> tuple[int, dict]:
         output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            code = project_tool.main(arguments)
+        error_output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error_output):
+                code = project_tool.main(arguments)
+        except SystemExit as exc:
+            return int(exc.code or 0), {
+                "ok": False,
+                "error": error_output.getvalue().strip() or "argument_parser_rejected",
+            }
         payload = json.loads(output.getvalue())
         return code, payload
 
@@ -5460,10 +5468,22 @@ class ProjectToolTests(unittest.TestCase):
         service_capacity: int | None = None,
         host_task_id: str | None = None,
         active_host_task_ids: list[str] | None = None,
+        stage: str = "source_analysis",
+        operation: str | None = None,
+        input_content: str = "冻结输入",
+        delegation_directive: str | None = "继续执行",
+        warnings: list[str] | None = None,
+        major_ambiguities: list[str] | None = None,
+        ensure_preflight: bool = True,
     ) -> list[str]:
+        if ensure_preflight:
+            self.ensure_production_preflight()
         input_path = self.write_project_file(
             f"01_原著解析/{input_filename}",
-            json.dumps({"source_unit_id": "SU001", "content": "冻结输入"}, ensure_ascii=False),
+            json.dumps(
+                {"source_unit_id": "SU001", "content": input_content},
+                ensure_ascii=False,
+            ),
         )
         arguments = [
             "plan-agent-slice",
@@ -5485,7 +5505,15 @@ class ProjectToolTests(unittest.TestCase):
             "source_window",
             "--run-id",
             "RUN-TEST-001",
+            "--stage",
+            stage,
+            "--output-schema-version",
+            "1",
         ]
+        if operation is not None:
+            arguments.extend(["--operation", operation])
+        if delegation_directive is not None:
+            arguments.extend(["--delegation-directive", delegation_directive])
         if artifact_key is not None:
             arguments.extend(["--artifact-key", artifact_key])
         if scheduling_mode is not None:
@@ -5498,7 +5526,766 @@ class ProjectToolTests(unittest.TestCase):
             arguments.extend(["--host-task-id", host_task_id])
         for active_host_task_id in active_host_task_ids or []:
             arguments.extend(["--active-host-task-id", active_host_task_id])
+        for warning in warnings or []:
+            arguments.extend(["--warning", warning])
+        for ambiguity in major_ambiguities or []:
+            arguments.extend(["--major-ambiguity", ambiguity])
         return arguments
+
+    def ensure_production_preflight(
+        self,
+        *,
+        run_id: str = "RUN-TEST-001",
+        mode: str = "production",
+        development_task_id: str | None = None,
+    ) -> dict:
+        arguments = [
+            "startup-preflight",
+            str(self.project),
+            "--run-id",
+            run_id,
+            "--mode",
+            mode,
+        ]
+        if development_task_id is not None:
+            arguments.extend(["--development-task-id", development_task_id])
+        code, payload = self.run_cli(*arguments)
+        self.assertEqual(code, 0, payload)
+        return payload
+
+    def test_production_preflight_runs_once_and_reruns_on_environment_change(self) -> None:
+        self.init_project()
+        original_validate_state = project_tool.validate_state
+        with mock.patch.object(
+            project_tool,
+            "validate_state",
+            wraps=original_validate_state,
+        ) as validate_state_mock:
+            with mock.patch.dict(
+                os.environ,
+                {"AI_DIRECTOR_ENVIRONMENT_REVISION": "env-a"},
+                clear=False,
+            ):
+                first = self.ensure_production_preflight()
+                second = self.ensure_production_preflight()
+            with mock.patch.dict(
+                os.environ,
+                {"AI_DIRECTOR_ENVIRONMENT_REVISION": "env-b"},
+                clear=False,
+            ):
+                third = self.ensure_production_preflight()
+
+        self.assertFalse(first["reused"])
+        self.assertEqual(first["preflight_run_count"], 1)
+        self.assertTrue(second["reused"])
+        self.assertEqual(second["preflight_run_count"], 1)
+        self.assertFalse(third["reused"])
+        self.assertEqual(third["preflight_run_count"], 2)
+        self.assertEqual(third["rerun_reason"], "environment_changed")
+        self.assertEqual(validate_state_mock.call_count, 2)
+
+    def test_execution_failure_allows_one_preflight_rerun(self) -> None:
+        self.init_project()
+        first_preflight = self.ensure_production_preflight()
+        self.assertEqual(first_preflight["preflight_run_count"], 1)
+        code, planned = self.run_cli(*self.agent_task_args())
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        failed_result = self.write_agent_result(
+            task,
+            status="failed",
+            error_code="429_too_many_requests",
+        )
+        code, failed = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(failed_result),
+        )
+        self.assertEqual(code, 0, failed)
+        rerun = self.ensure_production_preflight()
+        reused = self.ensure_production_preflight()
+        self.assertFalse(rerun["reused"])
+        self.assertEqual(rerun["rerun_reason"], "execution_failure")
+        self.assertEqual(rerun["preflight_run_count"], 2)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["preflight_run_count"], 2)
+
+    def test_production_mode_locks_and_blocks_development_operations(self) -> None:
+        self.init_project()
+        code, missing_development_task = self.run_cli(
+            "startup-preflight",
+            str(self.project),
+            "--run-id",
+            "RUN-DEV-MISSING",
+            "--mode",
+            "development",
+        )
+        self.assertEqual(code, 2, missing_development_task)
+        self.assertIn(
+            "development_task_id_required",
+            missing_development_task["error"],
+        )
+        preflight = self.ensure_production_preflight()
+        self.assertEqual(preflight["execution_mode"], "production")
+
+        code, rejected_mode = self.run_cli(
+            "startup-preflight",
+            str(self.project),
+            "--run-id",
+            "RUN-TEST-001",
+            "--mode",
+            "development",
+            "--development-task-id",
+            "DEV-001",
+        )
+        self.assertEqual(code, 2, rejected_mode)
+        self.assertIn("execution_mode_locked", rejected_mode["error"])
+
+        code, rejected_task = self.run_cli(
+            *self.agent_task_args(
+                task_type="development_test",
+                operation="development_test",
+            )
+        )
+        self.assertEqual(code, 2, rejected_task)
+        self.assertIn("production_operation_forbidden", rejected_task["error"])
+
+        code, planned = self.run_cli(*self.agent_task_args())
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(task["execution_mode"], "production")
+        self.assertFalse(task["execution_policy"]["source_mutation_allowed"])
+        self.assertFalse(task["execution_policy"]["development_tests_allowed"])
+        self.assertFalse(task["execution_policy"]["design_review_allowed"])
+
+    def test_environment_change_requires_preflight_before_more_planning(self) -> None:
+        self.init_project()
+        with mock.patch.dict(
+            os.environ,
+            {"AI_DIRECTOR_ENVIRONMENT_REVISION": "env-a"},
+            clear=False,
+        ):
+            self.ensure_production_preflight()
+            code, first = self.run_cli(
+                *self.agent_task_args(ensure_preflight=False)
+            )
+            self.assertEqual(code, 0, first)
+        with mock.patch.dict(
+            os.environ,
+            {"AI_DIRECTOR_ENVIRONMENT_REVISION": "env-b"},
+            clear=False,
+        ):
+            code, stale = self.run_cli(
+                *self.agent_task_args(
+                    input_filename="environment_changed.json",
+                    ensure_preflight=False,
+                )
+            )
+            self.assertEqual(code, 2, stale)
+            self.assertIn("execution_preflight_stale", stale["error"])
+            refreshed = self.ensure_production_preflight()
+            self.assertFalse(refreshed["reused"])
+            self.assertEqual(refreshed["rerun_reason"], "environment_changed")
+
+    def test_same_active_planned_task_is_reused_without_duplicate_planning(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+        code, second = self.run_cli(
+            *self.agent_task_args(delegation_directive=None)
+        )
+        self.assertEqual(code, 0, second)
+        self.assertTrue(second["reused"])
+        self.assertEqual(second["reuse_reason"], "active_planned_task_reused")
+        self.assertEqual(second["task_id"], first["task_id"])
+        self.assertTrue(second["authorization_reused"])
+        self.assertEqual(
+            len(list((self.project / ".ai-director/runtime/tasks").glob("*.json"))),
+            1,
+        )
+
+    def test_completed_task_with_missing_output_is_reexecuted(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, planned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate = (
+            self.project / task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}', encoding="utf-8")
+        result = self.write_agent_result(
+            task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 0, accepted)
+        candidate.unlink()
+
+        code, replanned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, replanned)
+        self.assertFalse(replanned["reused"])
+        self.assertEqual(replanned["attempt"], 2)
+        self.assertEqual(replanned["idempotency_key"], task["idempotency_key"])
+        self.assertEqual(
+            replanned["recovered_from_invalid_task_id"],
+            task["task_id"],
+        )
+
+    def test_completed_task_with_changed_output_hash_is_reexecuted(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, planned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate = (
+            self.project / task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}', encoding="utf-8")
+        result = self.write_agent_result(
+            task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 0, accepted)
+        candidate.write_text('{"events":[{"changed":true}]}', encoding="utf-8")
+
+        code, replanned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, replanned)
+        self.assertFalse(replanned["reused"])
+        self.assertEqual(replanned["attempt"], 2)
+        self.assertEqual(
+            replanned["recovered_from_invalid_task_id"],
+            task["task_id"],
+        )
+
+    def test_decision_idempotency_key_includes_versions_contract_and_input_hash(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(input_content="输入A")
+        )
+        self.assertEqual(code, 0, first)
+        first_task = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate = (
+            self.project / first_task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}', encoding="utf-8")
+        result = self.write_agent_result(
+            first_task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            first_task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 0, accepted)
+
+        code, second = self.run_cli(
+            *self.agent_task_args(
+                input_content="输入B",
+                delegation_directive="按方案完成",
+            )
+        )
+        self.assertEqual(code, 0, second)
+        second_task = json.loads(
+            (self.project / second["task_path"]).read_text(encoding="utf-8")
+        )
+        identity = second_task["decision_identity"]
+        self.assertNotEqual(first_task["idempotency_key"], second_task["idempotency_key"])
+        self.assertEqual(identity["project_id"], self.state()["project_id"])
+        self.assertEqual(identity["stage"], "source_analysis")
+        self.assertEqual(identity["operation"], "source_analysis")
+        self.assertEqual(identity["rule_version"], project_tool.agent_runtime.RULE_VERSION)
+        self.assertEqual(identity["runtime_version"], project_tool.agent_runtime.RUNTIME_VERSION)
+        self.assertEqual(identity["plugin_version"], project_tool.agent_runtime.PLUGIN_VERSION)
+        self.assertEqual(identity["output_contract_version"], 1)
+        self.assertEqual(identity["output_schema_version"], 1)
+        self.assertNotEqual(
+            first_task["decision_identity"]["input_hash"],
+            identity["input_hash"],
+        )
+
+    def test_delegation_authorization_reuses_and_invalidates_by_scope(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(delegation_directive="继续执行")
+        )
+        self.assertEqual(code, 0, first)
+        self.assertFalse(first["authorization_reused"])
+        first_authorization_id = first["authorization_id"]
+
+        code, reused = self.run_cli(
+            *self.agent_task_args(delegation_directive=None)
+        )
+        self.assertEqual(code, 0, reused)
+        self.assertTrue(reused["authorization_reused"])
+        self.assertEqual(reused["authorization_id"], first_authorization_id)
+
+        code, changed_input = self.run_cli(
+            *self.agent_task_args(
+                input_content="输入已变化",
+                delegation_directive=None,
+            )
+        )
+        self.assertEqual(code, 2, changed_input)
+        self.assertIn("delegation_authorization_required", changed_input["error"])
+
+        code, changed_stage = self.run_cli(
+            *self.agent_task_args(
+                stage="batch_writing",
+                delegation_directive=None,
+            )
+        )
+        self.assertEqual(code, 2, changed_stage)
+        self.assertIn("delegation_authorization_required", changed_stage["error"])
+
+    def test_negated_delegation_directives_never_create_authorization(self) -> None:
+        for directive in (
+            "不要继续执行",
+            "请勿按方案完成",
+            "不能继续执行",
+            "不应继续执行",
+            "无需继续执行",
+            "do not continue execution",
+            "don't complete as planned",
+            "cannot continue execution",
+            "should not continue execution",
+        ):
+            with self.subTest(directive=directive):
+                self.assertFalse(
+                    project_tool.agent_runtime.directive_is_explicit(directive)
+                )
+
+    def test_negated_delegation_directive_overrides_existing_authorization(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(delegation_directive="继续执行")
+        )
+        self.assertEqual(code, 0, first)
+
+        code, stopped = self.run_cli(
+            *self.agent_task_args(delegation_directive="不要继续执行")
+        )
+        self.assertEqual(code, 2, stopped)
+        self.assertIn("delegation_authorization_required", stopped["error"])
+
+    def test_warning_is_recorded_once_and_does_not_block(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(warnings=["optional_context_missing"])
+        )
+        self.assertEqual(code, 0, first)
+        self.assertEqual(first["warning_count"], 1)
+        code, second = self.run_cli(
+            *self.agent_task_args(
+                warnings=["optional_context_missing"],
+                delegation_directive=None,
+            )
+        )
+        self.assertEqual(code, 0, second)
+        self.assertTrue(second["reused"])
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        notices = runtime["execution_control"]["decision_notices"]
+        warning_notices = [
+            item for item in notices if item["severity"] == "warning"
+        ]
+        self.assertEqual(len(warning_notices), 1)
+        self.assertEqual(warning_notices[0]["occurrence_count"], 2)
+
+    def test_major_ambiguity_blocks_and_pauses_unrelated_active_tasks(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-ACTIVE-001",
+                active_host_task_ids=["HOST-ACTIVE-001"],
+            )
+        )
+        self.assertEqual(code, 0, first)
+
+        code, blocked = self.run_cli(
+            *self.agent_task_args(
+                input_filename="blocked_input.json",
+                input_content="需要重大判断的新输入",
+                delegation_directive="继续执行",
+                major_ambiguities=["missing_required_story_decision"],
+                active_host_task_ids=["HOST-ACTIVE-001"],
+            )
+        )
+        self.assertEqual(code, 2, blocked)
+        self.assertIn("major_ambiguity_blocked", blocked["error"])
+
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(runtime["execution_control"]["status"], "blocked")
+        self.assertEqual(
+            runtime["execution_control"]["active_blocker"]["severity"],
+            "major_ambiguity",
+        )
+        self.assertEqual(runtime["run"]["status"], "blocked")
+        self.assertEqual(runtime["run"]["active_task_ids"], [])
+        self.assertEqual(runtime["agent_runtime"]["status"], "blocked")
+        self.assertEqual(runtime["agent_runtime"]["active_task_ids"], [])
+        first_task = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(first_task["status"], "paused")
+
+        code, unrelated = self.run_cli(
+            *self.agent_task_args(
+                input_filename="unrelated_input.json",
+                input_content="无关并行验证",
+                delegation_directive="继续执行",
+            )
+        )
+        self.assertEqual(code, 2, unrelated)
+        self.assertIn("active_execution_blocker", unrelated["error"])
+
+    def test_candidate_acceptance_failure_blocks_unrelated_tasks(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-INVALID-CANDIDATE",
+                active_host_task_ids=["HOST-INVALID-CANDIDATE"],
+            )
+        )
+        self.assertEqual(code, 0, first)
+        first_task = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        invalid_candidate = (
+            self.project
+            / first_task["allowed_write_directory"]
+            / "invalid.json"
+        )
+        invalid_candidate.parent.mkdir(parents=True, exist_ok=True)
+        invalid_candidate.write_text("not-json", encoding="utf-8")
+        result = self.write_agent_result(
+            first_task,
+            candidate_output_paths=[
+                invalid_candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, rejected = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            first_task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 2, rejected)
+        self.assertIn("candidate_validation_failed", rejected["error"])
+
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        blocker = runtime["execution_control"]["active_blocker"]
+        self.assertEqual(blocker["severity"], "acceptance_failure")
+        blocked_task = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(blocked_task["status"], "acceptance_failed")
+
+        code, unrelated = self.run_cli(
+            *self.agent_task_args(
+                input_filename="after_acceptance_failure.json",
+                input_content="不应继续的新任务",
+            )
+        )
+        self.assertEqual(code, 2, unrelated)
+        self.assertIn("active_execution_blocker", unrelated["error"])
+
+    def test_missing_candidate_in_result_envelope_uses_acceptance_blocker(self) -> None:
+        self.init_project()
+        code, planned = self.run_cli(*self.agent_task_args())
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        result = self.write_agent_result(task, candidate_output_paths=[])
+        code, rejected = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 2, rejected)
+        self.assertIn("candidate_validation_failed", rejected["error"])
+        blocked_task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(blocked_task["status"], "acceptance_failed")
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(
+            runtime["execution_control"]["active_blocker"]["severity"],
+            "acceptance_failure",
+        )
+
+    def test_preflight_rerun_does_not_clear_active_blocker(self) -> None:
+        self.init_project()
+        with mock.patch.dict(
+            os.environ,
+            {"AI_DIRECTOR_ENVIRONMENT_REVISION": "env-a"},
+            clear=False,
+        ):
+            self.ensure_production_preflight()
+            code, blocked = self.run_cli(
+                *self.agent_task_args(
+                    input_filename="blocked_preflight.json",
+                    input_content="需要重大判断",
+                    major_ambiguities=["missing_required_story_decision"],
+                    ensure_preflight=False,
+                )
+            )
+            self.assertEqual(code, 2, blocked)
+        with mock.patch.dict(
+            os.environ,
+            {"AI_DIRECTOR_ENVIRONMENT_REVISION": "env-b"},
+            clear=False,
+        ):
+            code, rerun = self.run_cli(
+                "startup-preflight",
+                str(self.project),
+                "--run-id",
+                "RUN-TEST-001",
+                "--mode",
+                "production",
+            )
+        self.assertEqual(code, 0, rerun)
+        self.assertEqual(rerun["rerun_reason"], "environment_changed")
+        self.assertEqual(rerun["status"], "blocked")
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(runtime["execution_control"]["status"], "blocked")
+        self.assertIsNotNone(runtime["execution_control"]["active_blocker"])
+
+    def test_resolving_blocker_reactivates_paused_task_from_checkpoint(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-PAUSED-001",
+                active_host_task_ids=["HOST-PAUSED-001"],
+            )
+        )
+        self.assertEqual(code, 0, first)
+        code, blocked = self.run_cli(
+            *self.agent_task_args(
+                input_filename="recovery_blocker.json",
+                input_content="需要重大判断",
+                major_ambiguities=["missing_required_story_decision"],
+                active_host_task_ids=["HOST-PAUSED-001"],
+            )
+        )
+        self.assertEqual(code, 2, blocked)
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        blocker_id = runtime["execution_control"]["active_blocker"]["blocker_id"]
+
+        code, resolved = self.run_cli(
+            "startup-preflight",
+            str(self.project),
+            "--run-id",
+            "RUN-TEST-001",
+            "--mode",
+            "production",
+            "--resolve-blocker-id",
+            blocker_id,
+            "--resolution-note",
+            "必需决策已经补齐",
+        )
+        self.assertEqual(code, 0, resolved)
+        self.assertEqual(resolved["status"], "execution_ready")
+        self.assertEqual(resolved["resumed_task_ids"], [first["task_id"]])
+        code, resumed_runtime = self.run_cli(
+            "show-agent-runtime", str(self.project)
+        )
+        self.assertEqual(code, 0, resumed_runtime)
+        self.assertEqual(resumed_runtime["run"]["status"], "running")
+        self.assertEqual(
+            resumed_runtime["run"]["active_task_ids"], [first["task_id"]]
+        )
+        self.assertEqual(resumed_runtime["agent_runtime"]["status"], "running")
+        self.assertEqual(
+            resumed_runtime["agent_runtime"]["active_task_ids"],
+            [first["task_id"]],
+        )
+
+        paused_task = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(paused_task["status"], "planned")
+        self.assertEqual(paused_task["host_task_status"], "unbound")
+        self.assertEqual(paused_task["recovery_state"], "none")
+        checkpoint_path = self.project / paused_task["last_checkpoint_path"]
+        self.assertTrue(checkpoint_path.is_file())
+        checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        self.assertEqual(checkpoint["status"], "recovery_required")
+
+        code, resumed = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-RESUMED-001",
+                active_host_task_ids=["HOST-RESUMED-001"],
+                delegation_directive=None,
+                ensure_preflight=False,
+            )
+        )
+        self.assertEqual(code, 0, resumed)
+        self.assertTrue(resumed["reused"])
+        self.assertEqual(resumed["task_id"], first["task_id"])
+        self.assertEqual(resumed["reuse_reason"], "active_host_task_reused")
+        self.assertEqual(resumed["checkpoint_path"], paused_task["last_checkpoint_path"])
+
+    def test_failed_preflight_does_not_resolve_blocker_or_resume_tasks(self) -> None:
+        self.init_project()
+        code, first = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-PREFLIGHT-FAILURE",
+                active_host_task_ids=["HOST-PREFLIGHT-FAILURE"],
+            )
+        )
+        self.assertEqual(code, 0, first)
+        code, blocked = self.run_cli(
+            *self.agent_task_args(
+                input_filename="failed_preflight_blocker.json",
+                input_content="需要重大判断",
+                major_ambiguities=["missing_required_story_decision"],
+                active_host_task_ids=["HOST-PREFLIGHT-FAILURE"],
+            )
+        )
+        self.assertEqual(code, 2, blocked)
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        blocker_id = runtime["execution_control"]["active_blocker"]["blocker_id"]
+
+        with mock.patch.dict(
+            os.environ,
+            {"AI_DIRECTOR_ENVIRONMENT_REVISION": "invalid-environment"},
+            clear=False,
+        ), mock.patch.object(
+            project_tool.agent_runtime,
+            "PLUGIN_VERSION",
+            "0.8.90",
+        ):
+            code, failed = self.run_cli(
+                "startup-preflight",
+                str(self.project),
+                "--run-id",
+                "RUN-TEST-001",
+                "--mode",
+                "production",
+                "--resolve-blocker-id",
+                blocker_id,
+                "--resolution-note",
+                "尝试修复但环境仍无效",
+            )
+        self.assertEqual(code, 2, failed)
+        self.assertIn("startup_preflight_environment_invalid", failed["error"])
+
+        blocked_task = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(blocked_task["status"], "paused")
+        code, after = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, after)
+        self.assertEqual(
+            after["execution_control"]["active_blocker"]["blocker_id"],
+            blocker_id,
+        )
+        self.assertEqual(after["execution_control"]["status"], "blocked")
+
+    def test_repeated_accept_invalidates_missing_accepted_output(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, planned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate = (
+            self.project / task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}', encoding="utf-8")
+        result = self.write_agent_result(
+            task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 0, accepted)
+        candidate.unlink()
+
+        code, rejected = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 2, rejected)
+        self.assertIn("accepted_result_invalidated", rejected["error"])
+        invalidated = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(invalidated["status"], "invalidated")
+
+        code, replanned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, replanned)
+        self.assertEqual(replanned["attempt"], 2)
+        self.assertEqual(replanned["idempotency_key"], task["idempotency_key"])
 
     def write_agent_result(
         self,
@@ -5600,6 +6387,16 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(code, 2, rejected)
         self.assertIn("candidate_output_path_forbidden", rejected["error"])
+        blocked_task = json.loads(
+            (self.project / payload["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(blocked_task["status"], "acceptance_failed")
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(
+            runtime["execution_control"]["active_blocker"]["severity"],
+            "acceptance_failure",
+        )
 
     def test_agent_task_stops_after_two_failures_and_writes_checkpoint(self) -> None:
         self.init_project()
@@ -5651,10 +6448,19 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(failed2["status"], "blocked")
         self.assertTrue(failed2["checkpoint_path"])
         self.assertTrue((self.project / failed2["checkpoint_path"]).is_file())
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(runtime["run"]["active_task_ids"], [])
+        self.assertEqual(runtime["agent_runtime"]["active_task_ids"], [])
+        self.assertEqual(runtime["execution_control"]["status"], "blocked")
+        self.assertEqual(
+            runtime["execution_control"]["active_blocker"]["severity"],
+            "execution_failure",
+        )
 
         code, blocked = self.run_cli(*arguments)
         self.assertEqual(code, 2, blocked)
-        self.assertIn("two_failures", blocked["error"])
+        self.assertIn("active_execution_blocker", blocked["error"])
 
     def test_accept_agent_result_registers_one_artifact_and_separates_runtime_timing(self) -> None:
         self.init_project()
@@ -5767,6 +6573,12 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(code, 0, runtime)
         self.assertEqual(runtime["run"]["active_host_task_ids"], [])
         self.assertEqual(runtime["agent_runtime"]["active_host_task_ids"], [])
+        self.assertEqual(runtime["run"]["status"], "completed")
+        self.assertEqual(runtime["agent_runtime"]["status"], "completed")
+        self.assertEqual(
+            runtime["execution_control"]["status"],
+            "execution_ready",
+        )
 
     def test_plan_agent_slice_distinguishes_independent_tasks_and_serial_conflicts(self) -> None:
         self.init_project()
@@ -5892,6 +6704,142 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(task2["status"], "blocked")
         self.assertEqual(task2["recovery_state"], "blocked")
+        code, runtime = self.run_cli("show-agent-runtime", str(self.project))
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(runtime["run"]["active_task_ids"], [])
+        self.assertEqual(runtime["agent_runtime"]["active_task_ids"], [])
+        self.assertEqual(runtime["execution_control"]["status"], "blocked")
+        self.assertEqual(
+            runtime["execution_control"]["active_blocker"]["severity"],
+            "host_task_lost",
+        )
+        code, unrelated = self.run_cli(
+            *self.agent_task_args(
+                input_filename="after_host_loss.json",
+                input_content="阻断后不应继续",
+            )
+        )
+        self.assertEqual(code, 2, unrelated)
+        self.assertIn("active_execution_blocker", unrelated["error"])
+
+    def test_startup_preflight_migrates_v089_completed_task_without_regeneration(self) -> None:
+        self.init_project()
+        input_path = self.write_project_file(
+            "01_原著解析/legacy_input.json",
+            json.dumps(
+                {"source_unit_id": "SU001", "content": "冻结输入"},
+                ensure_ascii=False,
+            ),
+        )
+        input_ref = {
+            "artifact_key": "source_corpus",
+            "version": 1,
+            "path": input_path.relative_to(self.project).as_posix(),
+            "sha256": project_tool.sha256_file(input_path),
+        }
+        scope = {"batch_id": "B01", "episode_id": "E001"}
+        legacy_key = project_tool.agent_runtime.canonical_sha256(
+            {
+                "task_type": "episode_script",
+                "scope": scope,
+                "input_refs": [
+                    {
+                        "artifact_key": input_ref["artifact_key"],
+                        "version": input_ref["version"],
+                        "sha256": input_ref["sha256"],
+                    }
+                ],
+                "contract_version": 1,
+            }
+        )
+        task_id = project_tool.agent_runtime.task_id_for(legacy_key, 1)
+        write_directory = (
+            f"{project_tool.agent_runtime.RUNTIME_DIRECTORY}/candidates/{task_id}"
+        )
+        candidate = self.write_project_file(
+            f"{write_directory}/analysis.json",
+            '{"events":[]}',
+        )
+        legacy_task = {
+            "schema_version": 1,
+            "run_id": "RUN-TEST-001",
+            "task_id": task_id,
+            "task_type": "episode_script",
+            "scope": scope,
+            "attempt": 1,
+            "max_attempts": 2,
+            "idempotency_key": legacy_key,
+            "contract_version": 1,
+            "input_refs": [input_ref],
+            "allowed_read_paths": [input_ref["path"]],
+            "allowed_write_directory": write_directory,
+            "acceptance_command": "schema-only",
+            "artifact_key": None,
+            "return_max_chars": 1000,
+            "context_inheritance": "none",
+            "max_parallel_tasks": 2,
+            "effective_parallel_limit": 2,
+            "service_capacity": 2,
+            "scheduling_mode": "independent",
+            "scheduling_key": project_tool.agent_runtime.canonical_sha256(scope),
+            "single_state_writer": True,
+            "state_write_policy": "supervisor_only",
+            "supervisor_mode": "single_layer_host",
+            "coordinator_slice": "source_window",
+            "host_task_id": None,
+            "host_task_status": "completed",
+            "recovery_state": "none",
+            "status": "accepted",
+            "created_at": project_tool.now_iso(),
+        }
+        task_path = project_tool.agent_runtime.task_path_for(self.project, task_id)
+        project_tool.agent_runtime.atomic_write_json(task_path, legacy_task)
+        legacy_result = project_tool.agent_runtime.build_result_envelope(
+            task_id=task_id,
+            idempotency_key=legacy_key,
+            status="completed",
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+            telemetry={
+                "machine_time_seconds": 0,
+                "model_time_seconds": 0,
+                "agent_time_seconds": 0,
+                "human_wait_seconds": 0,
+                "reconnect_wait_seconds": 0,
+                "error_class": "none",
+            },
+        )
+        project_tool.agent_runtime.atomic_write_json(
+            project_tool.agent_runtime.result_path_for(self.project, task_id),
+            legacy_result,
+        )
+
+        preflight = self.ensure_production_preflight()
+        self.assertEqual(preflight["legacy_tasks_migrated"], 1)
+        migrated = json.loads(task_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["legacy_idempotency_key"], legacy_key)
+        self.assertIn("decision_identity", migrated)
+        self.assertTrue(migrated["accepted_outputs"])
+
+        code, reused = self.run_cli(
+            *self.agent_task_args(
+                task_type="episode_script",
+                scope=scope,
+                input_filename="legacy_input.json",
+                stage="batch_writing",
+                delegation_directive="继续执行",
+                ensure_preflight=False,
+            )
+        )
+        self.assertEqual(code, 0, reused)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["reuse_reason"], "completed_result_reused")
+        self.assertEqual(reused["task_id"], task_id)
+        self.assertEqual(
+            len(list((self.project / ".ai-director/runtime/tasks").glob("*.json"))),
+            1,
+        )
 
     def test_accept_agent_result_rejects_abandoned_older_attempt(self) -> None:
         self.init_project()
@@ -5972,10 +6920,19 @@ class ProjectToolTests(unittest.TestCase):
             "RUN-PREFLIGHT-001",
         )
         self.assertEqual(code, 0, payload)
-        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["status"], "execution_ready")
+        self.assertFalse(payload["reused"])
+        self.assertEqual(payload["execution_mode"], "production")
         self.assertEqual(
             payload["flow"],
-            ["state_read", "runtime_directories", "state_lock", "command_contracts"],
+            [
+                "state_read",
+                "runtime_directories",
+                "state_lock",
+                "command_contracts",
+                "execution_mode_lock",
+                "environment_fingerprint",
+            ],
         )
         self.assertTrue(
             (self.project / ".ai-director/runtime/tasks").is_dir()

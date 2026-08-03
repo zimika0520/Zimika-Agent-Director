@@ -52,15 +52,19 @@ AI 视频执行层不是新的编剧阶段，而是逐集解锁的纯文字适�
 `--coordinator-slice`为兼容既有任务包保留，只表示来源窗口、单集剧本、制作提取或批次收尾等逻辑业务片段，不表示第二级协调智能体。
 
 ```bash
-python3 <技能目录>/scripts/project_tool.py startup-preflight <项目目录>
+# 正式小说生产：模式在首次预检时锁定
+python3 <技能目录>/scripts/project_tool.py startup-preflight \
+  <项目目录> --mode production --run-id RUN-001
 
 # 第一次规划生成不可变任务包
 python3 <技能目录>/scripts/project_tool.py plan-agent-slice \
   <项目目录> --task-type source_analysis \
   --scope-json '{"source_unit_id":"SU001"}' \
   --input-ref source_corpus@1=01_原著解析/原著语料V1.json \
+  --stage source_analysis --operation source_analysis \
   --contract-version 1 --acceptance-command schema-only \
-  --coordinator-slice source_window --run-id RUN-001
+  --output-schema-version 1 --coordinator-slice source_window \
+  --run-id RUN-001 --delegation-directive "继续执行"
 
 # 主任务用 fork_context:false 创建工作智能体，获得宿主ID后绑定当前attempt
 python3 <技能目录>/scripts/project_tool.py plan-agent-slice \
@@ -74,17 +78,34 @@ python3 <技能目录>/scripts/project_tool.py accept-agent-result \
 python3 <技能目录>/scripts/project_tool.py show-agent-runtime <项目目录>
 ```
 
+- 正常小说执行只能使用`production`。只有明确的插件开发任务可以使用`--mode development --development-task-id <开发任务ID>`；模式和开发任务ID锁定后不能切换。生产模式拒绝`development_test`、`design_review`、`skill_edit`和`source_edit`。
+- `startup-preflight`的指纹覆盖插件版本、Skill、两个运行入口文件、Python/平台和显式环境版本。指纹不变且没有新的执行失败时复用`execution_ready`；环境变化会在下一次规划时报`execution_preflight_stale`，重跑后才能继续。
+- 统一决策身份由`project_id + stage + operation + input_hash + target_hash + rule/runtime/plugin version + output contract/schema version`组成。它同时驱动任务幂等键和委托授权作用域。
+- “继续执行”“按方案完成”等明确指令只授权当前项目、执行链、阶段、操作、输入和目标；任一作用域变化后必须重新授权。该授权不能放行内容新增、缺失输入、重大歧义或验收失败。
 - 任务包不继承会话历史，只读取冻结的 `input_refs` 和允许路径；相同任务类型、范围、输入版本/散列与契约版本只生成一个有效结果。
 - 主任务每次调用`plan-agent-slice`时必须通过可重复的`--active-host-task-id`传入全部仍存活的工作智能体ID。只有宿主ID仍活动、存在有效结果或存在有效检查点时，活动任务才可复用。
 - `planned/running`任务失去宿主、结果和检查点时，工具将其标记为`abandoned/recovery_required`并写检查点，再以相同幂等键创建attempt 2；第二次仍失联时标记`blocked`。旧attempt晚到结果不能登记。
+- v0.8.8/v0.8.9旧任务在`startup-preflight`中迁移模式、授权和统一决策身份；由于旧契约没有阶段字段，首次`plan-agent-slice`用当前真实阶段重绑定决策键。旧结果信封可继续验收，但正式结果统一写入新幂等键。
+- 已完成任务只有在全部接受产物仍存在、大小和SHA-256一致且基础验收命令继续通过时才能复用；否则旧任务标记失效并保留原幂等键进入下一受控attempt。
 - 默认并发为 2；`--max-parallel-tasks`、`--service-capacity` 可配置，调度器只并行不同调度键的独立任务。相邻集剧本、连续性、全局归一和状态写入保持串行。
-- 候选结果先由 CLI 校验，再登记 `awaiting_approval`；智能体不得直接写 `project_state.json`。所有状态读改写都经过项目状态锁和原子落盘。
+- 普通警告按内容、规则和授权作用域去重记录后继续；重大歧义由`plan-agent-slice`、候选验收失败由`accept-agent-result`自动创建活动阻断，连续失败也自动阻断，均立即暂停无关任务并写任务级检查点，不存在单独的“创建阻断”命令。
+- 候选结果先由 CLI 校验，再登记 `awaiting_approval`；验收失败的任务标记`acceptance_failed/recovery_required`，不能登记制品。智能体不得直接写 `project_state.json`。所有状态读改写都经过项目状态锁和原子落盘。
 - `429_too_many_requests`、`stream_disconnect_without_completion`、`context_window_exceeded` 分别进入限流退避、全新智能体重连、缩小上下文恢复策略；同一任务连续失败两次后写入检查点并阻断。
 - 用户说“继续”时先读取 `show-agent-runtime` 和最近检查点，复用已完成结果，不重新读取相同上下文或重复生成。
 
+阻断修复后由主任务显式解除：
+
+```bash
+python3 <技能目录>/scripts/project_tool.py startup-preflight \
+  <项目目录> --mode production --run-id RUN-001 \
+  --resolve-blocker-id <阻断ID> --resolution-note <修复说明>
+```
+
+被阻断暂停但自身未失败的任务恢复原任务包、检查点和活动租约；失败任务继续使用原幂等键受控恢复。`startup-preflight`重跑环境检查不能清除仍活动的阻断。
+
 ### 编排接口冻结
 
-自2026-08-03起，四个运行时入口、任务包、结果信封、幂等键、宿主任务绑定、检查点状态、项目状态锁、串行/独立调度和两次失败阻断为冻结兼容面。新增流程只能复用这些接口；不得让工作智能体直接写状态、绕过候选验收、改变幂等键组成或把失联任务无限标记为活动。
+自2026-08-03 v0.8.91起，四个运行时入口、执行模式、预检指纹、任务包、结果信封、统一决策身份、委托授权、阻断状态、宿主任务绑定、检查点状态、项目状态锁、串行/独立调度和两次失败阻断为冻结兼容面。新增流程只能复用这些接口；不得让工作智能体直接写状态、绕过候选验收、改变幂等键组成或把失联任务无限标记为活动。
 
 ### 校验与故事板复用
 

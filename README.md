@@ -2,7 +2,7 @@
 
 把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.9`
+当前版本：`0.8.91`
 
 ## 它能做什么
 
@@ -21,6 +21,11 @@
 - 长任务由主任务直接调度不继承历史的一次性工作智能体；完整内容写入项目候选文件，不回流主上下文。
 - 任务规划具备幂等键、检查点和受控恢复；已完成结果不会重复生成，失联或失败最多尝试两次。
 - 独立任务可按可配置容量并发，串行任务和`project_state.json`写入保持互斥。
+- 生产任务与开发任务在启动时锁定模式；生产模式禁止修改源码、Skill、运行开发测试或重新做设计审核。
+- 生产预检按插件、运行时、Skill、入口和环境指纹只执行一次；版本/环境变化或实际执行失败后才重跑。
+- 用户的明确继续指令按项目、执行链、阶段、输入和目标复用；输入、目标、规则或阶段变化后自动失效。
+- 普通警告去重记录后继续；重大歧义、候选验收失败和连续失败立即阻断无关任务并从检查点恢复。
+- v0.8.8/v0.8.9运行时任务在首次预检时迁移，并在首次新规划时按真实阶段重绑定统一决策键；已完成且校验有效的结果不重新生成。
 - 单次校验命令共享依赖DAG结果、已加载状态和JSON payload；文件版本或散列变化会在新运行中重新校验。
 - 相同分镜输入只生成一次HTML，两个交付位置通过输入指纹缓存和原子复制保持一致。
 
@@ -41,21 +46,32 @@ flowchart LR
 
 ## 全局编排运行时
 
-生产任务开始前运行最小预演，再由主任务直接创建、等待和关闭工作智能体：
+正式处理小说时先锁定生产模式并运行一次预检，再由主任务直接创建、等待和关闭工作智能体：
 
 ```bash
-python3 skills/novel-to-script-director/scripts/project_tool.py startup-preflight <项目目录>
+python3 skills/novel-to-script-director/scripts/project_tool.py startup-preflight \
+  <项目目录> --mode production --run-id RUN-001
 python3 skills/novel-to-script-director/scripts/project_tool.py plan-agent-slice <项目目录> \
   --task-type source_analysis --scope-json '{"source_unit_id":"SU001"}' \
   --input-ref source_corpus@1=01_原著解析/原著语料V1.json \
+  --stage source_analysis --operation source_analysis \
   --contract-version 1 --acceptance-command schema-only \
-  --coordinator-slice source_window --run-id RUN-001
+  --output-schema-version 1 --coordinator-slice source_window \
+  --run-id RUN-001 --delegation-directive "继续执行"
 python3 skills/novel-to-script-director/scripts/project_tool.py accept-agent-result \
   <项目目录> --task-id <任务ID> --result <项目内结果信封.json>
 python3 skills/novel-to-script-director/scripts/project_tool.py show-agent-runtime <项目目录>
 ```
 
 工作智能体只能读取任务包允许路径，只能写入`.ai-director/runtime/candidates/`下的任务目录。CLI负责候选校验、制品登记、检查点和项目状态写入，不直接调用模型。
+
+`production`是小说生产默认模式。模式一经锁定不能在同一项目执行链中切换；只有明确的插件开发任务才能使用`--mode development --development-task-id <开发任务ID>`。生产任务包会拒绝`development_test`、`design_review`、`skill_edit`和`source_edit`操作。
+
+预检结果记录在现有`project_state.json -> agent_runtime.execution_control`中，不建立第二套状态文件。环境未变化且没有新的执行失败时复用`execution_ready`；插件、Skill、入口、Python/平台或显式环境版本变化后，下一次规划先报预检失效，重跑后再继续。
+
+统一决策幂等键包含项目身份、阶段、操作、输入散列、目标范围、规则版本、运行时/插件版本及输出契约/schema版本。已接受结果只有在文件存在、散列一致且基础校验通过时才复用；否则沿用原幂等键进入受控恢复。
+
+普通警告只记录一次并继续。重大歧义或候选验收失败会创建活动阻断、暂停无关任务并写检查点；修复后用`startup-preflight --resolve-blocker-id <阻断ID> --resolution-note <说明>`解除，原任务从检查点恢复。笼统的“继续执行”只授权当前执行动作，不能替代新增故事事实所需的具体`change_authorization`。
 
 校验缓存只存在于单次命令的内存中，不跨命令持久化；它按制品键、版本、文件散列和依赖闭包签名复用已完成的依赖结论。故事板缓存位于项目自己的`.ai-director/runtime/render-cache/storyboards/`，按分镜计划及相关锚点、台词表、项目规格的版本和散列生成指纹。输入变化后使用新指纹重新渲染，缓存目录不进入最终交付包。
 
@@ -229,7 +245,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8.9 新增5项重复工作回归测试；定向测试38项、候选完整测试186项。
+v0.8.91 新增20项生产执行控制回归测试；编排、幂等、检查点、恢复、串并行和门禁相关定向测试33项通过。
 
 ## 更新记录
 

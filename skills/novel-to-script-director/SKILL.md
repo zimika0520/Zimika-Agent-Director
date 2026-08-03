@@ -67,9 +67,19 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 6. 展示进度卡：`当前阶段 / 已完成 / 待确认或阻塞 / 下一步`。
 7. `delivery_target` 含 `ai_video`，或用户要求执行层时，完整读取 [ai-video-production.md](references/ai-video-production.md)；涉及 Seedance 具体接口时再读 [seedance-compatibility.md](references/seedance-compatibility.md)，先核对模型能力快照，再处理文字执行层。
 
+## 生产执行与开发隔离
+
+- 正常处理小说一律使用`startup-preflight <项目目录> --mode production --run-id <执行链ID>`。模式在当前项目执行链首次预检时锁定；执行期间不得修改插件源码、Skill、运行开发测试或重新做设计审核。
+- 只有用户明确下达插件开发任务时才使用`--mode development --development-task-id <开发任务ID>`。同一执行控制不能从`production`切换到`development`，也不能更换已锁定的开发任务ID。
+- 预检指纹覆盖插件版本、Skill、`agent_runtime.py`、`project_tool.py`、Python/平台和显式环境版本。首次通过后记录`execution_ready`；指纹不变且没有新的执行失败时直接复用。版本/环境变化或实际执行失败后必须重新预检，其他原因不得反复预演。
+- `plan-agent-slice`的统一决策身份包含项目、阶段、操作、输入散列、目标范围、规则版本、运行时/插件版本和输出契约/schema版本。活动任务直接复用；已完成任务只有在产物存在、散列一致且基础校验通过时复用，否则保留原幂等键受控恢复。
+- 用户明确说“继续执行”“按方案完成”等，只形成当前项目、当前执行链、当前阶段、当前输入和目标的委托授权；输入、目标、规则、阶段或执行链变化后授权失效。委托授权不能替代新增故事事实的`change_authorization`，也不能绕过输入缺失、重大歧义或产物验收失败。
+- 普通警告按同一内容、规则和授权作用域去重记录后继续。重大歧义由`plan-agent-slice`、候选验收失败由`accept-agent-result`自动创建活动阻断、暂停无关任务并写检查点，不需要额外的阻断命令；连续失败同样自动阻断。阻断期间不得继续规划、并行验证或创建同类智能体。
+- 修复后使用`startup-preflight --resolve-blocker-id <阻断ID> --resolution-note <修复说明>`解除阻断。被暂停但未失败的任务恢复原任务包和租约；验收失败或失联任务按原幂等键从检查点受控恢复，旧attempt不能形成第二个有效结果。
+
 ## 任意长度小说与受控并发
 
-不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体；工作智能体只写独立候选文件，由主任务调用CLI验收和登记。生产任务开始前运行 `startup-preflight`；实际规划、验收和恢复统一使用 `plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。`coordinator_slice`只表示逻辑业务片段，不创建第二级协调智能体。主任务必须回传当前活动宿主任务ID；缺少宿主、结果和检查点的活动任务进入`abandoned/recovery_required`，以相同幂等键最多受控重试一次，旧attempt不得形成第二个有效结果。同一顶层校验命令必须复用运行级依赖DAG与JSON payload缓存；该缓存不得跨命令持久化，文件版本或散列变化必须重新校验。
+不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体；工作智能体只写独立候选文件，由主任务调用CLI验收和登记。实际规划、验收和恢复统一使用 `plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。`coordinator_slice`只表示逻辑业务片段，不创建第二级协调智能体。主任务必须回传当前活动宿主任务ID；缺少宿主、结果和检查点的活动任务进入`abandoned/recovery_required`，以相同幂等键最多受控重试一次，旧attempt不得形成第二个有效结果。同一顶层校验命令必须复用运行级依赖DAG与JSON payload缓存；该缓存不得跨命令持久化，文件版本或散列变化必须重新校验。
 
 生产来源分析必须维护`chapter_analysis_registry`和`rolling_source_progress`。相同`source_unit_id + content_sha256 + analysis_contract_version`不得重复分析；下一批先复用carryover，再从`next_read_start`规划新章节。使用`register-source-analysis`登记新的registry文件，使用`plan-rolling-source-window`生成增量窗口。所有输入输出必须位于显式项目根目录内。
 
