@@ -5236,6 +5236,693 @@ class ProjectToolTests(unittest.TestCase):
         self.assertFalse(any("test_" in path for path in paths))
         self.assertFalse(any("docs/superpowers/plans" in path for path in paths))
 
+    def agent_task_args(
+        self,
+        *,
+        task_type: str = "source_analysis",
+        acceptance_command: str = "schema-only",
+        artifact_key: str | None = None,
+        scope: dict | None = None,
+        input_filename: str = "agent_input.json",
+        scheduling_mode: str | None = None,
+        max_parallel_tasks: int | None = None,
+        service_capacity: int | None = None,
+        host_task_id: str | None = None,
+        active_host_task_ids: list[str] | None = None,
+    ) -> list[str]:
+        input_path = self.write_project_file(
+            f"01_原著解析/{input_filename}",
+            json.dumps({"source_unit_id": "SU001", "content": "冻结输入"}, ensure_ascii=False),
+        )
+        arguments = [
+            "plan-agent-slice",
+            str(self.project),
+            "--task-type",
+            task_type,
+            "--scope-json",
+            json.dumps(
+                scope
+                or {"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU001"}
+            ),
+            "--input-ref",
+            f"source_corpus@1={input_path}",
+            "--contract-version",
+            "1",
+            "--acceptance-command",
+            acceptance_command,
+            "--coordinator-slice",
+            "source_window",
+            "--run-id",
+            "RUN-TEST-001",
+        ]
+        if artifact_key is not None:
+            arguments.extend(["--artifact-key", artifact_key])
+        if scheduling_mode is not None:
+            arguments.extend(["--scheduling-mode", scheduling_mode])
+        if max_parallel_tasks is not None:
+            arguments.extend(["--max-parallel-tasks", str(max_parallel_tasks)])
+        if service_capacity is not None:
+            arguments.extend(["--service-capacity", str(service_capacity)])
+        if host_task_id is not None:
+            arguments.extend(["--host-task-id", host_task_id])
+        for active_host_task_id in active_host_task_ids or []:
+            arguments.extend(["--active-host-task-id", active_host_task_id])
+        return arguments
+
+    def write_agent_result(
+        self,
+        task: dict,
+        *,
+        status: str = "completed",
+        candidate_output_paths: list[str] | None = None,
+        error_code: str | None = None,
+        telemetry: dict | None = None,
+    ) -> Path:
+        result_path = self.project / "tmp" / f"{task['task_id']}-worker-result.json"
+        payload = {
+            "schema_version": 1,
+            "task_id": task["task_id"],
+            "idempotency_key": task["idempotency_key"],
+            "status": status,
+            "candidate_output_paths": candidate_output_paths or [],
+            "error_code": error_code,
+            "telemetry": telemetry
+            or {
+                "machine_time_seconds": 1.0,
+                "model_time_seconds": 2.0,
+                "agent_time_seconds": 3.0,
+                "human_wait_seconds": 4.0,
+                "reconnect_wait_seconds": 5.0,
+                "error_class": "none" if status == "completed" else error_code,
+            },
+        }
+        return self.write_project_file(
+            result_path.relative_to(self.project).as_posix(),
+            json.dumps(payload, ensure_ascii=False),
+        )
+
+    def test_plan_agent_slice_freezes_context_and_reuses_completed_result(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, payload = self.run_cli(*arguments)
+        self.assertEqual(code, 0, payload)
+        self.assertFalse(payload["reused"])
+        task_path = self.project / payload["task_path"]
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        self.assertEqual(task["context_inheritance"], "none")
+        self.assertEqual(task["max_parallel_tasks"], 2)
+        self.assertTrue(task["single_state_writer"])
+        self.assertEqual(task["state_write_policy"], "supervisor_only")
+        self.assertEqual(task["supervisor_mode"], "single_layer_host")
+        self.assertIsNone(task["host_task_id"])
+        self.assertEqual(task["attempt"], 1)
+        self.assertTrue(task["input_refs"][0]["sha256"])
+        candidate_dir = self.project / task["allowed_write_directory"]
+        candidate = candidate_dir / "analysis.json"
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text(json.dumps({"events": []}), encoding="utf-8")
+        result_path = self.write_agent_result(
+            task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result_path),
+        )
+        self.assertEqual(code, 0, accepted)
+        self.assertEqual(accepted["status"], "accepted")
+
+        code, reused = self.run_cli(*arguments)
+        self.assertEqual(code, 0, reused)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["task_id"], task["task_id"])
+        self.assertEqual(
+            len(list((self.project / ".ai-director/runtime/tasks").glob("*.json"))),
+            1,
+        )
+
+    def test_accept_agent_result_rejects_candidate_outside_frozen_write_scope(self) -> None:
+        self.init_project()
+        code, payload = self.run_cli(*self.agent_task_args())
+        self.assertEqual(code, 0, payload)
+        task = json.loads(
+            (self.project / payload["task_path"]).read_text(encoding="utf-8")
+        )
+        outside = self.write_project_file("tmp/outside.json", '{"events":[]}')
+        result_path = self.write_agent_result(
+            task,
+            candidate_output_paths=[outside.relative_to(self.project).as_posix()],
+        )
+        code, rejected = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result_path),
+        )
+        self.assertEqual(code, 2, rejected)
+        self.assertIn("candidate_output_path_forbidden", rejected["error"])
+
+    def test_agent_task_stops_after_two_failures_and_writes_checkpoint(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, payload = self.run_cli(*arguments)
+        self.assertEqual(code, 0, payload)
+        task1 = json.loads(
+            (self.project / payload["task_path"]).read_text(encoding="utf-8")
+        )
+        result1 = self.write_agent_result(
+            task1,
+            status="failed",
+            error_code="429_too_many_requests",
+        )
+        code, failed1 = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task1["task_id"],
+            "--result",
+            str(result1),
+        )
+        self.assertEqual(code, 0, failed1)
+        self.assertEqual(failed1["status"], "retryable")
+        self.assertEqual(failed1["next_attempt"], 2)
+
+        code, payload = self.run_cli(*arguments)
+        self.assertEqual(code, 0, payload)
+        self.assertFalse(payload["reused"])
+        task2 = json.loads(
+            (self.project / payload["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(task2["attempt"], 2)
+        self.assertEqual(task2["idempotency_key"], task1["idempotency_key"])
+        result2 = self.write_agent_result(
+            task2,
+            status="failed",
+            error_code="stream_disconnect_without_completion",
+        )
+        code, failed2 = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task2["task_id"],
+            "--result",
+            str(result2),
+        )
+        self.assertEqual(code, 0, failed2)
+        self.assertEqual(failed2["status"], "blocked")
+        self.assertTrue(failed2["checkpoint_path"])
+        self.assertTrue((self.project / failed2["checkpoint_path"]).is_file())
+
+        code, blocked = self.run_cli(*arguments)
+        self.assertEqual(code, 2, blocked)
+        self.assertIn("two_failures", blocked["error"])
+
+    def test_accept_agent_result_registers_one_artifact_and_separates_runtime_timing(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args(
+            task_type="episode_script",
+            acceptance_command="validate-script",
+            artifact_key="episode_script:E001",
+        )
+        code, payload = self.run_cli(*arguments)
+        self.assertEqual(code, 0, payload)
+        task = json.loads(
+            (self.project / payload["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate_dir = self.project / task["allowed_write_directory"]
+        candidate = candidate_dir / "E001.md"
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text(GOOD_SCRIPT, encoding="utf-8")
+        result_path = self.write_agent_result(
+            task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result_path),
+            "--artifact-key",
+            "episode_script:E001",
+            "--artifact-status",
+            "awaiting_approval",
+        )
+        self.assertEqual(code, 0, accepted)
+        self.assertEqual(accepted["registered_artifact"]["version"], 1)
+
+        runtime = self.state()["agent_runtime"]
+        self.assertEqual(
+            set(runtime["timing_totals"]),
+            {
+                "machine_time_seconds",
+                "model_time_seconds",
+                "agent_time_seconds",
+                "human_wait_seconds",
+                "reconnect_wait_seconds",
+            },
+        )
+        self.assertEqual(
+            runtime["error_counts"],
+            {},
+        )
+
+        code, reused = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result_path),
+            "--artifact-key",
+            "episode_script:E001",
+            "--artifact-status",
+            "awaiting_approval",
+        )
+        self.assertEqual(code, 0, reused)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(len(self.state()["artifacts"]["episode_script:E001"]), 1)
+
+    def test_accept_agent_result_clears_completed_host_task(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, planned = self.run_cli(*arguments)
+        self.assertEqual(code, 0, planned)
+        code, bound = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-WORKER-COMPLETE",
+                active_host_task_ids=["HOST-WORKER-COMPLETE"],
+            )
+        )
+        self.assertEqual(code, 0, bound)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate = (
+            self.project / task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}', encoding="utf-8")
+        result = self.write_agent_result(
+            task,
+            candidate_output_paths=[
+                candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result),
+        )
+        self.assertEqual(code, 0, accepted)
+        code, runtime = self.run_cli(
+            "show-agent-runtime",
+            str(self.project),
+        )
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(runtime["run"]["active_host_task_ids"], [])
+        self.assertEqual(runtime["agent_runtime"]["active_host_task_ids"], [])
+
+    def test_plan_agent_slice_distinguishes_independent_tasks_and_serial_conflicts(self) -> None:
+        self.init_project()
+        first_args = self.agent_task_args(
+            scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU001"},
+            scheduling_mode="independent",
+            max_parallel_tasks=4,
+            service_capacity=3,
+        )
+        code, first = self.run_cli(*first_args)
+        self.assertEqual(code, 0, first)
+        self.assertEqual(first["effective_parallel_limit"], 3)
+        code, first_bound = self.run_cli(
+            *self.agent_task_args(
+                scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU001"},
+                scheduling_mode="independent",
+                max_parallel_tasks=4,
+                service_capacity=3,
+                host_task_id="HOST-WORKER-001",
+                active_host_task_ids=["HOST-WORKER-001"],
+            )
+        )
+        self.assertEqual(code, 0, first_bound)
+        self.assertEqual(first_bound["reuse_reason"], "active_host_task_reused")
+
+        second_args = self.agent_task_args(
+            scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU002"},
+            input_filename="agent_input_2.json",
+            scheduling_mode="independent",
+            max_parallel_tasks=4,
+            service_capacity=3,
+            active_host_task_ids=["HOST-WORKER-001"],
+        )
+        code, second = self.run_cli(*second_args)
+        self.assertEqual(code, 0, second)
+        self.assertFalse(second["reused"])
+        self.assertEqual(second["active_task_count"], 2)
+        code, second_bound = self.run_cli(
+            *self.agent_task_args(
+                scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU002"},
+                input_filename="agent_input_2.json",
+                scheduling_mode="independent",
+                max_parallel_tasks=4,
+                service_capacity=3,
+                host_task_id="HOST-WORKER-002",
+                active_host_task_ids=["HOST-WORKER-001", "HOST-WORKER-002"],
+            )
+        )
+        self.assertEqual(code, 0, second_bound)
+
+        serial_args = self.agent_task_args(
+            scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU003"},
+            input_filename="agent_input_3.json",
+            scheduling_mode="serial",
+            active_host_task_ids=["HOST-WORKER-001", "HOST-WORKER-002"],
+        )
+        code, rejected = self.run_cli(*serial_args)
+        self.assertEqual(code, 2, rejected)
+        self.assertIn("serial_task_conflict", rejected["error"])
+
+    def test_plan_agent_slice_recovers_hostless_active_task_once(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+        task1_path = self.project / first["task_path"]
+
+        code, bound = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-WORKER-001",
+                active_host_task_ids=["HOST-WORKER-001"],
+            )
+        )
+        self.assertEqual(code, 0, bound)
+        self.assertTrue(bound["reused"])
+        self.assertEqual(bound["reuse_reason"], "active_host_task_reused")
+        self.assertEqual(bound["host_task_id"], "HOST-WORKER-001")
+
+        code, recovered = self.run_cli(*arguments)
+        self.assertEqual(code, 0, recovered)
+        self.assertFalse(recovered["reused"])
+        self.assertEqual(recovered["attempt"], 2)
+        self.assertEqual(recovered["recovered_from_task_id"], first["task_id"])
+        self.assertTrue((self.project / recovered["checkpoint_path"]).is_file())
+
+        task1 = json.loads(task1_path.read_text(encoding="utf-8"))
+        self.assertEqual(task1["status"], "abandoned")
+        self.assertEqual(task1["recovery_state"], "recovery_required")
+        checkpoint = json.loads(
+            (self.project / recovered["checkpoint_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(checkpoint["status"], "recovery_required")
+        self.assertEqual(recovered["idempotency_key"], first["idempotency_key"])
+
+    def test_plan_agent_slice_blocks_after_two_hostless_attempts(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+        code, _bound1 = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-WORKER-001",
+                active_host_task_ids=["HOST-WORKER-001"],
+            )
+        )
+        self.assertEqual(code, 0, _bound1)
+        code, second = self.run_cli(*arguments)
+        self.assertEqual(code, 0, second)
+        self.assertEqual(second["attempt"], 2)
+        code, _bound2 = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-WORKER-002",
+                active_host_task_ids=["HOST-WORKER-002"],
+            )
+        )
+        self.assertEqual(code, 0, _bound2)
+
+        code, blocked = self.run_cli(*arguments)
+        self.assertEqual(code, 2, blocked)
+        self.assertIn("two_abandoned_attempts_blocked", blocked["error"])
+        task2 = json.loads(
+            (self.project / second["task_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(task2["status"], "blocked")
+        self.assertEqual(task2["recovery_state"], "blocked")
+
+    def test_accept_agent_result_rejects_abandoned_older_attempt(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+        code, _bound = self.run_cli(
+            *self.agent_task_args(
+                host_task_id="HOST-WORKER-001",
+                active_host_task_ids=["HOST-WORKER-001"],
+            )
+        )
+        self.assertEqual(code, 0, _bound)
+        code, second = self.run_cli(*arguments)
+        self.assertEqual(code, 0, second)
+
+        task1 = json.loads(
+            (self.project / first["task_path"]).read_text(encoding="utf-8")
+        )
+        old_candidate = (
+            self.project / task1["allowed_write_directory"] / "late-analysis.json"
+        )
+        old_candidate.parent.mkdir(parents=True, exist_ok=True)
+        old_candidate.write_text('{"events":[]}', encoding="utf-8")
+        old_result = self.write_agent_result(
+            task1,
+            candidate_output_paths=[
+                old_candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, rejected = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task1["task_id"],
+            "--result",
+            str(old_result),
+        )
+        self.assertEqual(code, 2, rejected)
+        self.assertIn("stale_attempt_result_rejected", rejected["error"])
+        self.assertFalse(
+            project_tool.agent_runtime.result_path_for(
+                self.project, task1["task_id"]
+            ).exists()
+        )
+
+        task2 = json.loads(
+            (self.project / second["task_path"]).read_text(encoding="utf-8")
+        )
+        new_candidate = (
+            self.project / task2["allowed_write_directory"] / "analysis.json"
+        )
+        new_candidate.parent.mkdir(parents=True, exist_ok=True)
+        new_candidate.write_text('{"events":[]}', encoding="utf-8")
+        new_result = self.write_agent_result(
+            task2,
+            candidate_output_paths=[
+                new_candidate.relative_to(self.project).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task2["task_id"],
+            "--result",
+            str(new_result),
+        )
+        self.assertEqual(code, 0, accepted)
+        self.assertEqual(accepted["status"], "accepted")
+
+    def test_startup_preflight_runs_minimum_flow_without_model_or_novel_name(self) -> None:
+        self.init_project()
+        code, payload = self.run_cli(
+            "startup-preflight",
+            str(self.project),
+            "--run-id",
+            "RUN-PREFLIGHT-001",
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(
+            payload["flow"],
+            ["state_read", "runtime_directories", "state_lock", "command_contracts"],
+        )
+        self.assertTrue(
+            (self.project / ".ai-director/runtime/tasks").is_dir()
+        )
+        self.assertNotIn("测试项目", payload["run_scope"])
+
+    def test_error_recovery_policy_keeps_429_stream_and_context_distinct(self) -> None:
+        runtime = project_tool.agent_runtime
+        self.assertEqual(
+            runtime.recovery_policy_for("429_too_many_requests")["action"],
+            "rate_limit_backoff",
+        )
+        self.assertEqual(
+            runtime.recovery_policy_for("stream_disconnect_without_completion")["action"],
+            "fresh_agent_reconnect",
+        )
+        self.assertEqual(
+            runtime.recovery_policy_for("context_window_exceeded")["action"],
+            "fresh_agent_reduced_context",
+        )
+
+    def test_project_state_lock_is_reentrant_for_single_writer_helpers(self) -> None:
+        self.init_project()
+        with project_tool.agent_runtime.project_state_write_lock(self.project):
+            with project_tool.agent_runtime.project_state_write_lock(self.project):
+                self.assertTrue((self.project / project_tool.STATE_FILENAME).is_file())
+
+    def test_isolated_minimum_workflow_closure_and_runtime_resume(self) -> None:
+        self.create_ready_project()
+        project_root = self.project.resolve()
+        script_record = self.state()["artifacts"]["episode_script:E001"][-1]
+        script_path = project_root / script_record["path"]
+
+        validation = project_tool.validate_script_file(script_path)
+        self.assertTrue(validation["valid"], validation)
+        scenes, cues = project_tool.extract_script_index(
+            script_path,
+            "episode_script:E001",
+        )
+        self.assertEqual(len(scenes), 1)
+        self.assertEqual(len(cues), 2)
+
+        code, payload = self.run_cli(
+            "validate-project", str(project_root)
+        )
+        self.assertEqual(code, 0, payload)
+        code, payload = self.run_cli(
+            "validate-breakdowns",
+            str(project_root),
+            "--expected-episodes",
+            "1",
+        )
+        self.assertEqual(code, 0, payload)
+
+        self.register_ai_layer_prerequisites()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划_闭环.json",
+            json.dumps(self.shot_plan_payload(), ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        self.approve_shot_plan_with_review(plan_version)
+        code, delivery = self.run_cli(
+            "render-episode-delivery",
+            str(project_root),
+            "E001",
+        )
+        self.assertEqual(code, 0, delivery)
+        output_dir = project_root / "09_定稿交付/分集交付/E001"
+        docx_path = output_dir / "E001_剧本.docx"
+        html_path = output_dir / "E001_故事板.html"
+        self.assertTrue(docx_path.is_file())
+        self.assertTrue(html_path.is_file())
+        self.assertEqual(docx_path.parent, output_dir)
+        self.assertIn("景别：", html_path.read_text(encoding="utf-8"))
+
+        first_args = self.agent_task_args(
+            task_type="source_analysis",
+            scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU001"},
+            input_filename="closure_input_1.json",
+            scheduling_mode="independent",
+        )
+        code, first_plan = self.run_cli(*first_args)
+        self.assertEqual(code, 0, first_plan)
+        first_task = json.loads(
+            (project_root / first_plan["task_path"]).read_text(encoding="utf-8")
+        )
+        code, first_bound = self.run_cli(
+            *self.agent_task_args(
+                task_type="source_analysis",
+                scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU001"},
+                input_filename="closure_input_1.json",
+                scheduling_mode="independent",
+                host_task_id="HOST-CLOSURE-001",
+                active_host_task_ids=["HOST-CLOSURE-001"],
+            )
+        )
+        self.assertEqual(code, 0, first_bound)
+
+        second_args = self.agent_task_args(
+            task_type="source_analysis",
+            scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU002"},
+            input_filename="closure_input_2.json",
+            scheduling_mode="independent",
+            active_host_task_ids=["HOST-CLOSURE-001"],
+        )
+        code, second_plan = self.run_cli(*second_args)
+        self.assertEqual(code, 0, second_plan)
+        self.assertEqual(second_plan["active_task_count"], 2)
+        code, second_bound = self.run_cli(
+            *self.agent_task_args(
+                task_type="source_analysis",
+                scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU002"},
+                input_filename="closure_input_2.json",
+                scheduling_mode="independent",
+                host_task_id="HOST-CLOSURE-002",
+                active_host_task_ids=["HOST-CLOSURE-001", "HOST-CLOSURE-002"],
+            )
+        )
+        self.assertEqual(code, 0, second_bound)
+
+        candidate = (
+            project_root / first_task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}\n', encoding="utf-8")
+        result_path = self.write_agent_result(
+            first_task,
+            candidate_output_paths=[
+                candidate.relative_to(project_root).as_posix()
+            ],
+        )
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(project_root),
+            "--task-id",
+            first_task["task_id"],
+            "--result",
+            str(result_path),
+        )
+        self.assertEqual(code, 0, accepted)
+        code, resumed = self.run_cli(
+            *self.agent_task_args(
+                task_type="source_analysis",
+                scope={"batch_id": "B01", "episode_id": "E001", "source_unit_id": "SU001"},
+                input_filename="closure_input_1.json",
+                scheduling_mode="independent",
+                active_host_task_ids=["HOST-CLOSURE-002"],
+            )
+        )
+        self.assertEqual(code, 0, resumed)
+        self.assertTrue(resumed["reused"])
+        code, runtime = self.run_cli(
+            "show-agent-runtime", str(project_root)
+        )
+        self.assertEqual(code, 0, runtime)
+        self.assertEqual(runtime["run"]["active_task_ids"], [second_plan["task_id"]])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,6 +45,47 @@ AI 视频执行层不是新的编剧阶段，而是逐集解锁的纯文字适�
 3. 优先处理阻塞和失效制品，不跳到后续生成。
 4. 只读取当前阶段所需原著片段和制品。
 
+## 全局智能体编排运行时
+
+长任务采用单层宿主编排：主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体。`project_tool.py`只规划、校验、验收和更新运行状态，不创建智能体、不调用模型。运行目录固定派生自当前项目根目录的 `.ai-director/runtime/`，不进入最终交付包。
+
+`--coordinator-slice`为兼容既有任务包保留，只表示来源窗口、单集剧本、制作提取或批次收尾等逻辑业务片段，不表示第二级协调智能体。
+
+```bash
+python3 <技能目录>/scripts/project_tool.py startup-preflight <项目目录>
+
+# 第一次规划生成不可变任务包
+python3 <技能目录>/scripts/project_tool.py plan-agent-slice \
+  <项目目录> --task-type source_analysis \
+  --scope-json '{"source_unit_id":"SU001"}' \
+  --input-ref source_corpus@1=01_原著解析/原著语料V1.json \
+  --contract-version 1 --acceptance-command schema-only \
+  --coordinator-slice source_window --run-id RUN-001
+
+# 主任务用 fork_context:false 创建工作智能体，获得宿主ID后绑定当前attempt
+python3 <技能目录>/scripts/project_tool.py plan-agent-slice \
+  <项目目录> <与第一次完全相同的任务参数> \
+  --host-task-id <宿主工作智能体ID> \
+  --active-host-task-id <宿主工作智能体ID>
+
+# 等待并关闭工作智能体后验收结果
+python3 <技能目录>/scripts/project_tool.py accept-agent-result \
+  <项目目录> --task-id <任务ID> --result <项目内结果信封.json>
+python3 <技能目录>/scripts/project_tool.py show-agent-runtime <项目目录>
+```
+
+- 任务包不继承会话历史，只读取冻结的 `input_refs` 和允许路径；相同任务类型、范围、输入版本/散列与契约版本只生成一个有效结果。
+- 主任务每次调用`plan-agent-slice`时必须通过可重复的`--active-host-task-id`传入全部仍存活的工作智能体ID。只有宿主ID仍活动、存在有效结果或存在有效检查点时，活动任务才可复用。
+- `planned/running`任务失去宿主、结果和检查点时，工具将其标记为`abandoned/recovery_required`并写检查点，再以相同幂等键创建attempt 2；第二次仍失联时标记`blocked`。旧attempt晚到结果不能登记。
+- 默认并发为 2；`--max-parallel-tasks`、`--service-capacity` 可配置，调度器只并行不同调度键的独立任务。相邻集剧本、连续性、全局归一和状态写入保持串行。
+- 候选结果先由 CLI 校验，再登记 `awaiting_approval`；智能体不得直接写 `project_state.json`。所有状态读改写都经过项目状态锁和原子落盘。
+- `429_too_many_requests`、`stream_disconnect_without_completion`、`context_window_exceeded` 分别进入限流退避、全新智能体重连、缩小上下文恢复策略；同一任务连续失败两次后写入检查点并阻断。
+- 用户说“继续”时先读取 `show-agent-runtime` 和最近检查点，复用已完成结果，不重新读取相同上下文或重复生成。
+
+### 编排接口冻结
+
+自2026-08-03起，四个运行时入口、任务包、结果信封、幂等键、宿主任务绑定、检查点状态、项目状态锁、串行/独立调度和两次失败阻断为冻结兼容面。新增流程只能复用这些接口；不得让工作智能体直接写状态、绕过候选验收、改变幂等键组成或把失联任务无限标记为活动。
+
 ## 分层索引与全剧骨架
 
 - `SourceEventIndex.units[].granularity` 使用 `unit_detail` 或 `chapter_summary`。前者记录完整事件因果、行动、结果和状态变化；后者用于先建立章节级摘要，只强制事件摘要与原著引用。

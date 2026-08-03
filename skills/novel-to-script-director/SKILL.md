@@ -69,7 +69,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 ## 任意长度小说与受控并发
 
-不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。并发工作者只写独立文件，由单一合并者登记规范制品。
+不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体；工作智能体只写独立候选文件，由主任务调用CLI验收和登记。生产任务开始前运行 `startup-preflight`；实际规划、验收和恢复统一使用 `plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。`coordinator_slice`只表示逻辑业务片段，不创建第二级协调智能体。主任务必须回传当前活动宿主任务ID；缺少宿主、结果和检查点的活动任务进入`abandoned/recovery_required`，以相同幂等键最多受控重试一次，旧attempt不得形成第二个有效结果。
 
 生产来源分析必须维护`chapter_analysis_registry`和`rolling_source_progress`。相同`source_unit_id + content_sha256 + analysis_contract_version`不得重复分析；下一批先复用carryover，再从`next_read_start`规划新章节。使用`register-source-analysis`登记新的registry文件，使用`plan-rolling-source-window`生成增量窗口。所有输入输出必须位于显式项目根目录内。
 

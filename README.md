@@ -2,7 +2,7 @@
 
 把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.6`
+当前版本：`0.8.8`
 
 ## 它能做什么
 
@@ -18,6 +18,9 @@
 - 章节分析按章节哈希和契约版本幂等登记，后续批次优先复用carryover。
 - `rolling_batch`允许最终总集数未知，并要求显式用户确认后才能扩展批次。
 - 文学剧本区分现场人物与非现场说话人，并识别电话声音、VO、OS和屏幕声音，防止口述cue被漏计。
+- 长任务由主任务直接调度不继承历史的一次性工作智能体；完整内容写入项目候选文件，不回流主上下文。
+- 任务规划具备幂等键、检查点和受控恢复；已完成结果不会重复生成，失联或失败最多尝试两次。
+- 独立任务可按可配置容量并发，串行任务和`project_state.json`写入保持互斥。
 
 ## 工作流
 
@@ -33,6 +36,24 @@ flowchart LR
     H --> I[跨批连续性终检]
     I --> J[全剧最终交付包]
 ```
+
+## 全局编排运行时
+
+生产任务开始前运行最小预演，再由主任务直接创建、等待和关闭工作智能体：
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py startup-preflight <项目目录>
+python3 skills/novel-to-script-director/scripts/project_tool.py plan-agent-slice <项目目录> \
+  --task-type source_analysis --scope-json '{"source_unit_id":"SU001"}' \
+  --input-ref source_corpus@1=01_原著解析/原著语料V1.json \
+  --contract-version 1 --acceptance-command schema-only \
+  --coordinator-slice source_window --run-id RUN-001
+python3 skills/novel-to-script-director/scripts/project_tool.py accept-agent-result \
+  <项目目录> --task-id <任务ID> --result <项目内结果信封.json>
+python3 skills/novel-to-script-director/scripts/project_tool.py show-agent-runtime <项目目录>
+```
+
+工作智能体只能读取任务包允许路径，只能写入`.ai-director/runtime/candidates/`下的任务目录。CLI负责候选校验、制品登记、检查点和项目状态写入，不直接调用模型。
 
 ## 安装到 Codex
 
@@ -171,6 +192,7 @@ skills/novel-to-script-director/
 ├── references/
 └── scripts/
     ├── project_tool.py
+    ├── agent_runtime.py
     └── test_project_tool.py
 ```
 
@@ -203,7 +225,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8.6 完整测试：`168/168` 通过。
+v0.8.8 候选新增13项全局编排定向测试；候选完整测试集合共181项。
 
 ## 更新记录
 

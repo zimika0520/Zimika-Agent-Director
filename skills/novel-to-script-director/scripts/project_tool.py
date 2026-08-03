@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -25,6 +27,7 @@ from typing import Any, Iterable
 
 import source_partition
 import shot_contracts
+import agent_runtime
 
 
 SCHEMA_VERSION = 1
@@ -863,8 +866,30 @@ def load_state(project: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def save_state(project_path: Path, state: dict[str, Any]) -> None:
-    state["updated_at"] = now_iso()
-    atomic_write_json(project_path / STATE_FILENAME, state)
+    with agent_runtime.project_state_write_lock(project_path):
+        state["updated_at"] = now_iso()
+        atomic_write_json(project_path / STATE_FILENAME, state)
+
+
+def empty_agent_runtime_state() -> dict[str, Any]:
+    return {
+        "schema_version": agent_runtime.SCHEMA_VERSION,
+        "orchestration_mode": "single_layer_host",
+        "status": "idle",
+        "run_id": None,
+        "coordinator_slice": None,
+        "active_task_ids": [],
+        "active_host_task_ids": [],
+        "last_task_id": None,
+        "last_checkpoint_path": None,
+        "timing_totals": {
+            field: 0.0 for field in agent_runtime.TIMING_FIELDS
+        },
+        "error_counts": {},
+        "max_parallel_tasks": agent_runtime.DEFAULT_MAX_PARALLEL_TASKS,
+        "service_capacity": agent_runtime.DEFAULT_MAX_PARALLEL_TASKS,
+        "updated_at": now_iso(),
+    }
 
 
 def safe_relative_path(path: Path, project_path: Path) -> str:
@@ -1922,6 +1947,7 @@ def command_init(args: argparse.Namespace) -> int:
         "batches": {},
         "artifacts": {},
         "approvals": [],
+        "agent_runtime": empty_agent_runtime_state(),
         "history": [
             {
                 "event_id": str(uuid.uuid4()),
@@ -2259,7 +2285,12 @@ def command_register_artifact(args: argparse.Namespace) -> int:
         )
     version = max(versions, default=0) + 1
     dependencies = [parse_dependency(value, state) for value in args.depends_on]
-    validate_dependency_shape(args.artifact_key, dependencies)
+    if not (
+        getattr(args, "_runtime_candidate", False)
+        and not dependencies
+        and args.status == "awaiting_approval"
+    ):
+        validate_dependency_shape(args.artifact_key, dependencies)
     registered_at = now_iso()
     record: dict[str, Any] = {
         "version": version,
@@ -2776,6 +2807,1086 @@ def command_build_production_context_manifest(args: argparse.Namespace) -> int:
     output = resolve_project_output(project_path, args.output)
     atomic_write_json(output, payload)
     print_json({"ok": True, "output": str(output), "allowed_path_count": len(allowed)})
+    return 0
+
+
+def agent_runtime_task_files(project_path: Path) -> list[Path]:
+    paths = agent_runtime.ensure_runtime_directories(project_path)
+    return sorted(paths["tasks"].glob("*.json"))
+
+
+def load_agent_tasks(project_path: Path) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for path in agent_runtime_task_files(project_path):
+        try:
+            task = agent_runtime.read_json(path)
+        except agent_runtime.AgentRuntimeError as exc:
+            raise ToolError(str(exc)) from exc
+        task["_path"] = path
+        tasks.append(task)
+    return tasks
+
+
+def save_loaded_agent_task(task: dict[str, Any]) -> None:
+    path = task.get("_path")
+    if not isinstance(path, Path):
+        raise ToolError("agent_task_internal_path_missing")
+    payload = {
+        key: value
+        for key, value in task.items()
+        if not key.startswith("_")
+    }
+    agent_runtime.atomic_write_json(path, payload)
+
+
+def agent_task_relative_path(project_path: Path, path: Path) -> str:
+    return path.resolve().relative_to(project_path.resolve()).as_posix()
+
+
+def agent_scope_from_json(raw_scope: str) -> dict[str, Any]:
+    try:
+        scope = json.loads(raw_scope)
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"--scope-json 必须是 JSON 对象：{exc}") from exc
+    if not isinstance(scope, dict):
+        raise ToolError("--scope-json 顶层必须是 JSON 对象")
+    return scope
+
+
+def agent_input_refs_from_args(
+    project_path: Path, raw_refs: list[str]
+) -> list[dict[str, Any]]:
+    if not raw_refs:
+        raise ToolError("至少需要一个 --input-ref 冻结任务输入")
+    refs: list[dict[str, Any]] = []
+    for raw_ref in raw_refs:
+        if "=" not in raw_ref or "@" not in raw_ref.split("=", 1)[0]:
+            raise ToolError(
+                "--input-ref 格式必须是 artifact_key@version=项目内文件路径"
+            )
+        left, raw_path = raw_ref.split("=", 1)
+        artifact_key, raw_version = left.rsplit("@", 1)
+        try:
+            version = int(raw_version)
+        except ValueError as exc:
+            raise ToolError(f"输入制品版本必须是整数：{raw_ref}") from exc
+        if not artifact_key or version < 1:
+            raise ToolError(f"输入制品引用无效：{raw_ref}")
+        path = resolve_project_input(project_path, raw_path)
+        refs.append(
+            {
+                "artifact_key": artifact_key,
+                "version": version,
+                "path": safe_relative_path(path, project_path),
+                "sha256": sha256_file(path),
+            }
+        )
+    return refs
+
+
+def active_agent_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        task
+        for task in tasks
+        if task.get("status") in {"planned", "running"}
+    ]
+
+
+def agent_runtime_state(state: dict[str, Any]) -> dict[str, Any]:
+    runtime = state.get("agent_runtime")
+    if not isinstance(runtime, dict):
+        runtime = empty_agent_runtime_state()
+        state["agent_runtime"] = runtime
+    runtime.setdefault("schema_version", agent_runtime.SCHEMA_VERSION)
+    runtime.setdefault("orchestration_mode", "single_layer_host")
+    runtime.setdefault("status", "idle")
+    runtime.setdefault("active_task_ids", [])
+    runtime.setdefault("active_host_task_ids", [])
+    runtime.setdefault("timing_totals", {})
+    runtime.setdefault("error_counts", {})
+    for field in agent_runtime.TIMING_FIELDS:
+        runtime["timing_totals"].setdefault(field, 0.0)
+    return runtime
+
+
+def load_agent_run(project_path: Path) -> dict[str, Any]:
+    path = agent_runtime.runtime_paths(project_path)["run"]
+    if not path.is_file():
+        return {
+            "schema_version": agent_runtime.SCHEMA_VERSION,
+            "status": "idle",
+            "active_task_ids": [],
+        }
+    try:
+        return agent_runtime.read_json(path)
+    except agent_runtime.AgentRuntimeError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def save_agent_run(project_path: Path, run: dict[str, Any]) -> str:
+    run["updated_at"] = now_iso()
+    path = agent_runtime.runtime_paths(project_path)["run"]
+    agent_runtime.atomic_write_json(path, run)
+    return agent_task_relative_path(project_path, path)
+
+
+def write_agent_checkpoint(
+    project_path: Path,
+    *,
+    run_id: str,
+    task_id: str | None,
+    idempotency_key: str | None,
+    status: str,
+    next_step: str,
+    active_task_ids: list[str],
+    result_path: str | None = None,
+    failure_count: int = 0,
+) -> str:
+    checkpoint = agent_runtime.make_checkpoint(
+        run_id=run_id,
+        task_id=task_id,
+        idempotency_key=idempotency_key,
+        status=status,
+        next_step=next_step,
+        active_task_ids=active_task_ids,
+        result_path=result_path,
+        failure_count=failure_count,
+    )
+    path = agent_runtime.checkpoint_path_for(
+        project_path, run_id, task_id, status
+    )
+    agent_runtime.atomic_write_json(path, checkpoint)
+    return agent_task_relative_path(project_path, path)
+
+
+def valid_agent_result(
+    project_path: Path, task: dict[str, Any]
+) -> tuple[Path, dict[str, Any]] | None:
+    path = agent_runtime.result_path_for(project_path, task["task_id"])
+    if not path.is_file():
+        return None
+    try:
+        result = agent_runtime.read_json(path)
+    except agent_runtime.AgentRuntimeError:
+        return None
+    if agent_runtime.validate_result_envelope(task, result, project_path):
+        return None
+    return path, result
+
+
+def valid_agent_checkpoint(
+    project_path: Path, task: dict[str, Any]
+) -> tuple[Path, dict[str, Any]] | None:
+    paths = agent_runtime.runtime_paths(project_path)
+    checkpoints = sorted(
+        paths["checkpoints"].glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in checkpoints:
+        try:
+            checkpoint = agent_runtime.read_json(path)
+        except agent_runtime.AgentRuntimeError:
+            continue
+        if (
+            checkpoint.get("schema_version") == agent_runtime.SCHEMA_VERSION
+            and checkpoint.get("task_id") == task.get("task_id")
+            and checkpoint.get("idempotency_key") == task.get("idempotency_key")
+        ):
+            return path, checkpoint
+    return None
+
+
+def mark_agent_task_hostless(
+    project_path: Path,
+    task: dict[str, Any],
+    active_task_ids: list[str],
+) -> dict[str, Any]:
+    final_attempt = int(task.get("attempt", 0)) >= int(
+        task.get("max_attempts", 2)
+    )
+    task["status"] = "blocked" if final_attempt else "abandoned"
+    task["host_task_status"] = "inactive"
+    task["recovery_state"] = "blocked" if final_attempt else "recovery_required"
+    task["updated_at"] = now_iso()
+    checkpoint_status = "blocked" if final_attempt else "recovery_required"
+    checkpoint_path = write_agent_checkpoint(
+        project_path,
+        run_id=task["run_id"],
+        task_id=task["task_id"],
+        idempotency_key=task["idempotency_key"],
+        status=checkpoint_status,
+        next_step=(
+            "同一幂等任务已连续两次失去宿主工作智能体，停止自动派发"
+            if final_attempt
+            else "由主任务使用同一幂等键创建下一次受控工作智能体"
+        ),
+        active_task_ids=active_task_ids,
+        failure_count=int(task.get("attempt", 0)),
+    )
+    task["last_checkpoint_path"] = checkpoint_path
+    save_loaded_agent_task(task)
+    return {
+        "task_id": task["task_id"],
+        "idempotency_key": task["idempotency_key"],
+        "attempt": task["attempt"],
+        "status": task["status"],
+        "checkpoint_path": checkpoint_path,
+    }
+
+
+def persist_agent_reconciliation(
+    project_path: Path,
+    state: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+) -> None:
+    if not records:
+        return
+    active = active_agent_tasks(tasks)
+    active_ids = sorted(task["task_id"] for task in active)
+    active_host_task_ids = sorted(
+        {
+            task["host_task_id"]
+            for task in active
+            if isinstance(task.get("host_task_id"), str)
+            and task["host_task_id"]
+        }
+    )
+    last = records[-1]
+    status = "blocked" if last["status"] == "blocked" else "recovery_required"
+    run = load_agent_run(project_path)
+    run.update(
+        {
+            "status": status,
+            "active_task_ids": active_ids,
+            "active_host_task_ids": active_host_task_ids,
+            "last_task_id": last["task_id"],
+            "last_checkpoint_path": last["checkpoint_path"],
+        }
+    )
+    save_agent_run(project_path, run)
+    runtime = agent_runtime_state(state)
+    runtime.update(
+        {
+            "orchestration_mode": "single_layer_host",
+            "status": status,
+            "active_task_ids": active_ids,
+            "active_host_task_ids": active_host_task_ids,
+            "last_task_id": last["task_id"],
+            "last_checkpoint_path": last["checkpoint_path"],
+            "updated_at": now_iso(),
+        }
+    )
+    for record in records:
+        append_history(state, "agent_task_host_lost", record)
+    save_state(project_path, state)
+
+
+def update_agent_timing_and_errors(
+    runtime: dict[str, Any], telemetry: dict[str, Any]
+) -> None:
+    totals = runtime.setdefault("timing_totals", {})
+    for field in agent_runtime.TIMING_FIELDS:
+        value = telemetry.get(field, 0.0)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            totals[field] = float(totals.get(field, 0.0)) + float(value)
+    error_class = telemetry.get("error_class")
+    if error_class and error_class != "none":
+        counts = runtime.setdefault("error_counts", {})
+        counts[error_class] = int(counts.get(error_class, 0)) + 1
+
+
+def agent_scheduling_conflict(
+    new_task: dict[str, Any], active_tasks: list[dict[str, Any]]
+) -> str | None:
+    if not active_tasks:
+        return None
+    mode = new_task["scheduling_mode"]
+    if mode == "serial":
+        return "serial_task_conflict"
+    if any(task.get("scheduling_mode") == "serial" for task in active_tasks):
+        return "serial_task_conflict"
+    if any(
+        task.get("scheduling_key") == new_task["scheduling_key"]
+        for task in active_tasks
+    ):
+        return "same_scope_task_conflict"
+    limit = int(new_task["effective_parallel_limit"])
+    if len(active_tasks) >= limit:
+        return "parallel_capacity_exceeded"
+    return None
+
+
+def validate_agent_candidate(
+    project_path: Path, task: dict[str, Any], candidate_paths: list[str]
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    acceptance = task.get("acceptance_command")
+    for index, raw_path in enumerate(candidate_paths):
+        try:
+            candidate = resolve_project_input(project_path, raw_path)
+        except ToolError as exc:
+            errors.append(
+                issue(
+                    "candidate_output_invalid",
+                    str(exc),
+                    candidate_index=index,
+                )
+            )
+            continue
+        if acceptance == "schema-only":
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                errors.append(
+                    issue(
+                        "candidate_schema_invalid",
+                        f"候选 JSON 无法读取：{exc}",
+                        candidate_index=index,
+                    )
+                )
+                continue
+            if not isinstance(payload, dict):
+                errors.append(
+                    issue(
+                        "candidate_schema_invalid",
+                        "schema-only 候选顶层必须是 JSON 对象",
+                        candidate_index=index,
+                    )
+                )
+        elif acceptance == "validate-script":
+            validation = validate_script_file(candidate)
+            if validation.get("errors"):
+                errors.append(
+                    issue(
+                        "candidate_script_invalid",
+                        "候选文学剧本结构校验未通过",
+                        candidate_index=index,
+                        validation=validation,
+                    )
+                )
+    return errors
+
+
+def command_plan_agent_slice(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    scope = agent_scope_from_json(args.scope_json)
+    input_refs = agent_input_refs_from_args(project_path, args.input_ref)
+    if args.contract_version < 1:
+        raise ToolError("--contract-version 必须是正整数")
+    active_host_task_ids = set(args.active_host_task_id or [])
+    if args.host_task_id:
+        active_host_task_ids.add(args.host_task_id)
+    if any(
+        not isinstance(task_id, str) or not task_id.strip()
+        for task_id in active_host_task_ids
+    ):
+        raise ToolError("宿主任务ID必须是非空字符串")
+    max_parallel = args.max_parallel_tasks
+    service_capacity = args.service_capacity
+    if service_capacity is None:
+        raw_capacity = os.environ.get("AI_DIRECTOR_SERVICE_CAPACITY")
+        service_capacity = int(raw_capacity) if raw_capacity else max_parallel
+    for name, value in (
+        ("--max-parallel-tasks", max_parallel),
+        ("--service-capacity", service_capacity),
+    ):
+        if type(value) is not int or not 1 <= value <= agent_runtime.MAX_PARALLEL_TASKS:
+            raise ToolError(
+                f"{name} 必须是1到{agent_runtime.MAX_PARALLEL_TASKS}之间的整数"
+            )
+    scheduling_mode = args.scheduling_mode or agent_runtime.infer_scheduling_mode(
+        args.task_type, scope
+    )
+    scheduling_key = args.scheduling_key or agent_runtime.canonical_sha256(
+        {"coordinator_slice": args.coordinator_slice, "scope": scope}
+    )
+    idempotency_key = agent_runtime.build_idempotency_key(
+        args.task_type, scope, input_refs, args.contract_version
+    )
+    tasks = load_agent_tasks(project_path)
+    initial_matching = sorted(
+        (
+            task
+            for task in tasks
+            if task.get("idempotency_key") == idempotency_key
+        ),
+        key=lambda task: int(task.get("attempt", 0)),
+    )
+    initial_latest = initial_matching[-1] if initial_matching else None
+    bind_task_id = (
+        initial_latest.get("task_id")
+        if (
+            args.host_task_id
+            and initial_latest is not None
+            and initial_latest.get("status") in {"planned", "running"}
+        )
+        else None
+    )
+
+    reconciliation_records: list[dict[str, Any]] = []
+    for task in active_agent_tasks(tasks):
+        if task.get("task_id") == bind_task_id:
+            continue
+        result_evidence = valid_agent_result(project_path, task)
+        if result_evidence is not None:
+            result_path, result = result_evidence
+            task["status"] = (
+                "result_ready" if result.get("status") == "completed" else "failed"
+            )
+            task["result_path"] = agent_task_relative_path(
+                project_path, result_path
+            )
+            task["host_task_status"] = "completed"
+            task["updated_at"] = now_iso()
+            save_loaded_agent_task(task)
+            continue
+        checkpoint_evidence = valid_agent_checkpoint(project_path, task)
+        if checkpoint_evidence is not None:
+            checkpoint_path, checkpoint = checkpoint_evidence
+            checkpoint_status = checkpoint.get("status")
+            if checkpoint_status == "completed":
+                task["status"] = "completed"
+                task["host_task_status"] = "completed"
+            elif checkpoint_status == "blocked":
+                task["status"] = "blocked"
+                task["host_task_status"] = "inactive"
+                task["recovery_state"] = "blocked"
+            elif checkpoint_status in {"retryable", "recovery_required"}:
+                task["status"] = "recovery_required"
+                task["host_task_status"] = "inactive"
+                task["recovery_state"] = "recovery_required"
+            else:
+                checkpoint_evidence = None
+            if checkpoint_evidence is not None:
+                task["last_checkpoint_path"] = agent_task_relative_path(
+                    project_path, checkpoint_path
+                )
+                task["updated_at"] = now_iso()
+                save_loaded_agent_task(task)
+                continue
+        host_task_id = task.get("host_task_id")
+        if host_task_id and host_task_id in active_host_task_ids:
+            task["status"] = "running"
+            task["host_task_status"] = "active"
+            task["updated_at"] = now_iso()
+            save_loaded_agent_task(task)
+            continue
+        remaining_active_ids = [
+            item["task_id"]
+            for item in active_agent_tasks(tasks)
+            if item.get("task_id") != task.get("task_id")
+        ]
+        reconciliation_records.append(
+            mark_agent_task_hostless(
+                project_path,
+                task,
+                remaining_active_ids,
+            )
+        )
+    persist_agent_reconciliation(
+        project_path,
+        state,
+        tasks,
+        reconciliation_records,
+    )
+
+    matching = sorted(
+        (
+            task
+            for task in tasks
+            if task.get("idempotency_key") == idempotency_key
+        ),
+        key=lambda task: int(task.get("attempt", 0)),
+    )
+    latest = matching[-1] if matching else None
+    if latest is not None:
+        if latest.get("status") in {"accepted", "completed"}:
+            return _print_agent_reuse(
+                project_path, latest, "completed_result_reused"
+            )
+        if latest.get("status") == "result_ready":
+            return _print_agent_reuse(
+                project_path, latest, "result_pending_acceptance"
+            )
+        if latest.get("status") in {"planned", "running"}:
+            existing_host_task_id = latest.get("host_task_id")
+            if args.host_task_id:
+                if existing_host_task_id not in {None, args.host_task_id}:
+                    raise ToolError(
+                        "host_task_rebind_requires_recovery：旧宿主任务仍绑定在当前attempt"
+                    )
+                latest["host_task_id"] = args.host_task_id
+                latest["host_task_status"] = "active"
+                latest["status"] = "running"
+                latest["updated_at"] = now_iso()
+                save_loaded_agent_task(latest)
+                active_ids = sorted(
+                    task["task_id"] for task in active_agent_tasks(tasks)
+                )
+                run = load_agent_run(project_path)
+                run.update(
+                    {
+                        "schema_version": agent_runtime.SCHEMA_VERSION,
+                        "orchestration_mode": "single_layer_host",
+                        "run_id": args.run_id,
+                        "coordinator_slice": args.coordinator_slice,
+                        "status": "running",
+                        "active_task_ids": active_ids,
+                        "active_host_task_ids": sorted(active_host_task_ids),
+                        "last_task_id": latest["task_id"],
+                    }
+                )
+                save_agent_run(project_path, run)
+                runtime = agent_runtime_state(state)
+                runtime.update(
+                    {
+                        "orchestration_mode": "single_layer_host",
+                        "status": "running",
+                        "run_id": args.run_id,
+                        "coordinator_slice": args.coordinator_slice,
+                        "active_task_ids": active_ids,
+                        "active_host_task_ids": sorted(active_host_task_ids),
+                        "last_task_id": latest["task_id"],
+                        "updated_at": now_iso(),
+                    }
+                )
+                append_history(
+                    state,
+                    "agent_host_task_bound",
+                    {
+                        "task_id": latest["task_id"],
+                        "host_task_id": args.host_task_id,
+                    },
+                )
+                save_state(project_path, state)
+                return _print_agent_reuse(
+                    project_path,
+                    latest,
+                    "active_host_task_reused",
+                )
+            if (
+                existing_host_task_id
+                and existing_host_task_id in active_host_task_ids
+            ):
+                return _print_agent_reuse(
+                    project_path,
+                    latest,
+                    "active_host_task_reused",
+                )
+            raise ToolError(
+                "active_task_without_host_evidence：活动任务缺少宿主、结果或检查点依据"
+            )
+        if latest.get("status") == "blocked":
+            if latest.get("recovery_state") == "blocked":
+                raise ToolError(
+                    "two_abandoned_attempts_blocked：同一幂等任务已连续两次失去宿主"
+                )
+            raise ToolError("two_failures_blocked：同一幂等任务已连续失败两次")
+    attempt = int(latest.get("attempt", 0)) + 1 if latest else 1
+    if attempt > 2:
+        raise ToolError("two_failures_blocked：同一幂等任务已连续失败两次")
+
+    effective_limit = min(max_parallel, service_capacity)
+    task_id = agent_runtime.task_id_for(idempotency_key, attempt)
+    allowed_write_directory = (
+        f"{agent_runtime.RUNTIME_DIRECTORY}/candidates/{task_id}"
+    )
+    task = agent_runtime.build_task_package(
+        run_id=args.run_id,
+        task_id=task_id,
+        task_type=args.task_type,
+        scope=scope,
+        attempt=attempt,
+        input_refs=input_refs,
+        allowed_read_paths=args.allowed_read_path or [
+            item["path"] for item in input_refs
+        ],
+        allowed_write_directory=allowed_write_directory,
+        acceptance_command=args.acceptance_command,
+        contract_version=args.contract_version,
+        coordinator_slice=args.coordinator_slice,
+        artifact_key=args.artifact_key,
+        max_parallel_tasks=max_parallel,
+        scheduling_mode=scheduling_mode,
+        scheduling_key=scheduling_key,
+        service_capacity=service_capacity,
+    )
+    task["effective_parallel_limit"] = effective_limit
+    task_errors = agent_runtime.validate_task_package(
+        task, project_path, sha256_file
+    )
+    if task_errors:
+        raise ToolError(
+            json.dumps(
+                {"error": "task_invalid", "errors": task_errors},
+                ensure_ascii=False,
+            )
+        )
+    active = active_agent_tasks(tasks)
+    conflict = agent_scheduling_conflict(task, active)
+    if conflict:
+        raise ToolError(
+            f"{conflict}：当前任务为{scheduling_mode}，不能与已有活动任务并行"
+        )
+    task_path = agent_runtime.task_path_for(project_path, task_id)
+    agent_runtime.atomic_write_json(task_path, task)
+    run = load_agent_run(project_path)
+    run.update(
+        {
+            "schema_version": agent_runtime.SCHEMA_VERSION,
+            "orchestration_mode": "single_layer_host",
+            "run_id": args.run_id,
+            "coordinator_slice": args.coordinator_slice,
+            "status": "running",
+            "max_parallel_tasks": max_parallel,
+            "service_capacity": service_capacity,
+            "effective_parallel_limit": effective_limit,
+            "active_host_task_ids": sorted(active_host_task_ids),
+            "active_task_ids": sorted(
+                [item["task_id"] for item in active] + [task_id]
+            ),
+            "last_task_id": task_id,
+        }
+    )
+    save_agent_run(project_path, run)
+    runtime = agent_runtime_state(state)
+    runtime.update(
+        {
+            "orchestration_mode": "single_layer_host",
+            "status": "running",
+            "run_id": args.run_id,
+            "coordinator_slice": args.coordinator_slice,
+            "active_task_ids": run["active_task_ids"],
+            "active_host_task_ids": sorted(active_host_task_ids),
+            "last_task_id": task_id,
+            "max_parallel_tasks": max_parallel,
+            "service_capacity": service_capacity,
+            "updated_at": now_iso(),
+        }
+    )
+    append_history(
+        state,
+        "agent_task_planned",
+        {
+            "task_id": task_id,
+            "idempotency_key": idempotency_key,
+            "task_type": args.task_type,
+            "scheduling_mode": scheduling_mode,
+            "effective_parallel_limit": effective_limit,
+        },
+    )
+    save_state(project_path, state)
+    response = {
+        "ok": True,
+        "reused": False,
+        "task_id": task_id,
+        "task_path": agent_task_relative_path(project_path, task_path),
+        "idempotency_key": idempotency_key,
+        "attempt": attempt,
+        "scheduling_mode": scheduling_mode,
+        "effective_parallel_limit": effective_limit,
+        "active_task_count": len(active) + 1,
+    }
+    matching_recovery = next(
+        (
+            record
+            for record in reversed(reconciliation_records)
+            if record["idempotency_key"] == idempotency_key
+            and record["status"] == "abandoned"
+        ),
+        None,
+    )
+    if matching_recovery is not None:
+        response["recovered_from_task_id"] = matching_recovery["task_id"]
+        response["checkpoint_path"] = matching_recovery["checkpoint_path"]
+    print_json(response)
+    return 0
+
+
+def _print_agent_reuse(
+    project_path: Path, task: dict[str, Any], reason: str
+) -> int:
+    print_json(
+        {
+            "ok": True,
+            "reused": True,
+            "reuse_reason": reason,
+            "task_id": task["task_id"],
+            "task_path": agent_task_relative_path(project_path, task["_path"]),
+            "idempotency_key": task["idempotency_key"],
+            "attempt": task.get("attempt"),
+            "status": task.get("status"),
+            "host_task_id": task.get("host_task_id"),
+            "host_task_status": task.get("host_task_status"),
+            "recovery_state": task.get("recovery_state"),
+            "checkpoint_path": task.get("last_checkpoint_path"),
+            "effective_parallel_limit": task.get(
+                "effective_parallel_limit", agent_runtime.DEFAULT_MAX_PARALLEL_TASKS
+            ),
+        }
+    )
+    return 0
+
+
+def command_accept_agent_result(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    task_path = agent_runtime.task_path_for(project_path, args.task_id)
+    if not task_path.is_file():
+        raise ToolError(f"任务不存在：{args.task_id}")
+    task = agent_runtime.read_json(task_path)
+    task_errors = agent_runtime.validate_task_package(task, project_path, sha256_file)
+    if task_errors:
+        raise ToolError(json.dumps({"error": "task_invalid", "errors": task_errors}, ensure_ascii=False))
+    matching = sorted(
+        (
+            item
+            for item in load_agent_tasks(project_path)
+            if item.get("idempotency_key") == task.get("idempotency_key")
+        ),
+        key=lambda item: int(item.get("attempt", 0)),
+    )
+    latest = matching[-1] if matching else task
+    if task.get("status") in {"abandoned", "recovery_required", "blocked"}:
+        raise ToolError(
+            "stale_attempt_result_rejected：失联、待恢复或已阻断attempt不能登记结果"
+        )
+    if latest.get("task_id") != task.get("task_id"):
+        raise ToolError(
+            "stale_attempt_result_rejected：只能验收同一幂等键的最新attempt"
+        )
+    accepted_other = next(
+        (
+            item
+            for item in matching
+            if item.get("task_id") != task.get("task_id")
+            and item.get("status") in {"accepted", "completed"}
+        ),
+        None,
+    )
+    if accepted_other is not None:
+        raise ToolError(
+            "accepted_result_already_exists：同一幂等键已经存在有效结果"
+        )
+    if task.get("status") in {"accepted", "completed"}:
+        print_json(
+            {
+                "ok": True,
+                "status": "accepted",
+                "reused": True,
+                "task_id": task["task_id"],
+                "result_path": task.get("result_path"),
+            }
+        )
+        return 0
+    result_path = resolve_project_input(project_path, args.result)
+    result = agent_runtime.read_json(result_path)
+    result_errors = agent_runtime.validate_result_envelope(task, result, project_path)
+    if result_errors:
+        raise ToolError(
+            json.dumps(
+                {"error": "result_invalid", "errors": result_errors},
+                ensure_ascii=False,
+            )
+        )
+    canonical_result_path = agent_runtime.result_path_for(
+        project_path, args.task_id
+    )
+    agent_runtime.atomic_write_json(canonical_result_path, result)
+    telemetry = result["telemetry"]
+    runtime = agent_runtime_state(state)
+    update_agent_timing_and_errors(runtime, telemetry)
+    run = load_agent_run(project_path)
+    remaining_active_tasks = [
+        item
+        for item in active_agent_tasks(load_agent_tasks(project_path))
+        if item.get("task_id") != args.task_id
+    ]
+    active_ids = [item["task_id"] for item in remaining_active_tasks]
+    active_host_task_ids = sorted(
+        {
+            item["host_task_id"]
+            for item in remaining_active_tasks
+            if isinstance(item.get("host_task_id"), str)
+            and item["host_task_id"]
+        }
+    )
+    if result["status"] == "failed":
+        task["status"] = "failed"
+        task["host_task_status"] = "completed"
+        task["result_path"] = agent_task_relative_path(
+            project_path, canonical_result_path
+        )
+        task["error_code"] = result.get("error_code")
+        task["error_class"] = agent_runtime.classify_error(
+            result.get("error_code")
+        )
+        task["recovery_policy"] = agent_runtime.recovery_policy_for(
+            result.get("error_code")
+        )
+        task["updated_at"] = now_iso()
+        agent_runtime.atomic_write_json(task_path, task)
+        policy = task["recovery_policy"]
+        if int(task["attempt"]) < int(task["max_attempts"]):
+            checkpoint_status = "retryable"
+            next_step = policy["next_step"]
+            response_status = "retryable"
+            next_attempt = int(task["attempt"]) + 1
+        else:
+            checkpoint_status = "blocked"
+            next_step = "返回主会话处理连续两次失败，不再自动派发"
+            response_status = "blocked"
+            next_attempt = None
+        checkpoint_path = write_agent_checkpoint(
+            project_path,
+            run_id=task["run_id"],
+            task_id=task["task_id"],
+            idempotency_key=task["idempotency_key"],
+            status=checkpoint_status,
+            next_step=next_step,
+            active_task_ids=active_ids,
+            result_path=task["result_path"],
+            failure_count=int(task["attempt"]),
+        )
+        run.update(
+            {
+                "run_id": task["run_id"],
+                "coordinator_slice": task["coordinator_slice"],
+                "status": response_status,
+                "active_task_ids": sorted(active_ids),
+                "active_host_task_ids": active_host_task_ids,
+                "last_task_id": task["task_id"],
+                "last_checkpoint_path": checkpoint_path,
+            }
+        )
+        save_agent_run(project_path, run)
+        runtime.update(
+            {
+                "status": response_status,
+                "run_id": task["run_id"],
+                "coordinator_slice": task["coordinator_slice"],
+                "active_task_ids": sorted(active_ids),
+                "active_host_task_ids": active_host_task_ids,
+                "last_task_id": task["task_id"],
+                "last_checkpoint_path": checkpoint_path,
+                "updated_at": now_iso(),
+            }
+        )
+        append_history(
+            state,
+            "agent_task_failed",
+            {
+                "task_id": task["task_id"],
+                "error_code": result.get("error_code"),
+                "error_class": task["error_class"],
+                "recovery_action": policy["action"],
+                "status": response_status,
+            },
+        )
+        save_state(project_path, state)
+        response: dict[str, Any] = {
+            "ok": True,
+            "status": response_status,
+            "task_id": task["task_id"],
+            "error_class": task["error_class"],
+            "recovery_action": policy["action"],
+            "checkpoint_path": checkpoint_path,
+        }
+        if next_attempt is not None:
+            response["next_attempt"] = next_attempt
+        print_json(response)
+        return 0
+
+    candidate_paths = result["candidate_output_paths"]
+    candidate_errors = validate_agent_candidate(
+        project_path, task, candidate_paths
+    )
+    if candidate_errors:
+        raise ToolError(
+            json.dumps(
+                {"error": "candidate_validation_failed", "errors": candidate_errors},
+                ensure_ascii=False,
+            )
+        )
+    artifact_key = args.artifact_key or task.get("artifact_key")
+    if artifact_key and len(candidate_paths) != 1:
+        raise ToolError("artifact_candidate_count_invalid：登记制品必须只有一个候选文件")
+    registered_artifact = None
+    if artifact_key:
+        register_args = argparse.Namespace(
+            project=str(project_path),
+            artifact_key=artifact_key,
+            path=str(project_path / candidate_paths[0]),
+            status=args.artifact_status,
+            depends_on=args.depends_on or [],
+            note=args.note or f"agent task {task['task_id']}",
+            _runtime_candidate=True,
+        )
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            code = command_register_artifact(register_args)
+        if code != 0:
+            raise ToolError("agent_result_artifact_registration_failed")
+        registered_artifact = json.loads(captured.getvalue())
+        project_path, state = load_state(project_path)
+        runtime = agent_runtime_state(state)
+    task["status"] = "accepted"
+    task["host_task_status"] = "completed"
+    task["result_path"] = agent_task_relative_path(
+        project_path, canonical_result_path
+    )
+    task["accepted_at"] = now_iso()
+    task["updated_at"] = now_iso()
+    agent_runtime.atomic_write_json(task_path, task)
+    checkpoint_path = write_agent_checkpoint(
+        project_path,
+        run_id=task["run_id"],
+        task_id=task["task_id"],
+        idempotency_key=task["idempotency_key"],
+        status="completed",
+        next_step=(
+            "继续当前协调片段"
+            if active_ids
+            else "进入人工门禁或下一自然业务片段"
+        ),
+        active_task_ids=active_ids,
+        result_path=task["result_path"],
+    )
+    run.update(
+        {
+            "run_id": task["run_id"],
+            "coordinator_slice": task["coordinator_slice"],
+            "status": "running" if active_ids else "completed",
+            "active_task_ids": sorted(active_ids),
+            "active_host_task_ids": active_host_task_ids,
+            "last_task_id": task["task_id"],
+            "last_checkpoint_path": checkpoint_path,
+        }
+    )
+    save_agent_run(project_path, run)
+    runtime.update(
+        {
+            "status": "running" if active_ids else "completed",
+            "run_id": task["run_id"],
+            "coordinator_slice": task["coordinator_slice"],
+            "active_task_ids": sorted(active_ids),
+            "active_host_task_ids": active_host_task_ids,
+            "last_task_id": task["task_id"],
+            "last_checkpoint_path": checkpoint_path,
+            "updated_at": now_iso(),
+        }
+    )
+    append_history(
+        state,
+        "agent_task_accepted",
+        {
+            "task_id": task["task_id"],
+            "artifact_key": artifact_key,
+            "checkpoint_path": checkpoint_path,
+        },
+    )
+    save_state(project_path, state)
+    response = {
+        "ok": True,
+        "status": "accepted",
+        "reused": False,
+        "task_id": task["task_id"],
+        "checkpoint_path": checkpoint_path,
+    }
+    if registered_artifact is not None:
+        response["registered_artifact"] = registered_artifact
+    print_json(response)
+    return 0
+
+
+def command_show_agent_runtime(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    paths = agent_runtime.ensure_runtime_directories(project_path)
+    run = load_agent_run(project_path)
+    checkpoints = sorted(
+        paths["checkpoints"].glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    latest_checkpoint = (
+        agent_runtime.read_json(checkpoints[0]) if checkpoints else None
+    )
+    print_json(
+        {
+            "ok": True,
+            "project_root": str(project_path),
+            "run": run,
+            "agent_runtime": state.get("agent_runtime")
+            or empty_agent_runtime_state(),
+            "active_tasks": [
+                {
+                    "task_id": task.get("task_id"),
+                    "task_type": task.get("task_type"),
+                    "attempt": task.get("attempt"),
+                    "scheduling_mode": task.get("scheduling_mode"),
+                    "status": task.get("status"),
+                    "host_task_id": task.get("host_task_id"),
+                    "host_task_status": task.get("host_task_status"),
+                    "recovery_state": task.get("recovery_state"),
+                }
+                for task in active_agent_tasks(load_agent_tasks(project_path))
+            ],
+            "latest_checkpoint": latest_checkpoint,
+        }
+    )
+    return 0
+
+
+def command_startup_preflight(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    validation = validate_state(project_path)
+    if not validation["valid"]:
+        raise ToolError(
+            json.dumps(
+                {
+                    "error": "startup_preflight_state_invalid",
+                    "errors": validation["errors"],
+                },
+                ensure_ascii=False,
+            )
+        )
+    agent_runtime.ensure_runtime_directories(project_path)
+    with agent_runtime.project_state_write_lock(project_path):
+        lock_probe = True
+    required_contracts = (
+        "plan-agent-slice",
+        "accept-agent-result",
+        "show-agent-runtime",
+    )
+    if not all(hasattr(agent_runtime, name) for name in (
+        "build_task_package",
+        "validate_result_envelope",
+        "make_checkpoint",
+    )):
+        raise ToolError("startup_preflight_runtime_contract_missing")
+    runtime = state.get("agent_runtime")
+    print_json(
+        {
+            "ok": True,
+            "status": "ready",
+            "run_scope": {
+                "runtime_directory": agent_runtime.RUNTIME_DIRECTORY,
+                "run_id": args.run_id,
+                "orchestration_mode": "single_layer_host",
+            },
+            "flow": [
+                "state_read",
+                "runtime_directories",
+                "state_lock",
+                "command_contracts",
+            ],
+            "command_contracts": list(required_contracts),
+            "state_valid": validation["valid"],
+            "runtime_initialized": isinstance(runtime, dict),
+            "lock_probe": lock_probe,
+        }
+    )
     return 0
 
 
@@ -10818,6 +11929,95 @@ def build_parser() -> argparse.ArgumentParser:
     context_parser.add_argument("--output", required=True, help="项目内清单输出路径")
     context_parser.set_defaults(handler=command_build_production_context_manifest)
 
+    agent_slice_parser = subparsers.add_parser(
+        "plan-agent-slice",
+        help="按幂等键生成一个无历史继承的不可变智能体任务包",
+    )
+    agent_slice_parser.add_argument("project", help="项目目录")
+    agent_slice_parser.add_argument("--task-type", required=True)
+    agent_slice_parser.add_argument("--scope-json", required=True)
+    agent_slice_parser.add_argument(
+        "--input-ref",
+        action="append",
+        default=[],
+        metavar="ARTIFACT@VERSION=PATH",
+        help="冻结输入引用，可重复传入",
+    )
+    agent_slice_parser.add_argument("--contract-version", type=int, required=True)
+    agent_slice_parser.add_argument(
+        "--acceptance-command",
+        choices=tuple(sorted(agent_runtime.SUPPORTED_ACCEPTANCE_COMMANDS)),
+        default="none",
+    )
+    agent_slice_parser.add_argument("--coordinator-slice", required=True)
+    agent_slice_parser.add_argument("--run-id", required=True)
+    agent_slice_parser.add_argument(
+        "--host-task-id",
+        help="主任务创建的一次性工作智能体ID；重复规划时用于绑定当前attempt",
+    )
+    agent_slice_parser.add_argument(
+        "--active-host-task-id",
+        action="append",
+        default=[],
+        help="当前仍存活的宿主工作智能体ID，可重复传入",
+    )
+    agent_slice_parser.add_argument("--artifact-key")
+    agent_slice_parser.add_argument(
+        "--allowed-read-path",
+        action="append",
+        default=[],
+        help="任务允许读取的项目内路径；省略时使用 input-ref 路径",
+    )
+    agent_slice_parser.add_argument(
+        "--scheduling-mode",
+        choices=tuple(sorted(agent_runtime.SUPPORTED_SCHEDULING_MODES)),
+    )
+    agent_slice_parser.add_argument("--scheduling-key")
+    agent_slice_parser.add_argument(
+        "--max-parallel-tasks",
+        type=int,
+        default=agent_runtime.DEFAULT_MAX_PARALLEL_TASKS,
+    )
+    agent_slice_parser.add_argument("--service-capacity", type=int)
+    agent_slice_parser.set_defaults(handler=command_plan_agent_slice)
+
+    accept_agent_parser = subparsers.add_parser(
+        "accept-agent-result",
+        help="校验智能体结果并由单一写入者登记候选制品",
+    )
+    accept_agent_parser.add_argument("project", help="项目目录")
+    accept_agent_parser.add_argument("--task-id", required=True)
+    accept_agent_parser.add_argument("--result", required=True)
+    accept_agent_parser.add_argument("--artifact-key")
+    accept_agent_parser.add_argument(
+        "--artifact-status",
+        choices=("draft", "awaiting_approval"),
+        default="awaiting_approval",
+    )
+    accept_agent_parser.add_argument(
+        "--depends-on",
+        action="append",
+        default=[],
+        metavar="KEY[@VERSION]",
+    )
+    accept_agent_parser.add_argument("--note")
+    accept_agent_parser.set_defaults(handler=command_accept_agent_result)
+
+    show_agent_parser = subparsers.add_parser(
+        "show-agent-runtime",
+        help="显示当前智能体运行、活动任务和最近检查点",
+    )
+    show_agent_parser.add_argument("project", help="项目目录")
+    show_agent_parser.set_defaults(handler=command_show_agent_runtime)
+
+    preflight_parser = subparsers.add_parser(
+        "startup-preflight",
+        help="启动前预演状态、运行目录、锁和最小编排契约",
+    )
+    preflight_parser.add_argument("project", help="项目目录")
+    preflight_parser.add_argument("--run-id", default="PREFLIGHT")
+    preflight_parser.set_defaults(handler=command_startup_preflight)
+
     episode_delivery_parser = subparsers.add_parser(
         "render-episode-delivery", help="从同版本剧本、人物锚点和分镜计划生成逐集DOCX与HTML"
     )
@@ -10923,12 +12123,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+STATE_MUTATING_COMMANDS = {
+    "init",
+    "show",
+    "define-batch",
+    "set-stage",
+    "register-artifact",
+    "approve",
+    "mark-stale",
+    "add-source",
+    "plan-agent-slice",
+    "accept-agent-result",
+    "startup-preflight",
+    "render-episode-delivery",
+    "build-handoff",
+}
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
+        if args.command in STATE_MUTATING_COMMANDS and hasattr(args, "project"):
+            with agent_runtime.project_state_write_lock(Path(args.project)):
+                return args.handler(args)
         return args.handler(args)
     except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+    except agent_runtime.AgentRuntimeError as exc:
         print_json({"ok": False, "error": str(exc)})
         return 2
     except KeyboardInterrupt:
