@@ -21,6 +21,7 @@ CHARACTER_LINE_RE = re.compile(r"^\s*人物\s*[：:]\s*(.+?)\s*$")
 HOOK_LINE_RE = re.compile(r"^\s*集尾钩子\s*[：:]\s*(.+?)\s*$")
 SCENE_STATE_RE = re.compile(r"^\s*场尾状态\s*[：:].*$")
 SOURCE_COMMENT_RE = re.compile(r"^\s*<!--.*-->\s*$")
+RENDER_CONTRACT_VERSION = 1
 
 
 def split_names(value: str) -> list[str]:

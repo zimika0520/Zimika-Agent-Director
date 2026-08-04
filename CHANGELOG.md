@@ -1,5 +1,15 @@
 # 更新记录
 
+## v0.8.92 — 2026-08-04
+
+- 生产故事板和逐集交付统一要求当前`execution_ready`；直接renderer调用、手工复制或缺少来源清单的文件不能被认定为正式交付。
+- 新增`episode_delivery_manifest:<集号>`和`validate-episode-delivery`，按输入制品版本/散列、渲染契约、DOCX/HTML输出散列和标准renderer标记重新验收，只有全部一致才返回`official_delivery: true`。
+- 相同逐集输入直接复用已验收产物；输出被覆盖或输入版本/散列变化后旧清单失效并重新生成，两个HTML位置继续复用同一次实际渲染。
+- 新增`write-agent-result`，由CLI复用统一结果信封构造器、限制候选目录并标准化运行耗时字段。
+- 未绑定宿主但租约仍有效的计划任务继续复用attempt 1；租约过期后沿用原幂等键受控恢复，第二次过期后阻断且不创建attempt 3。
+- `ai_video`和`both`项目在制作提取、台词提取、故事板和逐集交付前要求schema v2事件索引、有效`beats`及目标集`episode_scopes`；`human_team`保持兼容。
+- 新增15项正式交付与来源契约回归测试；编排相关定向测试46项通过，完整自动化测试221项通过。
+
 ## v0.8.91 — 2026-08-03
 
 - 在现有`agent_runtime`和`project_state.agent_runtime.execution_control`中增加生产/开发模式锁；生产模式禁止临时运行开发测试、设计审核、Skill修改和源码修改，开发模式必须绑定明确开发任务ID。

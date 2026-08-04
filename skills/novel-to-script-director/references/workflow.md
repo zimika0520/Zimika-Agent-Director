@@ -84,7 +84,7 @@ python3 <技能目录>/scripts/project_tool.py show-agent-runtime <项目目录>
 - “继续执行”“按方案完成”等明确指令只授权当前项目、执行链、阶段、操作、输入和目标；任一作用域变化后必须重新授权。该授权不能放行内容新增、缺失输入、重大歧义或验收失败。
 - 任务包不继承会话历史，只读取冻结的 `input_refs` 和允许路径；相同任务类型、范围、输入版本/散列与契约版本只生成一个有效结果。
 - 主任务每次调用`plan-agent-slice`时必须通过可重复的`--active-host-task-id`传入全部仍存活的工作智能体ID。只有宿主ID仍活动、存在有效结果或存在有效检查点时，活动任务才可复用。
-- `planned/running`任务失去宿主、结果和检查点时，工具将其标记为`abandoned/recovery_required`并写检查点，再以相同幂等键创建attempt 2；第二次仍失联时标记`blocked`。旧attempt晚到结果不能登记。
+- 未绑定宿主的`planned`任务在`activity_lease_expires_at`之前仍视为活动，重复规划复用attempt 1。租约过期，或`running`任务失去活动宿主、结果和检查点时，工具才将其标记为`abandoned/recovery_required`并写检查点，再以相同幂等键创建attempt 2；第二次仍无恢复依据时标记`blocked`且不创建attempt 3。旧attempt晚到结果不能登记。
 - v0.8.8/v0.8.9旧任务在`startup-preflight`中迁移模式、授权和统一决策身份；由于旧契约没有阶段字段，首次`plan-agent-slice`用当前真实阶段重绑定决策键。旧结果信封可继续验收，但正式结果统一写入新幂等键。
 - 已完成任务只有在全部接受产物仍存在、大小和SHA-256一致且基础验收命令继续通过时才能复用；否则旧任务标记失效并保留原幂等键进入下一受控attempt。
 - 默认并发为 2；`--max-parallel-tasks`、`--service-capacity` 可配置，调度器只并行不同调度键的独立任务。相邻集剧本、连续性、全局归一和状态写入保持串行。
@@ -113,6 +113,9 @@ python3 <技能目录>/scripts/project_tool.py startup-preflight \
 - `validate-handoff`把同一次项目校验结果、已加载状态和上下文传给`validate-breakdowns`，不能为了提速跳过制作提取、连续性、审批、版本或追溯检查。
 - `episode_delivery_inputs`读取并校验分镜计划、人物锚点和交付依赖后，将只读payload传给renderer；renderer不得再次读取这些输入。
 - 故事板缓存位于当前项目`.ai-director/runtime/render-cache/storyboards/`，输入指纹覆盖分镜计划、台词表、项目规格和四类锚点的版本与散列。两个HTML交付位置必须从同一缓存文件原子复制；指纹变化时重新渲染，旧缓存不得冒充新版本。
+- `ai_video`和`both`项目进入`production_extraction`、`dialogue_extraction`、`storyboard_render`或`episode_delivery`前，必须先通过schema v2来源契约检查：当前确认事件索引包含可校验`beats`，并以`episode_scopes`覆盖目标集。失败时返回`ai_video_source_contract_not_ready`，且不得创建任务包或读取下游交付输入；`human_team`不应用该门禁。
+- `render-episode-delivery`是唯一正式逐集生成入口。它要求当前生产预检、冻结输入版本/散列、校验DOCX和HTML后登记`episode_delivery_manifest:<集号>`。直接renderer输出、复制文件或手工HTML只能作为候选，不能产生正式清单。
+- `validate-episode-delivery`重新核对当前输入指纹、清单入口和契约、输出路径/散列、DOCX ZIP结构以及HTML标准renderer标记。只有返回`official_delivery: true`才能报告逐集交付完成。
 
 ## 分层索引与全剧骨架
 
@@ -181,9 +184,10 @@ python3 <技能目录>/scripts/project_tool.py add-source <项目目录> <新章
 
 ```bash
 python3 scripts/project_tool.py render-episode-delivery <项目目录> E001
+python3 scripts/project_tool.py validate-episode-delivery <项目目录> E001
 ```
 
-输出固定为 `09_定稿交付/分集交付/E001/E001_剧本.docx` 和 `E001_故事板.html`。
+输出固定为 `09_定稿交付/分集交付/E001/E001_剧本.docx` 和 `E001_故事板.html`，来源清单位于项目运行时的`deliveries/E001/`。文件存在不等于正式完成，必须以验收命令结果为准。
 
 ## 修改传播
 

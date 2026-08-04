@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 SCHEMA_VERSION = 1
 RUNTIME_VERSION = "2"
-PLUGIN_VERSION = "0.8.91"
+PLUGIN_VERSION = "0.8.92"
 RULE_VERSION = "production-control-v1"
 EXECUTION_CONTROL_SCHEMA_VERSION = 1
 DEFAULT_MAX_PARALLEL_TASKS = 2

@@ -569,6 +569,49 @@
 - 台词声音表用 `delivery_mode` 区分 `on_screen`、`off_screen`、`voice_over`、`phone_audio`、`screen_video`；非现场人物不得进入 `characters_on_screen`。
 - 每个分镜单元必须提供 `action_flow`、`time_span_mode` 和完整 `shot_language`。动作前置状态、最短时长、对白字数和屏幕文字后期方案由工具实际校验。
 - 边界报告的最终结论由目标制品的机器校验结果计算；报告自填 `passed` 不能覆盖阻断错误。
+- `delivery_target`为`ai_video`或`both`时，制作提取、台词提取、故事板和逐集交付在创建下游任务前要求当前确认的schema v2事件索引、非空且可校验的`beats`及覆盖目标集的`episode_scopes`。schema v1仍可用于旧项目阅读和人类团队流程，但不能作为AI视频下游生产依据。
+
+### 逐集正式交付来源清单
+
+`render-episode-delivery`生成并登记`episode_delivery_manifest:<集号>`。清单路径由项目根目录派生，使用项目相对路径，不保存任何固定小说名或外部绝对路径。
+
+```json
+{
+  "schema_version": 1,
+  "project_id": "项目UUID",
+  "episode_id": "E001",
+  "generation_entrypoint": "project_tool render-episode-delivery",
+  "plugin_version": "当前插件版本",
+  "runtime_version": "当前运行时版本",
+  "rule_version": "当前规则版本",
+  "docx_contract_version": "当前DOCX渲染契约",
+  "storyboard_contract_version": "当前HTML渲染契约",
+  "input_fingerprint": "统一输入指纹",
+  "inputs": [
+    {
+      "artifact_key": "episode_script:E001",
+      "version": 1,
+      "path": "07_分集剧本/E001.md",
+      "sha256": "64位十六进制散列"
+    }
+  ],
+  "storyboard_input_fingerprint": "故事板输入指纹",
+  "outputs": {
+    "docx": {
+      "path": "09_定稿交付/分集交付/E001/E001_剧本.docx",
+      "sha256": "64位十六进制散列"
+    },
+    "html": {
+      "path": "09_定稿交付/分集交付/E001/E001_故事板.html",
+      "sha256": "64位十六进制散列"
+    }
+  },
+  "reused": false,
+  "generated_at": "ISO-8601时间"
+}
+```
+
+`validate-episode-delivery`要求清单为项目状态中的当前确认版本，入口和渲染契约与当前代码一致，所有输入仍是当前版本且SHA-256一致，DOCX包含`[Content_Types].xml`和`word/document.xml`，HTML包含标准renderer与渲染契约标记，两个输出路径位于当前项目正式逐集目录且散列匹配。全部通过才返回`official_delivery: true`；直接renderer输出、复制文件、手工HTML或被覆盖的产物都不能成为正式交付。
 
 ### 人物三视图锚点v2与分镜镜头语言v2
 

@@ -25,6 +25,10 @@ import shot_contracts
 
 STATE_FILENAME = "project_state.json"
 RENDER_CONTRACT_VERSION = 2
+HTML_TEMPLATE_MARKER = (
+    f'<meta name="ai-director-render-contract" '
+    f'content="{RENDER_CONTRACT_VERSION}">'
+)
 
 # 参考色板(dataviz 默认,已通过六项校验;场景按登记顺序取固定槽位,不循环)
 SCENE_SLOTS_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
@@ -552,6 +556,7 @@ def render(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+{HTML_TEMPLATE_MARKER}
 <title>{esc(project_name)} · {esc(episode)} 故事板</title>
 <style>
 .sb-root {{

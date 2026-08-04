@@ -76,6 +76,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 - 用户明确说“继续执行”“按方案完成”等，只形成当前项目、当前执行链、当前阶段、当前输入和目标的委托授权；输入、目标、规则、阶段或执行链变化后授权失效。委托授权不能替代新增故事事实的`change_authorization`，也不能绕过输入缺失、重大歧义或产物验收失败。
 - 普通警告按同一内容、规则和授权作用域去重记录后继续。重大歧义由`plan-agent-slice`、候选验收失败由`accept-agent-result`自动创建活动阻断、暂停无关任务并写检查点，不需要额外的阻断命令；连续失败同样自动阻断。阻断期间不得继续规划、并行验证或创建同类智能体。
 - 修复后使用`startup-preflight --resolve-blocker-id <阻断ID> --resolution-note <修复说明>`解除阻断。被暂停但未失败的任务恢复原任务包和租约；验收失败或失联任务按原幂等键从检查点受控恢复，旧attempt不能形成第二个有效结果。
+- 未绑定宿主任务的`planned`任务在`activity_lease_expires_at`之前仍视为活动任务，重复规划必须复用attempt 1；租约过期且无结果或检查点时才进入受控恢复，第二次过期后阻断且不得创建attempt 3。
 
 ## 任意长度小说与受控并发
 
@@ -203,6 +204,7 @@ python3 <技能目录>/scripts/project_tool.py build-handoff <项目目录> --se
 - 按 [ai-video-production.md](references/ai-video-production.md) 执行：①建立或更新风格/角色/场景/道具四类锚点（带版本号的规范制品）；②生成模型无关的 `ai_shot_plan:E001`（含每单元通用中文提示词），登记 `awaiting_approval` 后先过 `ai_video_boundary_review:E001` 前置门禁。**通用分镜计划就是默认最终交付**，不区分 Seedance/可灵/Veo 等平台。
 - 仅当用户点名需要某平台的参数化任务包时，才建立该模型的 `model_capability_profile` 并编译 `ai_video_execution_plan:E001:<模型>`；语义审查绑定在分镜计划层，编译不重审。
 - 分镜计划确认后运行 `project_tool.py render-storyboard <项目目录> <集号>` 生成 HTML 故事板供用户可视化检查（节奏时间轴、单元卡片、提示词复制、锚点资产表）；只读渲染，规范数据以 JSON 为准。相同输入版本与散列只实际渲染一次，AI执行包与逐集定稿位置通过项目内输入指纹缓存原子复制；输入变化必须重新渲染。
+- `delivery_target`为`ai_video`或`both`时，进入制作提取、台词提取、故事板规划或逐集交付前，当前确认的`source_event_index`必须为schema v2，并提供可校验`beats`和覆盖目标集的`episode_scopes`；否则立即报`ai_video_source_contract_not_ready`且不得创建下游任务。`human_team`项目不应用该提前门禁。
 - 只从当前已确认 `episode_script`、对应 `episode_boundary_review`、覆盖该集的制作提取数据和连续性台账生成，不覆盖文学剧本。`ai_video` 目标下提取表与锚点可按已确认批次滚动更新，绑定当前批次全部剧本版本即可交付该批次执行包。
 - 每个分镜单元必须绑定锚点版本；锚点更新后，引用它的计划自动标记失效，须换版重编。approve 时工具自动校验外形锁注入、台词逐条覆盖、单人对嘴、结构化状态链连续、切点时长理由、资产预算与提示词字段完整。
 - 兼容旧项目：`seedance_execution_plan:E001` 键仍受支持，按原 Seedance 专属流程校验。
@@ -255,4 +257,4 @@ python3 <技能目录>/scripts/project_tool.py set-stage \
 
 ## 每集最终交付
 
-当某集文学剧本、边界报告、制作提取、人物锚点v2和AI分镜均为当前确认版本后，运行 `render-episode-delivery`。每集交付一个可编辑DOCX文学剧本和一个从同版本剧本推演的HTML故事板。DOCX中的人物首次可见出镜位置展示完整三视图文字，后续场次引用；HTML每个分镜明确展示景别和镜头运动。本技能仍不生成图片或视频。
+当某集文学剧本、边界报告、制作提取、人物锚点v2和AI分镜均为当前确认版本后，先确保生产预检仍为当前`execution_ready`，再运行 `render-episode-delivery`。该命令是唯一正式逐集生成入口：它冻结输入制品路径、版本和SHA-256，生成可编辑DOCX文学剧本与同版本HTML故事板，并登记`episode_delivery_manifest:<集号>`。随后必须运行`validate-episode-delivery <项目目录> <集号>`；只有返回`official_delivery: true`才能报告正式完成。直接调用renderer、手工复制文件或只有DOCX/HTML但缺少有效清单时均只算候选。本技能仍不生成图片或视频。

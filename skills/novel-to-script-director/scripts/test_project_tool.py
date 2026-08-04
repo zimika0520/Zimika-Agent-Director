@@ -3309,6 +3309,87 @@ class ProjectToolTests(unittest.TestCase):
             self.assertIn(expected, page, expected)
         self.assertNotIn("。。", page)
 
+    def prepare_episode_delivery_project(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划V1.json",
+            json.dumps(self.shot_plan_payload(), ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        self.approve_shot_plan_with_review(plan_version)
+
+    def run_production_preflight(self) -> dict:
+        code, payload = self.run_cli(
+            "startup-preflight",
+            str(self.project),
+            "--mode",
+            "production",
+            "--run-id",
+            "TEST-PRODUCTION",
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["status"], "execution_ready")
+        return payload
+
+    def test_render_commands_require_production_preflight(self) -> None:
+        self.prepare_episode_delivery_project()
+
+        for command in ("render-storyboard", "render-episode-delivery"):
+            with self.subTest(command=command):
+                code, payload = self.run_cli(command, str(self.project), "E001")
+                self.assertEqual(code, 2, payload)
+                self.assertEqual(payload["error"], "execution_preflight_required")
+
+    def test_render_commands_reject_stale_production_preflight(self) -> None:
+        self.prepare_episode_delivery_project()
+
+        for command in ("render-storyboard", "render-episode-delivery"):
+            with self.subTest(command=command):
+                self.run_production_preflight()
+                state = self.state()
+                state["agent_runtime"]["execution_control"]["preflight"][
+                    "fingerprint"
+                ] = f"stale-test-fingerprint-{command}"
+                (self.project / project_tool.STATE_FILENAME).write_text(
+                    json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                code, payload = self.run_cli(command, str(self.project), "E001")
+                self.assertEqual(code, 2, payload)
+                self.assertEqual(payload["error"], "execution_preflight_stale")
+
+    def test_render_storyboard_checks_ai_source_contract_once(self) -> None:
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
+        original = project_tool.validate_ai_video_source_contract_ready
+        with mock.patch.object(
+            project_tool,
+            "validate_ai_video_source_contract_ready",
+            wraps=original,
+        ) as contract_mock:
+            code, payload = self.run_cli(
+                "render-storyboard", str(self.project), "E001"
+            )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(contract_mock.call_count, 1)
+
+    def test_render_episode_delivery_checks_ai_source_contract_once(self) -> None:
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
+        original = project_tool.validate_ai_video_source_contract_ready
+        with mock.patch.object(
+            project_tool,
+            "validate_ai_video_source_contract_ready",
+            wraps=original,
+        ) as contract_mock:
+            code, payload = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(contract_mock.call_count, 1)
+
     def test_prompt_executability_rejects_generic_template(self) -> None:
         unit = {
             "prompt_text": "半写实都市国漫；阿宁藏好钥匙；无字幕。",
@@ -3371,16 +3452,8 @@ class ProjectToolTests(unittest.TestCase):
         )
 
     def test_render_episode_delivery_outputs_exact_pair(self) -> None:
-        self.create_ready_project()
-        self.register_ai_layer_prerequisites()
-        plan = self.shot_plan_payload()
-        plan_version = self.register_artifact(
-            "ai_shot_plan:E001",
-            "10_AI视频执行包/E001_分镜计划V1.json",
-            json.dumps(plan, ensure_ascii=False),
-            self.shot_plan_dependencies(),
-        )
-        self.approve_shot_plan_with_review(plan_version)
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
         code, payload = self.run_cli(
             "render-episode-delivery", str(self.project), "E001"
         )
@@ -3398,6 +3471,239 @@ class ProjectToolTests(unittest.TestCase):
         html_text = (output_dir / "E001_故事板.html").read_text(encoding="utf-8")
         self.assertIn("景别：", html_text)
         self.assertIn("镜头运动：", html_text)
+
+    def test_episode_delivery_inputs_freeze_hashes_and_invalidate_fingerprint(
+        self,
+    ) -> None:
+        self.prepare_episode_delivery_project()
+        state = self.state()
+        inputs, errors = project_tool.episode_delivery_inputs(
+            self.project, state, "E001"
+        )
+        input_type = getattr(project_tool, "EpisodeDeliveryInputs", None)
+        self.assertIsNotNone(input_type, "逐集交付输入必须使用冻结对象")
+        self.assertIsInstance(inputs, input_type)
+        self.assertEqual(errors, [])
+        self.assertTrue(inputs.dependencies)
+        for dependency in inputs.dependencies:
+            self.assertEqual(
+                set(dependency),
+                {"artifact_key", "version", "path", "sha256"},
+            )
+            path = self.project / dependency["path"]
+            self.assertTrue(path.is_file())
+            self.assertEqual(dependency["sha256"], project_tool.sha256_file(path))
+        original_fingerprint = inputs.input_fingerprint
+
+        anchor_key = next(
+            key for key in state["artifacts"] if key.startswith("character_anchor:")
+        )
+        anchor_record = project_tool.latest_record(state, anchor_key)
+        anchor_path = self.project / anchor_record["path"]
+        anchor_path.write_text(
+            anchor_path.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        anchor_record["sha256"] = project_tool.sha256_file(anchor_path)
+        anchor_record["size_bytes"] = anchor_path.stat().st_size
+        (self.project / project_tool.STATE_FILENAME).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        updated_inputs, updated_errors = project_tool.episode_delivery_inputs(
+            self.project, self.state(), "E001"
+        )
+        self.assertEqual(updated_errors, [])
+        self.assertNotEqual(
+            updated_inputs.input_fingerprint,
+            original_fingerprint,
+        )
+
+    def test_render_episode_delivery_registers_official_manifest(self) -> None:
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
+        code, payload = self.run_cli(
+            "render-episode-delivery", str(self.project), "E001"
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertIs(payload.get("official_delivery"), True, payload)
+        self.assertEqual(
+            payload.get("generation_entrypoint"),
+            "project_tool render-episode-delivery",
+        )
+        self.assertIsInstance(payload.get("input_fingerprint"), str)
+        self.assertEqual(
+            set(payload.get("outputs", {})),
+            {"docx", "html"},
+        )
+        for output in payload["outputs"].values():
+            self.assertTrue((self.project / output["path"]).is_file())
+            self.assertEqual(
+                output["sha256"],
+                project_tool.sha256_file(self.project / output["path"]),
+            )
+        manifest_path = self.project / payload["manifest"]
+        self.assertTrue(manifest_path.is_file())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["generation_entrypoint"],
+            "project_tool render-episode-delivery",
+        )
+        state = self.state()
+        record = project_tool.latest_record(
+            state, "episode_delivery_manifest:E001"
+        )
+        self.assertIsInstance(record, dict)
+        self.assertEqual(record["status"], "confirmed")
+        html_path = self.project / payload["outputs"]["html"]["path"]
+        self.assertIn(
+            'name="ai-director-render-contract"',
+            html_path.read_text(encoding="utf-8"),
+        )
+
+        code, validated = self.run_cli(
+            "validate-episode-delivery", str(self.project), "E001"
+        )
+        self.assertEqual(code, 0, validated)
+        self.assertIs(validated.get("official_delivery"), True, validated)
+
+    def test_direct_storyboard_render_cannot_become_official_delivery(self) -> None:
+        import render_storyboard
+
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
+        state = self.state()
+        inputs, errors = project_tool.episode_delivery_inputs(
+            self.project, state, "E001"
+        )
+        self.assertEqual(errors, [])
+        output = (
+            self.project
+            / "09_定稿交付"
+            / "分集交付"
+            / "E001"
+            / "E001_故事板.html"
+        )
+        render_storyboard.render(
+            self.project,
+            "E001",
+            output,
+            state=state,
+            preloaded=inputs.storyboard_payloads,
+        )
+        self.assertTrue(output.is_file())
+
+        code, payload = self.run_cli(
+            "validate-episode-delivery", str(self.project), "E001"
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIs(payload.get("official_delivery"), False, payload)
+        self.assertIn(
+            "episode_delivery_manifest_missing",
+            {item["code"] for item in payload.get("errors", [])},
+        )
+
+    def test_episode_delivery_reuses_and_rerenders_after_tamper_or_input_change(
+        self,
+    ) -> None:
+        import render_episode_script
+        import render_storyboard
+
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
+        docx_calls = 0
+        storyboard_calls = 0
+        original_docx = render_episode_script.write_docx
+        original_storyboard = render_storyboard.render
+
+        def counted_docx(*args, **kwargs):
+            nonlocal docx_calls
+            docx_calls += 1
+            return original_docx(*args, **kwargs)
+
+        def counted_storyboard(*args, **kwargs):
+            nonlocal storyboard_calls
+            storyboard_calls += 1
+            return original_storyboard(*args, **kwargs)
+
+        with mock.patch.object(
+            render_episode_script, "write_docx", side_effect=counted_docx
+        ), mock.patch.object(
+            render_storyboard, "render", side_effect=counted_storyboard
+        ):
+            code, first = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, first)
+            self.assertFalse(first["reused"])
+            code, repeated = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, repeated)
+            self.assertTrue(repeated["reused"])
+            self.assertEqual(docx_calls, 1)
+            self.assertEqual(storyboard_calls, 1)
+
+            html_path = self.project / first["outputs"]["html"]["path"]
+            html_path.write_text(
+                html_path.read_text(encoding="utf-8") + "\n<!-- tampered -->\n",
+                encoding="utf-8",
+            )
+            code, tampered = self.run_cli(
+                "validate-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 2, tampered)
+            self.assertIn(
+                "episode_delivery_output_hash_mismatch",
+                {item["code"] for item in tampered["errors"]},
+            )
+            code, repaired = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, repaired)
+            self.assertFalse(repaired["reused"])
+            self.assertEqual(docx_calls, 2)
+            self.assertEqual(storyboard_calls, 2)
+
+            state = self.state()
+            anchor_key = next(
+                key
+                for key in state["artifacts"]
+                if key.startswith("character_anchor:")
+            )
+            anchor_record = project_tool.latest_record(state, anchor_key)
+            anchor_path = self.project / anchor_record["path"]
+            anchor_path.write_text(
+                anchor_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            anchor_record["sha256"] = project_tool.sha256_file(anchor_path)
+            anchor_record["size_bytes"] = anchor_path.stat().st_size
+            (self.project / project_tool.STATE_FILENAME).write_text(
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            code, stale = self.run_cli(
+                "validate-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 2, stale)
+            self.assertIn(
+                "episode_delivery_input_stale",
+                {item["code"] for item in stale["errors"]},
+            )
+            code, refreshed = self.run_cli(
+                "render-episode-delivery", str(self.project), "E001"
+            )
+            self.assertEqual(code, 0, refreshed)
+            self.assertFalse(refreshed["reused"])
+            self.assertEqual(docx_calls, 3)
+            self.assertEqual(storyboard_calls, 3)
+            self.assertNotEqual(
+                refreshed["input_fingerprint"],
+                first["input_fingerprint"],
+            )
 
     def test_validation_context_memoizes_shared_dependency_dag(self) -> None:
         self.create_ready_project()
@@ -3501,15 +3807,8 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(calls, 1)
 
     def test_render_episode_delivery_reuses_preloaded_storyboard_inputs(self) -> None:
-        self.create_ready_project()
-        self.register_ai_layer_prerequisites()
-        plan_version = self.register_artifact(
-            "ai_shot_plan:E001",
-            "10_AI视频执行包/E001_分镜计划V1.json",
-            json.dumps(self.shot_plan_payload(), ensure_ascii=False),
-            self.shot_plan_dependencies(),
-        )
-        self.approve_shot_plan_with_review(plan_version)
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
         state = self.state()
         plan_record = project_tool.latest_record(state, "ai_shot_plan:E001")
         anchor_key = next(
@@ -3549,6 +3848,7 @@ class ProjectToolTests(unittest.TestCase):
             self.shot_plan_dependencies(),
         )
         self.approve_shot_plan_with_review(plan_version)
+        self.run_production_preflight()
         collect_calls = 0
         original = render_storyboard.collect_anchors
 
@@ -5553,6 +5853,152 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(code, 0, payload)
         return payload
 
+    def set_delivery_target(self, delivery_target: str) -> None:
+        self.update_artifact_json(
+            "project_spec",
+            lambda payload: payload.update(
+                {"delivery_target": delivery_target}
+            ),
+        )
+
+    def downgrade_source_event_index_to_v1(self) -> None:
+        def downgrade(payload: dict) -> None:
+            payload["schema_version"] = 1
+            payload.pop("content_contract_version", None)
+            payload.pop("episode_scopes", None)
+            for unit in payload.get("units", []):
+                for event in unit.get("events", []):
+                    event.pop("beats", None)
+
+        self.update_artifact_json("source_event_index", downgrade)
+
+    def prepare_agent_source_contract_project(
+        self,
+        *,
+        delivery_target: str,
+        schema_version: int,
+    ) -> None:
+        self.init_project()
+        project_id = self.state()["project_id"]
+        self.register_and_approve(
+            "project_spec",
+            "01_原著解析/项目规格V1.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_id": project_id,
+                    "expected_episodes": 1,
+                    "delivery_target": delivery_target,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        normalized_source = self.write_project_file(
+            "01_原著解析/标准化正文_第001章.txt",
+            "阿宁守住母亲留下的钥匙。\n",
+        )
+        source_corpus = {
+            "schema_version": 1,
+            "project_id": project_id,
+            "generated_from": [
+                {"artifact_key": "project_spec", "version": 1}
+            ],
+            "source_units": [
+                {
+                    "source_unit_id": "SRC-CH001",
+                    "source_id": self.state()["sources"][0]["source_id"],
+                    "source_locator": "第1章",
+                    "ordinal": 1,
+                    "content_path": normalized_source.relative_to(
+                        self.project
+                    ).as_posix(),
+                    "content_sha256": project_tool.sha256_file(
+                        normalized_source
+                    ),
+                }
+            ],
+        }
+        self.register_and_approve(
+            "source_corpus",
+            "01_原著解析/原著语料V1.json",
+            json.dumps(source_corpus, ensure_ascii=False),
+            ("project_spec@1",),
+        )
+        event = {
+            "event_id": "EV-0001",
+            "ordinal": 1,
+            "summary": "阿宁守住母亲留下的钥匙",
+            "participants": ["C001"],
+            "cause": "钥匙是母亲遗物",
+            "action": "阿宁拒绝交出钥匙",
+            "outcome": "钥匙仍由阿宁持有",
+            "state_change": "守护钥匙的冲突建立",
+            "source_refs": ["SRC-CH001"],
+        }
+        source_event_index = {
+            "schema_version": schema_version,
+            "project_id": project_id,
+            "generated_from": [
+                {"artifact_key": "source_corpus", "version": 1}
+            ],
+            "units": [
+                {
+                    "source_unit_id": "SRC-CH001",
+                    "source_locator": "第1章",
+                    "status": "ready",
+                    "events": [event],
+                }
+            ],
+        }
+        if schema_version == 2:
+            source_event_index.update(
+                {
+                    "content_contract_version": 1,
+                    "entities": [
+                        {
+                            "entity_id": "C001",
+                            "entity_type": "character",
+                            "canonical_name": "阿宁",
+                            "aliases": [],
+                        }
+                    ],
+                    "fact_definitions": [],
+                    "temporal_constraints": [],
+                    "episode_scopes": {
+                        "E001": {
+                            "allowed_beat_ids": ["B001"],
+                            "first_beat_id": "B001",
+                            "last_beat_id": "B001",
+                        }
+                    },
+                }
+            )
+            event["beats"] = [
+                {
+                    "beat_id": "B001",
+                    "ordinal": 1,
+                    "source_refs": ["SRC-CH001", "第1章"],
+                    "protected_fact_ids": [],
+                    "required_fact_ids": [],
+                    "content_atoms": [
+                        {
+                            "atom_id": "SA-B001-001",
+                            "kind": "action",
+                            "text": "阿宁守住母亲留下的钥匙。",
+                            "source_unit_id": "SRC-CH001",
+                            "source_locator": "第1章",
+                            "source_excerpt": "阿宁守住母亲留下的钥匙。",
+                        }
+                    ],
+                }
+            ]
+        self.register_and_approve(
+            "source_event_index",
+            "01_原著解析/原著事件索引V1.json",
+            json.dumps(source_event_index, ensure_ascii=False),
+            ("source_corpus@1",),
+        )
+
     def test_production_preflight_runs_once_and_reruns_on_environment_change(self) -> None:
         self.init_project()
         original_validate_state = project_tool.validate_state
@@ -5693,6 +6139,61 @@ class ProjectToolTests(unittest.TestCase):
             refreshed = self.ensure_production_preflight()
             self.assertFalse(refreshed["reused"])
             self.assertEqual(refreshed["rerun_reason"], "environment_changed")
+
+    def test_ai_video_schema_v1_blocks_production_extraction_before_task_creation(
+        self,
+    ) -> None:
+        self.prepare_agent_source_contract_project(
+            delivery_target="ai_video",
+            schema_version=1,
+        )
+
+        code, payload = self.run_cli(
+            *self.agent_task_args(
+                task_type="production_extraction",
+                stage="quality_review",
+                operation="production_extraction",
+            )
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertEqual(payload["error"], "ai_video_source_contract_not_ready")
+        runtime_root = self.project / ".ai-director/runtime"
+        self.assertEqual(list((runtime_root / "tasks").glob("*.json")), [])
+        self.assertEqual(list((runtime_root / "candidates").glob("*")), [])
+
+    def test_ai_video_schema_v2_allows_production_extraction(self) -> None:
+        self.prepare_agent_source_contract_project(
+            delivery_target="ai_video",
+            schema_version=2,
+        )
+
+        code, payload = self.run_cli(
+            *self.agent_task_args(
+                task_type="production_extraction",
+                stage="quality_review",
+                operation="production_extraction",
+            )
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertFalse(payload["reused"])
+        self.assertEqual(payload["attempt"], 1)
+
+    def test_human_team_schema_v1_allows_production_extraction(self) -> None:
+        self.prepare_agent_source_contract_project(
+            delivery_target="human_team",
+            schema_version=1,
+        )
+
+        code, payload = self.run_cli(
+            *self.agent_task_args(
+                task_type="production_extraction",
+                stage="quality_review",
+                operation="production_extraction",
+            )
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertFalse(payload["reused"])
+        self.assertEqual(payload["attempt"], 1)
 
     def test_same_active_planned_task_is_reused_without_duplicate_planning(self) -> None:
         self.init_project()
@@ -6319,6 +6820,60 @@ class ProjectToolTests(unittest.TestCase):
             json.dumps(payload, ensure_ascii=False),
         )
 
+    def test_write_agent_result_cli_builds_valid_envelope(self) -> None:
+        self.init_project()
+        code, planned = self.run_cli(*self.agent_task_args())
+        self.assertEqual(code, 0, planned)
+        task = json.loads(
+            (self.project / planned["task_path"]).read_text(encoding="utf-8")
+        )
+        candidate = (
+            self.project / task["allowed_write_directory"] / "analysis.json"
+        )
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text('{"events":[]}\n', encoding="utf-8")
+        candidate_relative = candidate.relative_to(self.project).as_posix()
+
+        code, payload = self.run_cli(
+            "write-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--status",
+            "completed",
+            "--candidate-output",
+            candidate_relative,
+            "--machine-time-seconds",
+            "1.25",
+        )
+        self.assertEqual(code, 0, payload)
+        result_path = self.project / payload["result_path"]
+        self.assertTrue(result_path.is_file())
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            project_tool.agent_runtime.validate_result_envelope(
+                task, result, self.project
+            ),
+            [],
+        )
+        self.assertEqual(
+            set(result["telemetry"]),
+            {*project_tool.agent_runtime.TIMING_FIELDS, "error_class"},
+        )
+        self.assertEqual(result["telemetry"]["machine_time_seconds"], 1.25)
+        self.assertEqual(result["telemetry"]["error_class"], "none")
+
+        code, accepted = self.run_cli(
+            "accept-agent-result",
+            str(self.project),
+            "--task-id",
+            task["task_id"],
+            "--result",
+            str(result_path),
+        )
+        self.assertEqual(code, 0, accepted)
+        self.assertEqual(accepted["status"], "accepted")
+
     def test_plan_agent_slice_freezes_context_and_reuses_completed_result(self) -> None:
         self.init_project()
         arguments = self.agent_task_args()
@@ -6638,6 +7193,84 @@ class ProjectToolTests(unittest.TestCase):
         code, rejected = self.run_cli(*serial_args)
         self.assertEqual(code, 2, rejected)
         self.assertIn("serial_task_conflict", rejected["error"])
+
+    def test_plan_agent_slice_reuses_unexpired_hostless_lease(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+
+        code, reused = self.run_cli(*arguments)
+        self.assertEqual(code, 0, reused)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["reuse_reason"], "active_planned_task_reused")
+        self.assertEqual(reused["status"], "planned")
+        self.assertEqual(reused["attempt"], 1)
+        self.assertEqual(reused["task_id"], first["task_id"])
+        self.assertEqual(
+            len(list((self.project / ".ai-director/runtime/tasks").glob("*.json"))),
+            1,
+        )
+
+    def test_plan_agent_slice_recovers_expired_hostless_lease_once(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+        first_path = self.project / first["task_path"]
+        task1 = json.loads(first_path.read_text(encoding="utf-8"))
+        task1["activity_lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+        first_path.write_text(
+            json.dumps(task1, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, recovered = self.run_cli(*arguments)
+        self.assertEqual(code, 0, recovered)
+        self.assertFalse(recovered["reused"])
+        self.assertEqual(recovered["attempt"], 2)
+        self.assertEqual(recovered["idempotency_key"], first["idempotency_key"])
+        self.assertEqual(recovered["recovered_from_task_id"], first["task_id"])
+        self.assertTrue((self.project / recovered["checkpoint_path"]).is_file())
+
+        abandoned = json.loads(first_path.read_text(encoding="utf-8"))
+        self.assertEqual(abandoned["status"], "abandoned")
+        self.assertEqual(abandoned["recovery_state"], "recovery_required")
+
+    def test_plan_agent_slice_blocks_after_two_expired_hostless_leases(self) -> None:
+        self.init_project()
+        arguments = self.agent_task_args()
+        code, first = self.run_cli(*arguments)
+        self.assertEqual(code, 0, first)
+        first_path = self.project / first["task_path"]
+        task1 = json.loads(first_path.read_text(encoding="utf-8"))
+        task1["activity_lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+        first_path.write_text(
+            json.dumps(task1, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, second = self.run_cli(*arguments)
+        self.assertEqual(code, 0, second)
+        self.assertEqual(second["attempt"], 2)
+        second_path = self.project / second["task_path"]
+        task2 = json.loads(second_path.read_text(encoding="utf-8"))
+        task2["activity_lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+        second_path.write_text(
+            json.dumps(task2, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, blocked = self.run_cli(*arguments)
+        self.assertEqual(code, 2, blocked)
+        self.assertIn("two_abandoned_attempts_blocked", blocked["error"])
+        self.assertEqual(
+            len(list((self.project / ".ai-director/runtime/tasks").glob("*.json"))),
+            2,
+        )
+        blocked_task = json.loads(second_path.read_text(encoding="utf-8"))
+        self.assertEqual(blocked_task["status"], "blocked")
+        self.assertEqual(blocked_task["recovery_state"], "blocked")
 
     def test_plan_agent_slice_recovers_hostless_active_task_once(self) -> None:
         self.init_project()
@@ -6995,6 +7628,7 @@ class ProjectToolTests(unittest.TestCase):
             self.shot_plan_dependencies(),
         )
         self.approve_shot_plan_with_review(plan_version)
+        self.run_production_preflight()
         code, delivery = self.run_cli(
             "render-episode-delivery",
             str(project_root),

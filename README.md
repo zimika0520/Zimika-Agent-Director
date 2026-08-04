@@ -2,7 +2,7 @@
 
 把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.91`
+当前版本：`0.8.92`
 
 ## 它能做什么
 
@@ -28,6 +28,8 @@
 - v0.8.8/v0.8.9运行时任务在首次预检时迁移，并在首次新规划时按真实阶段重绑定统一决策键；已完成且校验有效的结果不重新生成。
 - 单次校验命令共享依赖DAG结果、已加载状态和JSON payload；文件版本或散列变化会在新运行中重新校验。
 - 相同分镜输入只生成一次HTML，两个交付位置通过输入指纹缓存和原子复制保持一致。
+- 逐集DOCX/HTML只有经`render-episode-delivery`生成、登记来源清单并通过`validate-episode-delivery`后才是正式交付；直接renderer输出或手工复制文件只算候选。
+- `ai_video`和`both`项目在制作提取、台词提取、故事板或逐集交付前必须使用带`beats`和`episode_scopes`的schema v2事件索引；`human_team`不受该门禁影响。
 
 ## 工作流
 
@@ -74,6 +76,8 @@ python3 skills/novel-to-script-director/scripts/project_tool.py show-agent-runti
 普通警告只记录一次并继续。重大歧义或候选验收失败会创建活动阻断、暂停无关任务并写检查点；修复后用`startup-preflight --resolve-blocker-id <阻断ID> --resolution-note <说明>`解除，原任务从检查点恢复。笼统的“继续执行”只授权当前执行动作，不能替代新增故事事实所需的具体`change_authorization`。
 
 校验缓存只存在于单次命令的内存中，不跨命令持久化；它按制品键、版本、文件散列和依赖闭包签名复用已完成的依赖结论。故事板缓存位于项目自己的`.ai-director/runtime/render-cache/storyboards/`，按分镜计划及相关锚点、台词表、项目规格的版本和散列生成指纹。输入变化后使用新指纹重新渲染，缓存目录不进入最终交付包。
+
+生产渲染必须使用当前`execution_ready`。`render-episode-delivery`会冻结当前确认制品的路径、版本和SHA-256，生成DOCX/HTML后登记`episode_delivery_manifest:<集号>`；只有`validate-episode-delivery`重新核对输入指纹、输出散列、DOCX结构和HTML标准renderer标记后，结果才返回`official_delivery: true`。
 
 ## 安装到 Codex
 
@@ -234,9 +238,11 @@ python3 skills/novel-to-script-director/scripts/project_tool.py plan-source-part
 python3 skills/novel-to-script-director/scripts/project_tool.py merge-source-analysis-shards   <项目目录> --plan <partition-plan.json> --shard-dir <shards目录>   --output <source_event_index_candidate.json>
 
 python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-delivery   <项目目录> E001
+
+python3 skills/novel-to-script-director/scripts/project_tool.py validate-episode-delivery   <项目目录> E001
 ```
 
-流程不按小说总字数切换；章节/事件优先，容量预算兜底。逐集命令输出 `E001_剧本.docx` 与 `E001_故事板.html`，不生成图片。
+流程不按小说总字数切换；章节/事件优先，容量预算兜底。逐集命令输出 `E001_剧本.docx`、`E001_故事板.html`和项目运行时内的来源清单，不生成图片。文件存在不等于正式完成，必须以验收命令返回的`official_delivery`为准。
 
 ## 验证
 
@@ -245,7 +251,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8.91 新增20项生产执行控制回归测试；编排、幂等、检查点、恢复、串并行和门禁相关定向测试33项通过。
+v0.8.92 新增15项正式交付与来源契约回归测试；编排、幂等、检查点、恢复、串并行和门禁相关定向测试46项通过；完整自动化测试221项通过。
 
 ## 更新记录
 

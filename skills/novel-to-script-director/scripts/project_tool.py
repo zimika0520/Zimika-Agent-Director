@@ -20,10 +20,11 @@ import sys
 import tempfile
 import unicodedata
 import uuid
+import zipfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 import source_partition
 import shot_contracts
@@ -32,6 +33,16 @@ import agent_runtime
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "project_state.json"
+EPISODE_DELIVERY_MANIFEST_SCHEMA_VERSION = 1
+EPISODE_DELIVERY_ENTRYPOINT = "project_tool render-episode-delivery"
+AI_VIDEO_SOURCE_CONTRACT_TASK_TYPES = frozenset(
+    {
+        "production_extraction",
+        "dialogue_extraction",
+        "storyboard_render",
+        "episode_delivery",
+    }
+)
 
 # 项目规格 rights_mode 枚举：来源只来自用户提供，插件不联网检索正文。
 # 缺省（旧项目无该字段）按 owned 语义处理，不报错。
@@ -165,6 +176,7 @@ ARTIFACT_TYPES = {
     "ai_shot_plan": "AI分镜单元计划",
     "ai_video_boundary_review": "AI分镜内容边界报告",
     "ai_video_execution_plan": "AI视频执行计划",
+    "episode_delivery_manifest": "逐集正式交付来源清单",
     "batch_delivery_review": "批次交付审核报告",
     "batch_delivery_manifest": "批次交付清单",
     "batch_package": "批次制作就绪包",
@@ -176,7 +188,12 @@ ARTIFACT_TYPES = {
 # 边 A -> B 表示 B 的正确性依赖 A。某个已确认的 A 出现新版本时，
 # 已存在的 B 及其所有下游制品都应重新评估。
 DEPENDENCY_GRAPH = {
-    "project_spec": {"source_corpus", "story_facts", "adaptation_profile"},
+    "project_spec": {
+        "source_corpus",
+        "story_facts",
+        "adaptation_profile",
+        "episode_delivery_manifest",
+    },
     "source_corpus": {
         "chapter_analysis_registry",
         "rolling_source_progress",
@@ -195,6 +212,7 @@ DEPENDENCY_GRAPH = {
         "seedance_boundary_review",
         "ai_shot_plan",
         "ai_video_boundary_review",
+        "episode_delivery_manifest",
         "batch_source_detail",
     },
     "story_facts": {
@@ -202,6 +220,7 @@ DEPENDENCY_GRAPH = {
         "genre_profile",
         "seedance_execution_plan",
         "seedance_boundary_review",
+        "episode_delivery_manifest",
         "ai_shot_plan",
         "ai_video_boundary_review",
     },
@@ -259,6 +278,7 @@ DEPENDENCY_GRAPH = {
     "character_roster": {
         "production_readiness_report", "delivery_manifest", "final_package",
         "seedance_execution_plan",
+        "episode_delivery_manifest",
     },
     "scene_catalog": {
         "production_readiness_report", "delivery_manifest", "final_package",
@@ -270,7 +290,7 @@ DEPENDENCY_GRAPH = {
     },
     "dialogue_cue_sheet": {
         "production_readiness_report", "delivery_manifest", "final_package",
-        "seedance_execution_plan", "ai_shot_plan",
+        "seedance_execution_plan", "ai_shot_plan", "episode_delivery_manifest",
     },
     "continuity_ledger": {
         "production_readiness_report", "delivery_manifest", "final_package",
@@ -286,13 +306,13 @@ DEPENDENCY_GRAPH = {
     "batch_package": {"series_delivery_manifest", "final_package"},
     "series_delivery_manifest": {"final_package"},
     "seedance_execution_plan": {"seedance_boundary_review", "generation_retry_ledger"},
-    "style_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan"},
-    "character_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan"},
-    "scene_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan"},
-    "prop_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan"},
+    "style_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan", "episode_delivery_manifest"},
+    "character_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan", "episode_delivery_manifest"},
+    "scene_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan", "episode_delivery_manifest"},
+    "prop_anchor": {"seedance_execution_plan", "seedance_boundary_review", "ai_shot_plan", "ai_video_boundary_review", "ai_video_execution_plan", "episode_delivery_manifest"},
     "model_capability_profile": {"ai_video_execution_plan"},
-    "ai_shot_plan": {"ai_video_boundary_review", "ai_video_execution_plan", "generation_retry_ledger"},
-    "ai_video_boundary_review": {"ai_video_execution_plan"},
+    "ai_shot_plan": {"ai_video_boundary_review", "ai_video_execution_plan", "generation_retry_ledger", "episode_delivery_manifest"},
+    "ai_video_boundary_review": {"ai_video_execution_plan", "episode_delivery_manifest"},
     "delivery_manifest": {"final_package"},
 }
 
@@ -390,6 +410,15 @@ REQUIRED_UPSTREAM_GROUPS: dict[str, tuple[frozenset[str], ...]] = {
     "ai_video_execution_plan": (
         frozenset({"ai_shot_plan"}),
         frozenset({"model_capability_profile"}),
+    ),
+    "episode_delivery_manifest": (
+        frozenset({"project_spec"}),
+        frozenset({"episode_script"}),
+        frozenset({"episode_boundary_review"}),
+        frozenset({"character_roster"}),
+        frozenset({"dialogue_cue_sheet"}),
+        frozenset({"ai_shot_plan"}),
+        frozenset({"ai_video_boundary_review"}),
     ),
     "episode_script": (
         frozenset({"adaptation_decision_ledger"}),
@@ -597,6 +626,12 @@ OPTIONAL_UPSTREAM_TYPES: dict[str, frozenset[str]] = {
         "continuity_ledger",
         "ai_video_boundary_review",
     }),
+    "episode_delivery_manifest": frozenset({
+        "style_anchor",
+        "character_anchor",
+        "scene_anchor",
+        "prop_anchor",
+    }),
 }
 OPTIONAL_UPSTREAM_TYPES["final_package"] = frozenset(
     set(ARTIFACT_TYPES) - {"final_package", "delivery_manifest", "series_delivery_manifest"}
@@ -657,6 +692,7 @@ ARTIFACT_STAGE = {
     "ai_shot_plan": "final_delivery",
     "ai_video_boundary_review": "final_delivery",
     "ai_video_execution_plan": "final_delivery",
+    "episode_delivery_manifest": "final_delivery",
     "batch_delivery_review": "final_delivery",
     "batch_delivery_manifest": "final_delivery",
     "batch_package": "final_delivery",
@@ -781,6 +817,17 @@ class ValidationContext:
         self.boundary_results: dict[
             tuple[Any, ...], tuple[str, dict[str, Any]] | None
         ] = {}
+
+
+class EpisodeDeliveryInputs(NamedTuple):
+    episode: str
+    script_text: str | None
+    roster: dict[str, Any] | None
+    anchors: dict[str, dict[str, Any]]
+    plan: dict[str, Any] | None
+    dependencies: tuple[dict[str, Any], ...]
+    storyboard_payloads: dict[str, Any]
+    input_fingerprint: str
 
 
 def now_iso() -> str:
@@ -2492,6 +2539,7 @@ def command_register_artifact(args: argparse.Namespace) -> int:
         "series_delivery_manifest",
         "batch_delivery_manifest",
         "batch_package",
+        "episode_delivery_manifest",
     }:
         raise ToolError(
             f"{artifact_kind} 只能由 build-handoff 生成，不能手工登记"
@@ -3534,6 +3582,16 @@ def require_execution_ready(
     return control, fingerprint
 
 
+def require_production_execution(
+    project_path: Path,
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    control, fingerprint = require_execution_ready(project_path, state)
+    if control.get("execution_mode") != "production":
+        raise agent_runtime.AgentRuntimeError("production_execution_required")
+    return control, fingerprint
+
+
 def load_agent_run(project_path: Path) -> dict[str, Any]:
     path = agent_runtime.runtime_paths(project_path)["run"]
     if not path.is_file():
@@ -3893,6 +3951,14 @@ def command_plan_agent_slice(args: argparse.Namespace) -> int:
         operation,
         args.task_type,
     )
+    if AI_VIDEO_SOURCE_CONTRACT_TASK_TYPES.intersection(
+        {args.task_type, operation}
+    ) and validate_ai_video_source_contract_ready(
+        project_path,
+        state,
+        episode=scope.get("episode_id"),
+    ):
+        raise ToolError("ai_video_source_contract_not_ready")
     decision_identity = agent_runtime.build_decision_identity(
         project_id=state["project_id"],
         stage=stage,
@@ -4429,6 +4495,83 @@ def result_errors_are_candidate_failures(
         and error.get("code") in CANDIDATE_RESULT_ERROR_CODES
         for error in errors
     )
+
+
+def command_write_agent_result(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    require_execution_ready(project_path, state)
+    task_path = agent_runtime.task_path_for(project_path, args.task_id)
+    if not task_path.is_file():
+        raise ToolError(f"任务不存在：{args.task_id}")
+    task = agent_runtime.read_json(task_path)
+    task_errors = agent_runtime.validate_task_package(
+        task, project_path, sha256_file
+    )
+    if task_errors:
+        raise ToolError(
+            json.dumps(
+                {"error": "task_invalid", "errors": task_errors},
+                ensure_ascii=False,
+            )
+        )
+    telemetry = {
+        field: getattr(args, field)
+        for field in agent_runtime.TIMING_FIELDS
+        if getattr(args, field) is not None
+    }
+    telemetry["error_class"] = (
+        args.error_class
+        if args.error_class is not None
+        else (
+            "none"
+            if args.status == "completed"
+            else agent_runtime.classify_error(args.error_code)
+        )
+    )
+    result = agent_runtime.build_result_envelope(
+        task_id=task["task_id"],
+        idempotency_key=task["idempotency_key"],
+        status=args.status,
+        candidate_output_paths=args.candidate_output,
+        error_code=args.error_code,
+        telemetry=telemetry,
+    )
+    result_errors = agent_runtime.validate_result_envelope(
+        task, result, project_path
+    )
+    if result_errors:
+        raise ToolError(
+            json.dumps(
+                {"error": "result_invalid", "errors": result_errors},
+                ensure_ascii=False,
+            )
+        )
+    result_path = agent_runtime.result_path_for(
+        project_path, task["task_id"]
+    )
+    reused = False
+    if result_path.is_file():
+        existing = agent_runtime.read_json(result_path)
+        if existing != result:
+            raise ToolError(
+                "agent_result_already_exists：同一任务已经存在不同结果，拒绝覆盖"
+            )
+        reused = True
+    else:
+        agent_runtime.atomic_write_json(result_path, result)
+    print_json(
+        {
+            "ok": True,
+            "task_id": task["task_id"],
+            "result_path": agent_task_relative_path(
+                project_path, result_path
+            ),
+            "status": result["status"],
+            "reused": reused,
+            "telemetry": result["telemetry"],
+        }
+    )
+    return 0
 
 
 def block_agent_acceptance_failure(
@@ -5044,8 +5187,11 @@ def command_startup_preflight(args: argparse.Namespace) -> int:
     required_contracts = (
         "startup-preflight",
         "plan-agent-slice",
+        "write-agent-result",
         "accept-agent-result",
         "show-agent-runtime",
+        "render-episode-delivery",
+        "validate-episode-delivery",
     )
     if should_run:
         environment_errors = agent_runtime.validate_environment_snapshot(
@@ -5207,13 +5353,94 @@ def command_startup_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
+def delivery_dependency_ref(
+    project_path: Path,
+    artifact_key: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    path = path_from_record(project_path, record.get("path"))
+    if path is None or not path.is_file():
+        raise ToolError(f"逐集交付依赖文件不存在：{artifact_key}")
+    return {
+        "artifact_key": artifact_key,
+        "version": record["version"],
+        "path": safe_relative_path(path, project_path),
+        "sha256": sha256_file(path),
+    }
+
+
 def episode_delivery_inputs(
     project_path: Path, state: dict[str, Any], episode: str
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[EpisodeDeliveryInputs, list[dict[str, Any]]]:
+    import render_episode_script
+    import render_storyboard
+
+    source_contract_errors = validate_ai_video_source_contract_ready(
+        project_path,
+        state,
+        episode=episode,
+    )
+    if source_contract_errors:
+        return (
+            EpisodeDeliveryInputs(
+                episode=episode,
+                script_text=None,
+                roster=None,
+                anchors={},
+                plan=None,
+                dependencies=(),
+                storyboard_payloads={},
+                input_fingerprint=agent_runtime.canonical_sha256(
+                    {
+                        "project_id": state.get("project_id"),
+                        "episode": episode,
+                        "source_contract_errors": source_contract_errors,
+                    }
+                ),
+            ),
+            [
+                issue(
+                    "ai_video_source_contract_not_ready",
+                    "AI视频下游要求当前确认的 schema v2 事件索引、beats 和目标集 episode_scopes",
+                    details=source_contract_errors,
+                )
+            ],
+        )
+
     context = ValidationContext()
     errors: list[dict[str, Any]] = []
-    dependencies: list[dict[str, Any]] = []
+    dependency_refs: dict[tuple[str, int], dict[str, Any]] = {}
     storyboard_payloads: dict[str, Any] = {}
+
+    def add_dependency(key: str, record: dict[str, Any]) -> None:
+        try:
+            dependency = delivery_dependency_ref(project_path, key, record)
+        except ToolError:
+            errors.append(
+                issue(
+                    "episode_delivery_input_file_missing",
+                    "逐集交付依赖文件不存在",
+                    artifact_key=key,
+                )
+            )
+            return
+        dependency_refs[(key, record["version"])] = dependency
+
+    def read_payload(key: str, record: dict[str, Any]) -> Any:
+        if key in storyboard_payloads:
+            return storyboard_payloads[key]
+        path = path_from_record(project_path, record.get("path"))
+        if path is None or not path.is_file():
+            return None
+        if path.suffix.lower() == ".json":
+            payload: Any = read_json_file_cached(path, context)
+        else:
+            try:
+                payload = path.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeError):
+                return None
+        storyboard_payloads[key] = payload
+        return payload
 
     def require_current(key: str, label: str) -> dict[str, Any] | None:
         record = latest_record(state, key)
@@ -5222,21 +5449,29 @@ def episode_delivery_inputs(
         ):
             errors.append(issue("episode_delivery_input_missing", f"缺少当前已确认{label}", artifact_key=key))
             return None
-        dependencies.append({"artifact_key": key, "version": record["version"]})
+        add_dependency(key, record)
         return record
 
     script_key = f"episode_script:{episode}"
     plan_key = f"ai_shot_plan:{episode}"
     script_record = require_current(script_key, "分集剧本")
     plan_record = require_current(plan_key, "AI分镜计划")
-    if isinstance(script_record, dict) and matching_boundary_review(
-        state, script_key, script_record, project_path, context=context
-    ) is None:
-        errors.append(issue("episode_delivery_script_review_missing", "分集剧本缺少当前 passed 内容边界报告"))
-    if isinstance(plan_record, dict) and matching_boundary_review(
-        state, plan_key, plan_record, project_path, context=context
-    ) is None:
-        errors.append(issue("episode_delivery_shot_review_missing", "AI分镜计划缺少当前 passed 内容边界报告"))
+    if isinstance(script_record, dict):
+        script_review = matching_boundary_review(
+            state, script_key, script_record, project_path, context=context
+        )
+        if script_review is None:
+            errors.append(issue("episode_delivery_script_review_missing", "分集剧本缺少当前 passed 内容边界报告"))
+        else:
+            add_dependency(script_review[0], script_review[1])
+    if isinstance(plan_record, dict):
+        shot_review = matching_boundary_review(
+            state, plan_key, plan_record, project_path, context=context
+        )
+        if shot_review is None:
+            errors.append(issue("episode_delivery_shot_review_missing", "AI分镜计划缺少当前 passed 内容边界报告"))
+        else:
+            add_dependency(shot_review[0], shot_review[1])
 
     roster_dependency = (
         dependency_record_of_type(state, plan_record, "character_roster")
@@ -5248,9 +5483,10 @@ def episode_delivery_inputs(
         if roster_dependency is not None
         else latest_record(state, "character_roster")
     )
+    roster_key = roster_dependency[0] if roster_dependency is not None else "character_roster"
     if not isinstance(roster_record, dict) or not confirmed_record_is_usable(
         state,
-        "character_roster",
+        roster_key,
         roster_record,
         project_path,
         context=context,
@@ -5258,9 +5494,11 @@ def episode_delivery_inputs(
         errors.append(issue("episode_delivery_roster_missing", "缺少当前已确认角色提取表"))
         roster_payload = None
     else:
-        dependencies.append({"artifact_key": "character_roster", "version": roster_record["version"]})
+        add_dependency(roster_key, roster_record)
         roster_path = path_from_record(project_path, roster_record.get("path"))
-        roster_payload = read_json_file(roster_path) if roster_path else None
+        roster_payload = (
+            read_json_file_cached(roster_path, context) if roster_path else None
+        )
 
     plan_payload: dict[str, Any] | None = None
     anchors: dict[str, dict[str, Any]] = {}
@@ -5303,7 +5541,63 @@ def episode_delivery_inputs(
                 continue
             anchors[payload["character_id"]] = payload
             storyboard_payloads[key] = payload
-            dependencies.append({"artifact_key": key, "version": version})
+            add_dependency(key, record)
+
+    if isinstance(plan_record, dict):
+        cue_dependency = dependency_record_of_type(
+            state, plan_record, "dialogue_cue_sheet"
+        )
+        cue_key = cue_dependency[0] if cue_dependency is not None else "dialogue_cue_sheet"
+        cue_record = (
+            cue_dependency[1]
+            if cue_dependency is not None
+            else latest_record(state, cue_key)
+        )
+        if not isinstance(cue_record, dict) or not confirmed_record_is_usable(
+            state,
+            cue_key,
+            cue_record,
+            project_path,
+            context=context,
+        ):
+            errors.append(
+                issue(
+                    "episode_delivery_dialogue_cues_missing",
+                    "缺少当前已确认台词声音表",
+                    artifact_key=cue_key,
+                )
+            )
+        else:
+            cue_payload = read_payload(cue_key, cue_record)
+            storyboard_payloads["dialogue_cue_sheet"] = cue_payload
+            add_dependency(cue_key, cue_record)
+
+    spec_record = require_current("project_spec", "项目规格")
+    if isinstance(spec_record, dict):
+        storyboard_payloads["project_spec"] = read_payload(
+            "project_spec", spec_record
+        )
+
+    for prefix in (
+        "style_anchor",
+        "character_anchor",
+        "scene_anchor",
+        "prop_anchor",
+    ):
+        for key in sorted(state.get("artifacts", {})):
+            if key != prefix and not key.startswith(prefix + ":"):
+                continue
+            record = latest_record(state, key)
+            if not isinstance(record, dict) or not confirmed_record_is_usable(
+                state,
+                key,
+                record,
+                project_path,
+                context=context,
+            ):
+                continue
+            read_payload(key, record)
+            add_dependency(key, record)
 
     script_text: str | None = None
     if isinstance(script_record, dict):
@@ -5316,16 +5610,34 @@ def episode_delivery_inputs(
         if not isinstance(script_text, str):
             errors.append(issue("episode_delivery_script_unreadable", "分集剧本无法读取"))
 
-    return (
+    dependencies = tuple(
+        dependency_refs[key]
+        for key in sorted(dependency_refs, key=lambda item: (item[0], item[1]))
+    )
+    input_fingerprint = agent_runtime.canonical_sha256(
         {
+            "project_id": state.get("project_id"),
+            "project_name": state.get("name"),
             "episode": episode,
-            "script_text": script_text,
-            "roster": roster_payload,
-            "anchors": anchors,
-            "plan": plan_payload,
+            "plugin_version": agent_runtime.PLUGIN_VERSION,
+            "runtime_version": agent_runtime.RUNTIME_VERSION,
+            "rule_version": agent_runtime.RULE_VERSION,
+            "docx_contract_version": render_episode_script.RENDER_CONTRACT_VERSION,
+            "storyboard_contract_version": render_storyboard.RENDER_CONTRACT_VERSION,
             "dependencies": dependencies,
-            "storyboard_payloads": storyboard_payloads,
-        },
+        }
+    )
+    return (
+        EpisodeDeliveryInputs(
+            episode=episode,
+            script_text=script_text,
+            roster=roster_payload,
+            anchors=anchors,
+            plan=plan_payload,
+            dependencies=dependencies,
+            storyboard_payloads=storyboard_payloads,
+            input_fingerprint=input_fingerprint,
+        ),
         errors,
     )
 
@@ -5340,7 +5652,383 @@ def validate_episode_delivery_readiness(
         "ready": not errors,
         "episode": episode,
         "errors": errors,
-        "dependencies": _inputs["dependencies"],
+        "dependencies": list(_inputs.dependencies),
+        "input_fingerprint": _inputs.input_fingerprint,
+    }
+
+
+def episode_delivery_output_ref(
+    project_path: Path,
+    path: Path,
+) -> dict[str, Any]:
+    return {
+        "path": safe_relative_path(path, project_path),
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def episode_delivery_file_errors(
+    docx_path: Path,
+    html_path: Path,
+) -> list[dict[str, Any]]:
+    import render_storyboard
+
+    errors: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(docx_path) as archive:
+            names = set(archive.namelist())
+            corrupt_member = archive.testzip()
+    except (OSError, zipfile.BadZipFile):
+        names = set()
+        corrupt_member = "unreadable"
+    required_docx_members = {"[Content_Types].xml", "word/document.xml"}
+    if not required_docx_members.issubset(names) or corrupt_member is not None:
+        errors.append(
+            issue(
+                "episode_delivery_docx_invalid",
+                "逐集交付 DOCX 结构无效",
+            )
+        )
+    try:
+        html_text = html_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        html_text = ""
+    if render_storyboard.HTML_TEMPLATE_MARKER not in html_text:
+        errors.append(
+            issue(
+                "episode_delivery_template_marker_missing",
+                "逐集交付 HTML 缺少标准渲染契约标记",
+            )
+        )
+    if "AI导演插件 render_storyboard" not in html_text:
+        errors.append(
+            issue(
+                "episode_delivery_renderer_marker_missing",
+                "逐集交付 HTML 缺少标准渲染器来源标记",
+            )
+        )
+    return errors
+
+
+def next_episode_delivery_manifest_version(
+    state: dict[str, Any],
+    episode: str,
+) -> int:
+    records = state.get("artifacts", {}).get(
+        f"episode_delivery_manifest:{episode}", []
+    )
+    versions = [
+        record.get("version")
+        for record in records
+        if isinstance(record, dict) and type(record.get("version")) is int
+    ]
+    return max(versions, default=0) + 1
+
+
+def build_episode_delivery_manifest(
+    *,
+    project_path: Path,
+    state: dict[str, Any],
+    episode: str,
+    inputs: EpisodeDeliveryInputs,
+    docx_path: Path,
+    html_path: Path,
+    storyboard_fingerprint: str,
+    reused: bool,
+) -> dict[str, Any]:
+    import render_episode_script
+    import render_storyboard
+
+    return {
+        "schema_version": EPISODE_DELIVERY_MANIFEST_SCHEMA_VERSION,
+        "project_id": state.get("project_id"),
+        "episode_id": episode,
+        "generation_entrypoint": EPISODE_DELIVERY_ENTRYPOINT,
+        "plugin_version": agent_runtime.PLUGIN_VERSION,
+        "runtime_version": agent_runtime.RUNTIME_VERSION,
+        "rule_version": agent_runtime.RULE_VERSION,
+        "docx_contract_version": render_episode_script.RENDER_CONTRACT_VERSION,
+        "storyboard_contract_version": render_storyboard.RENDER_CONTRACT_VERSION,
+        "input_fingerprint": inputs.input_fingerprint,
+        "inputs": list(inputs.dependencies),
+        "storyboard_input_fingerprint": storyboard_fingerprint,
+        "outputs": {
+            "docx": episode_delivery_output_ref(project_path, docx_path),
+            "html": episode_delivery_output_ref(project_path, html_path),
+        },
+        "reused": reused,
+        "generated_at": now_iso(),
+    }
+
+
+def register_episode_delivery_manifest(
+    project_path: Path,
+    state: dict[str, Any],
+    episode: str,
+    manifest_path: Path,
+    dependencies: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    key = f"episode_delivery_manifest:{episode}"
+    artifact_kind = artifact_type(key)
+    state_dependencies = [
+        {
+            "artifact_key": dependency["artifact_key"],
+            "version": dependency["version"],
+        }
+        for dependency in dependencies
+    ]
+    validate_dependency_shape(key, state_dependencies)
+    records = state.setdefault("artifacts", {}).setdefault(key, [])
+    version = next_episode_delivery_manifest_version(state, episode)
+    record = {
+        "version": version,
+        "artifact_type": artifact_kind,
+        "path": safe_relative_path(manifest_path, project_path),
+        "size_bytes": manifest_path.stat().st_size,
+        "sha256": sha256_file(manifest_path),
+        "status": "awaiting_approval",
+        "depends_on": state_dependencies,
+        "registered_at": now_iso(),
+        "note": "由标准逐集交付命令确定性生成并自动验收",
+    }
+    records.append(record)
+    affected = confirm_record(
+        state,
+        key,
+        record,
+        f"逐集交付 {episode} 已由标准入口生成新版本",
+    )
+    approvals = state.setdefault("approvals", [])
+    approvals.append(
+        {
+            "approval_id": str(uuid.uuid4()),
+            "artifact_key": key,
+            "version": version,
+            "approved_at": now_iso(),
+            "approved_by": "project_tool",
+            "approval_type": "deterministic_delivery_validation",
+            "note": "标准入口、输入指纹、模板契约和输出哈希均已验证",
+        }
+    )
+    append_history(
+        state,
+        "episode_delivery_manifest_registered",
+        {
+            "artifact_key": key,
+            "version": version,
+            "path": record["path"],
+            "downstream_marked_stale": affected,
+        },
+    )
+    return record
+
+
+def validate_episode_delivery_state(
+    project_path: Path,
+    state: dict[str, Any],
+    episode: str,
+    *,
+    current_inputs: EpisodeDeliveryInputs | None = None,
+) -> dict[str, Any]:
+    import render_episode_script
+    import render_storyboard
+
+    errors: list[dict[str, Any]] = []
+    key = f"episode_delivery_manifest:{episode}"
+    record = latest_record(state, key)
+    manifest_path = (
+        path_from_record(project_path, record.get("path"))
+        if isinstance(record, dict)
+        else None
+    )
+    manifest: dict[str, Any] | None = None
+    if not isinstance(record, dict) or manifest_path is None or not manifest_path.is_file():
+        errors.append(
+            issue(
+                "episode_delivery_manifest_missing",
+                "缺少当前逐集正式交付来源清单",
+                artifact_key=key,
+            )
+        )
+    else:
+        if record.get("status") != "confirmed" or not has_active_approval(
+            state, key, record.get("version")
+        ):
+            errors.append(
+                issue(
+                    "episode_delivery_manifest_unconfirmed",
+                    "逐集交付来源清单未通过确定性验收",
+                    artifact_key=key,
+                )
+            )
+        if (
+            record.get("sha256") != sha256_file(manifest_path)
+            or record.get("size_bytes") != manifest_path.stat().st_size
+        ):
+            errors.append(
+                issue(
+                    "episode_delivery_manifest_hash_mismatch",
+                    "逐集交付来源清单在登记后已变化",
+                    artifact_key=key,
+                )
+            )
+        try:
+            manifest = read_json_file(manifest_path)
+        except ToolError:
+            errors.append(
+                issue(
+                    "episode_delivery_manifest_invalid",
+                    "逐集交付来源清单无法读取",
+                    artifact_key=key,
+                )
+            )
+
+    if current_inputs is None:
+        inputs, input_errors = episode_delivery_inputs(
+            project_path, state, episode
+        )
+    else:
+        inputs = current_inputs
+        input_errors = []
+    if input_errors:
+        errors.append(
+            issue(
+                "episode_delivery_input_stale",
+                "逐集交付当前输入已失效",
+                input_errors=input_errors,
+            )
+        )
+
+    outputs: dict[str, Any] = {}
+    if isinstance(manifest, dict):
+        if manifest.get("schema_version") != EPISODE_DELIVERY_MANIFEST_SCHEMA_VERSION:
+            errors.append(
+                issue(
+                    "episode_delivery_manifest_schema_invalid",
+                    "逐集交付来源清单 schema_version 无效",
+                )
+            )
+        if manifest.get("project_id") != state.get("project_id"):
+            errors.append(
+                issue(
+                    "episode_delivery_manifest_project_mismatch",
+                    "逐集交付来源清单 project_id 不一致",
+                )
+            )
+        if manifest.get("episode_id") != episode:
+            errors.append(
+                issue(
+                    "episode_delivery_manifest_episode_mismatch",
+                    "逐集交付来源清单集号不一致",
+                )
+            )
+        if manifest.get("generation_entrypoint") != EPISODE_DELIVERY_ENTRYPOINT:
+            errors.append(
+                issue(
+                    "episode_delivery_entrypoint_invalid",
+                    "逐集交付不是由标准入口生成",
+                )
+            )
+        version_fields = {
+            "plugin_version": agent_runtime.PLUGIN_VERSION,
+            "runtime_version": agent_runtime.RUNTIME_VERSION,
+            "rule_version": agent_runtime.RULE_VERSION,
+            "docx_contract_version": render_episode_script.RENDER_CONTRACT_VERSION,
+            "storyboard_contract_version": render_storyboard.RENDER_CONTRACT_VERSION,
+        }
+        for field, expected in version_fields.items():
+            if manifest.get(field) != expected:
+                errors.append(
+                    issue(
+                        "episode_delivery_contract_version_mismatch",
+                        "逐集交付来源清单绑定的运行或渲染契约已变化",
+                        field=field,
+                        expected=expected,
+                        actual=manifest.get(field),
+                    )
+                )
+        if (
+            manifest.get("input_fingerprint") != inputs.input_fingerprint
+            or manifest.get("inputs") != list(inputs.dependencies)
+        ):
+            errors.append(
+                issue(
+                    "episode_delivery_input_stale",
+                    "逐集交付输入版本或哈希已变化",
+                )
+            )
+        raw_outputs = manifest.get("outputs")
+        outputs = raw_outputs if isinstance(raw_outputs, dict) else {}
+        expected_paths = {
+            "docx": (
+                project_path
+                / "09_定稿交付"
+                / "分集交付"
+                / episode
+                / f"{episode}_剧本.docx"
+            ),
+            "html": (
+                project_path
+                / "09_定稿交付"
+                / "分集交付"
+                / episode
+                / f"{episode}_故事板.html"
+            ),
+        }
+        resolved_outputs: dict[str, Path] = {}
+        for kind, expected_path in expected_paths.items():
+            output_ref = outputs.get(kind)
+            output_path = (
+                path_from_record(project_path, output_ref.get("path"))
+                if isinstance(output_ref, dict)
+                else None
+            )
+            if output_path != expected_path.resolve() or not output_path.is_file():
+                errors.append(
+                    issue(
+                        "episode_delivery_output_missing",
+                        "逐集交付输出缺失或路径不符合标准",
+                        output_type=kind,
+                    )
+                )
+                continue
+            resolved_outputs[kind] = output_path
+            if (
+                output_ref.get("sha256") != sha256_file(output_path)
+                or output_ref.get("size_bytes") != output_path.stat().st_size
+            ):
+                errors.append(
+                    issue(
+                        "episode_delivery_output_hash_mismatch",
+                        "逐集交付输出在生成后已被覆盖或修改",
+                        output_type=kind,
+                    )
+                )
+        if set(resolved_outputs) == {"docx", "html"}:
+            errors.extend(
+                episode_delivery_file_errors(
+                    resolved_outputs["docx"],
+                    resolved_outputs["html"],
+                )
+            )
+
+    return {
+        "official_delivery": not errors,
+        "episode": episode,
+        "manifest": (
+            safe_relative_path(manifest_path, project_path)
+            if manifest_path is not None and manifest_path.is_file()
+            else None
+        ),
+        "generation_entrypoint": (
+            manifest.get("generation_entrypoint")
+            if isinstance(manifest, dict)
+            else None
+        ),
+        "input_fingerprint": inputs.input_fingerprint,
+        "outputs": outputs,
+        "errors": errors,
     }
 
 
@@ -5349,16 +6037,38 @@ def command_render_episode_delivery(args: argparse.Namespace) -> int:
     import render_storyboard
 
     project_path, state = load_state(args.project)
+    require_production_execution(project_path, state)
     episode = str(args.episode).upper()
     if not EPISODE_ID_RE.fullmatch(episode):
         raise ToolError("集号必须使用 E001 形式")
     inputs, errors = episode_delivery_inputs(project_path, state, episode)
     if errors:
+        if any(
+            item.get("code") == "ai_video_source_contract_not_ready"
+            for item in errors
+        ):
+            raise ToolError("ai_video_source_contract_not_ready")
         codes = "、".join(dict.fromkeys(item["code"] for item in errors))
         raise ToolError(f"逐集交付未就绪：{codes}")
-    parsed = render_episode_script.parse_episode_script(inputs["script_text"])
+    reusable = validate_episode_delivery_state(
+        project_path,
+        state,
+        episode,
+        current_inputs=inputs,
+    )
+    if reusable["official_delivery"]:
+        print_json(
+            {
+                "ok": True,
+                **reusable,
+                "reused": True,
+                "dependencies": list(inputs.dependencies),
+            }
+        )
+        return 0
+    parsed = render_episode_script.parse_episode_script(inputs.script_text)
     insertions = render_episode_script.build_turnaround_insertions(
-        episode, parsed["scenes"], inputs["roster"], inputs["anchors"]
+        episode, parsed["scenes"], inputs.roster, inputs.anchors
     )
     output_dir = project_path / "09_定稿交付" / "分集交付" / episode
     allowed_names = {f"{episode}_剧本.docx", f"{episode}_故事板.html"}
@@ -5367,28 +6077,118 @@ def command_render_episode_delivery(args: argparse.Namespace) -> int:
         if extras:
             raise ToolError(f"逐集交付目录存在非目标文件，拒绝覆盖：{extras}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    script_output = render_episode_script.write_docx(
-        str(state.get("name") or project_path.name),
-        parsed,
-        insertions,
-        output_dir / f"{episode}_剧本.docx",
-    )
-    html_output = render_storyboard.render(
+    script_output = output_dir / f"{episode}_剧本.docx"
+    html_output = output_dir / f"{episode}_故事板.html"
+    temporary_token = uuid.uuid4().hex
+    temporary_script = output_dir / f".{episode}_剧本.{temporary_token}.docx"
+    temporary_html = output_dir / f".{episode}_故事板.{temporary_token}.html"
+    try:
+        render_episode_script.write_docx(
+            str(state.get("name") or project_path.name),
+            parsed,
+            insertions,
+            temporary_script,
+        )
+        render_storyboard.render(
+            project_path,
+            episode,
+            temporary_html,
+            state=state,
+            preloaded=inputs.storyboard_payloads,
+        )
+        file_errors = episode_delivery_file_errors(
+            temporary_script,
+            temporary_html,
+        )
+        if file_errors:
+            raise ToolError(
+                json.dumps(
+                    {
+                        "error": "episode_delivery_output_invalid",
+                        "errors": file_errors,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        os.replace(temporary_script, script_output)
+        os.replace(temporary_html, html_output)
+    finally:
+        temporary_script.unlink(missing_ok=True)
+        temporary_html.unlink(missing_ok=True)
+
+    plan_record = latest_record(state, f"ai_shot_plan:{episode}")
+    if not isinstance(plan_record, dict):
+        raise ToolError("逐集交付缺少当前 AI 分镜计划")
+    storyboard_fingerprint = render_storyboard.storyboard_input_fingerprint(
         project_path,
+        state,
         episode,
-        output_dir / f"{episode}_故事板.html",
-        state=state,
-        preloaded=inputs["storyboard_payloads"],
+        plan_record,
     )
+    manifest_version = next_episode_delivery_manifest_version(state, episode)
+    manifest_path = (
+        project_path
+        / ".ai-director"
+        / "runtime"
+        / "deliveries"
+        / episode
+        / f"manifest-v{manifest_version}.json"
+    )
+    manifest = build_episode_delivery_manifest(
+        project_path=project_path,
+        state=state,
+        episode=episode,
+        inputs=inputs,
+        docx_path=script_output,
+        html_path=html_output,
+        storyboard_fingerprint=storyboard_fingerprint,
+        reused=False,
+    )
+    atomic_write_json(manifest_path, manifest)
+    register_episode_delivery_manifest(
+        project_path,
+        state,
+        episode,
+        manifest_path,
+        inputs.dependencies,
+    )
+    validation = validate_episode_delivery_state(
+        project_path,
+        state,
+        episode,
+        current_inputs=inputs,
+    )
+    if not validation["official_delivery"]:
+        raise ToolError(
+            json.dumps(
+                {
+                    "error": "episode_delivery_validation_failed",
+                    "errors": validation["errors"],
+                },
+                ensure_ascii=False,
+            )
+        )
+    save_state(project_path, state)
     print_json(
         {
             "ok": True,
-            "episode": episode,
-            "outputs": [str(script_output), str(html_output)],
-            "dependencies": inputs["dependencies"],
+            **validation,
+            "reused": False,
+            "dependencies": list(inputs.dependencies),
         }
     )
     return 0
+
+
+def command_validate_episode_delivery(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    require_production_execution(project_path, state)
+    episode = str(args.episode).upper()
+    if not EPISODE_ID_RE.fullmatch(episode):
+        raise ToolError("集号必须使用 E001 形式")
+    validation = validate_episode_delivery_state(project_path, state, episode)
+    print_json({"ok": validation["official_delivery"], **validation})
+    return 0 if validation["official_delivery"] else 2
 
 
 def command_render_storyboard(args: argparse.Namespace) -> int:
@@ -5396,11 +6196,17 @@ def command_render_storyboard(args: argparse.Namespace) -> int:
     import render_storyboard
 
     project_path, state = load_state(args.project)
+    require_production_execution(project_path, state)
     episode = str(args.episode).upper()
     if not EPISODE_ID_RE.fullmatch(episode):
         raise ToolError("集号必须使用 E001 形式")
     inputs, errors = episode_delivery_inputs(project_path, state, episode)
     if errors:
+        if any(
+            item.get("code") == "ai_video_source_contract_not_ready"
+            for item in errors
+        ):
+            raise ToolError("ai_video_source_contract_not_ready")
         codes = "、".join(dict.fromkeys(item["code"] for item in errors))
         raise ToolError(f"故事板渲染未就绪：{codes}")
     requested_output = resolve_project_output(project_path, args.output) if args.output else None
@@ -5409,7 +6215,7 @@ def command_render_storyboard(args: argparse.Namespace) -> int:
         episode,
         requested_output,
         state=state,
-        preloaded=inputs["storyboard_payloads"],
+        preloaded=inputs.storyboard_payloads,
     )
     print_json({"ok": True, "output": str(output)})
     return 0
@@ -6566,6 +7372,110 @@ def source_beat_index(event_index: dict[str, Any] | None) -> dict[str, dict[str,
                     "story_time": beat.get("story_time") if isinstance(beat.get("story_time"), dict) else None,
                 }
     return result
+
+
+def validate_ai_video_source_contract_ready(
+    project_path: Path,
+    state: dict[str, Any],
+    *,
+    episode: Any = None,
+) -> list[dict[str, Any]]:
+    spec = confirmed_project_spec_payload(project_path, state)
+    delivery_target = (
+        spec.get("delivery_target", "ai_video")
+        if isinstance(spec, dict)
+        else "ai_video"
+    )
+    if delivery_target == "human_team":
+        return []
+    if delivery_target not in {"ai_video", "both"}:
+        return [
+            issue(
+                "ai_video_delivery_target_invalid",
+                "项目规格 delivery_target 必须为 ai_video、both 或 human_team",
+                delivery_target=delivery_target,
+            )
+        ]
+
+    record = latest_record(state, "source_event_index")
+    if not isinstance(record, dict) or not confirmed_record_is_usable(
+        state,
+        "source_event_index",
+        record,
+        project_path,
+    ):
+        return [
+            issue(
+                "ai_video_source_event_index_unavailable",
+                "AI视频下游要求当前可用且已确认的原著事件索引",
+            )
+        ]
+    path = path_from_record(project_path, record.get("path"))
+    try:
+        payload = (
+            json.loads(path.read_text(encoding="utf-8-sig"))
+            if path is not None and path.suffix.lower() == ".json"
+            else None
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        return [
+            issue(
+                "ai_video_source_event_index_unreadable",
+                "AI视频下游要求可读取的 JSON 原著事件索引",
+            )
+        ]
+
+    errors: list[dict[str, Any]] = []
+    if payload.get("schema_version") != 2:
+        errors.append(
+            issue(
+                "ai_video_source_schema_v2_required",
+                "AI视频下游要求 source_event_index.schema_version=2",
+            )
+        )
+    beats = source_beat_index(payload)
+    if not beats:
+        errors.append(
+            issue(
+                "ai_video_source_beats_required",
+                "AI视频下游要求原著事件索引包含可校验 beats",
+            )
+        )
+    scopes = payload.get("episode_scopes")
+    if not isinstance(scopes, dict) or not scopes:
+        errors.append(
+            issue(
+                "ai_video_episode_scopes_required",
+                "AI视频下游要求原著事件索引包含 episode_scopes",
+            )
+        )
+        return errors
+
+    if isinstance(episode, str) and EPISODE_ID_RE.fullmatch(episode):
+        scope = scopes.get(episode)
+        allowed = (
+            scope.get("allowed_beat_ids")
+            if isinstance(scope, dict)
+            else None
+        )
+        if (
+            not isinstance(allowed, list)
+            or not allowed
+            or not all(
+                isinstance(beat_id, str) and beat_id in beats
+                for beat_id in allowed
+            )
+        ):
+            errors.append(
+                issue(
+                    "ai_video_episode_scope_invalid",
+                    "目标集 episode_scopes 必须声明非空且有效的 allowed_beat_ids",
+                    episode_id=episode,
+                )
+            )
+    return errors
 
 
 CONTENT_ATOM_KINDS = {
@@ -13440,6 +14350,37 @@ def build_parser() -> argparse.ArgumentParser:
     agent_slice_parser.add_argument("--service-capacity", type=int)
     agent_slice_parser.set_defaults(handler=command_plan_agent_slice)
 
+    write_agent_result_parser = subparsers.add_parser(
+        "write-agent-result",
+        help="根据冻结任务包生成规范结果信封并原子写入运行时结果目录",
+    )
+    write_agent_result_parser.add_argument("project", help="项目目录")
+    write_agent_result_parser.add_argument("--task-id", required=True)
+    write_agent_result_parser.add_argument(
+        "--status",
+        choices=("completed", "failed"),
+        required=True,
+    )
+    write_agent_result_parser.add_argument(
+        "--candidate-output",
+        action="append",
+        default=[],
+        help="任务冻结候选目录内的项目相对路径，可重复传入",
+    )
+    write_agent_result_parser.add_argument("--error-code")
+    write_agent_result_parser.add_argument(
+        "--error-class",
+        choices=tuple(sorted(agent_runtime.ERROR_CLASSES)),
+    )
+    for timing_field in agent_runtime.TIMING_FIELDS:
+        write_agent_result_parser.add_argument(
+            "--" + timing_field.replace("_", "-"),
+            type=float,
+        )
+    write_agent_result_parser.set_defaults(
+        handler=command_write_agent_result
+    )
+
     accept_agent_parser = subparsers.add_parser(
         "accept-agent-result",
         help="校验智能体结果并由单一写入者登记候选制品",
@@ -13500,6 +14441,16 @@ def build_parser() -> argparse.ArgumentParser:
     episode_delivery_parser.add_argument("project", help="项目目录")
     episode_delivery_parser.add_argument("episode", help="集号，如 E001")
     episode_delivery_parser.set_defaults(handler=command_render_episode_delivery)
+
+    validate_episode_delivery_parser = subparsers.add_parser(
+        "validate-episode-delivery",
+        help="校验逐集DOCX、HTML、当前输入和标准生成入口的来源证明",
+    )
+    validate_episode_delivery_parser.add_argument("project", help="项目目录")
+    validate_episode_delivery_parser.add_argument("episode", help="集号，如 E001")
+    validate_episode_delivery_parser.set_defaults(
+        handler=command_validate_episode_delivery
+    )
 
     render_parser = subparsers.add_parser(
         "render-storyboard", help="把已确认的 AI 分镜计划渲染成单文件 HTML 故事板(只读)"
@@ -13609,6 +14560,7 @@ STATE_MUTATING_COMMANDS = {
     "mark-stale",
     "add-source",
     "plan-agent-slice",
+    "write-agent-result",
     "accept-agent-result",
     "startup-preflight",
     "render-episode-delivery",
