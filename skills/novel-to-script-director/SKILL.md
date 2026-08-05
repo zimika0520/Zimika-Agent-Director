@@ -19,6 +19,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 - `standard`：完整四道门禁，适合长剧集与多人协作。
 - `express`（单人快速通道）：门禁合并为两道——①项目规格＋改编定位＋改编圣经＋全剧地图一次性确认；②首集试写＋首集执行包一次性确认，此后按批次滚动交付。express 下首集剧本即试写稿：同一文件先登记为 `pilot_scripts` 并完成试写审核，通过后复登记为 `episode_script:E001`，不必另写一份试写。三层内容边界报告照常生成并保持前置；`blocked` 与 `suspected_overreach` 的拦截规则不变，express 只减少确认次数，不放松内容边界。
+- `synopsis`（简介受控扩写）：不复制第二套状态机，仍走现有四道门禁。新增简介事实索引、动态可行性、全剧地图确认、串行分集生产和降 AI 感表达质量检查。默认单集 `60—90` 秒、单集至少 `21` 个 AI 分镜单元；目标集数支持任意正整数。可行性不足时必须先停止，让用户补充简介、减少集数或提供明确授权，不得静默扩写。
 
 ## 交付边界
 
@@ -31,7 +32,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 - 图片、故事板图片、角色/场景生图和影音成品不属于本技能。用户提供的既有参考素材只能登记路径、URL或资产 ID，不能由本技能生成。
 - 不把“3场/集”“前3集”“每批3—5集”冒充行业标准；它们只能作为项目可调参数。
 - 不声称忠于未读到的原著。来源缺失、损坏或无法核验时明确写“不清楚”，不得补造。
-- 原著来源只来自用户提供。上传文件默认直接建档，不自动检查缺章、乱码、截断或完整度。来源类型使用 `self_owned`、`storyline` 或 `published_novel`；只有用户明确选择已发表小说、主动开启官网审核并提供官网或正版页面时，才读取该指定页面生成非阻塞 `source_review`，不自行全网搜索、不下载官网正文、不覆盖上传文件。
+- 原著来源只来自用户提供。上传文件默认直接建档，不自动检查缺章、乱码、截断或完整度。来源类型使用 `self_owned`、`storyline`、`published_novel` 或 `synopsis`；只有用户明确选择已发表小说、主动开启官网审核并提供官网或正版页面时，才读取该指定页面生成非阻塞 `source_review`，不自行全网搜索、不下载官网正文、不覆盖上传文件。`synopsis` 只接受用户提供的简介，并必须在初始化时提供目标集数。
 - 项目规格的 `rights_mode`（owned/licensed/unclear，缺省按 owned 处理）只登记用户声明的权利状态：`owned` 与 `licensed` 不讨论版权照常推进（licensed 可用 `rights_note` 记录授权范围）；`unclear` 时仅提示用户确认权利状态一次（提示不是错误），不阻塞任何流程。
 
 ## 内容边界总则
@@ -82,7 +83,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 不按小说总字数写死短/长流程。优先按章节、场景和事件建立稳定来源单元，再用当前运行时容量策略合并相邻单元。原著粗分析分片、四类制作提取和DOCX/HTML渲染可以在输入版本锁定后受控并发；全局ID归一、连续性、相邻集定稿和项目状态写入必须串行。主任务是唯一监督者，直接创建、等待和关闭不继承历史的一次性工作智能体；工作智能体只写独立候选文件，由主任务调用CLI验收和登记。实际规划、验收和恢复统一使用 `plan-agent-slice`、`accept-agent-result`、`show-agent-runtime`。`coordinator_slice`只表示逻辑业务片段，不创建第二级协调智能体。主任务必须回传当前活动宿主任务ID；缺少宿主、结果和检查点的活动任务进入`abandoned/recovery_required`，以相同幂等键最多受控重试一次，旧attempt不得形成第二个有效结果。同一顶层校验命令必须复用运行级依赖DAG与JSON payload缓存；该缓存不得跨命令持久化，文件版本或散列变化必须重新校验。
 
-生产来源分析必须维护`chapter_analysis_registry`和`rolling_source_progress`。相同`source_unit_id + content_sha256 + analysis_contract_version`不得重复分析；下一批先复用carryover，再从`next_read_start`规划新章节。使用`register-source-analysis`登记新的registry文件，使用`plan-rolling-source-window`生成增量窗口。所有输入输出必须位于显式项目根目录内。
+生产来源分析必须维护`chapter_analysis_registry`和schema v2 `rolling_source_progress`。滚动进度的`current_batch_id`只能是项目状态中已确认的`B01/B02`生产批次，`SA01/SA02`只是窗口编号，禁止冒充批次。相同`source_unit_id + content_sha256 + analysis_contract_version`不得重复分析；首窗完成后必须先写`batch_readiness`：`ready_for_batch`立即停止扩窗并转入当前B批次，`needs_more_source`必须写出非空`source_gap_reasons`后才能从`next_read_start`读取相邻新章节。使用`register-source-analysis`登记registry，使用`plan-rolling-source-window`生成受控窗口；不得连续预规划下一窗口或顺势分析全书。所有输入输出必须位于显式项目根目录内。
 
 ## 建立本地项目
 
@@ -91,7 +92,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 ```bash
 python3 <技能目录>/scripts/project_tool.py init \
   <项目目录> --name <项目名> --source <原始文件> \
-  [--source-kind self_owned|storyline|published_novel] \
+  [--source-kind self_owned|storyline|published_novel|synopsis] \
   [--official-review --official-url <指定页面>] \
   [--expected-episodes <目标集数>]
 ```
@@ -100,7 +101,9 @@ python3 <技能目录>/scripts/project_tool.py init \
 
 `--expected-episodes`记入状态的`expected_episodes_hint`，只用于固定全剧规格确认前的规划提示。运行时只读取有效确认的`project_spec`；更高版本仍为draft或awaiting_approval时不能覆盖上一份有效确认规格。`rolling_batch` schema v2允许`final_expected_episodes: null`，批次范围以显式用户确认的`project_state.batches`为权威。
 
-完整小说、部分章节、TXT、Markdown、Word 或其他可读取文档都直接登记。`self_owned` 与 `storyline` 不询问官网审核；`published_novel` 再询问用户是否审核，默认关闭。用户主动开启时必须提供 HTTP/HTTPS 页面，审核结论只展示，不阻塞原著解析。`--garble-threshold` 仅为旧命令兼容保留，当前版本不触发正文检查。
+完整小说、部分章节、TXT、Markdown、Word 或其他可读取文档都直接登记。`self_owned` 与 `storyline` 不询问官网审核；`published_novel` 再询问用户是否审核，默认关闭。`synopsis` 也必须以文件方式登记，粘贴内容先由宿主写入 `00_原始内容/` 再走同一来源路径。用户主动开启时必须提供 HTTP/HTTPS 页面，审核结论只展示，不阻塞原著解析。`--garble-threshold` 仅为旧命令兼容保留，当前版本不触发正文检查。
+
+`synopsis` 项目初始化必须提供 `--expected-episodes`，但该值只表示用户目标。正式生成前先建立 `source_mode: synopsis` 的事件索引和 `synopsis_feasibility`，逐集给出可核验的 `episode_slots`；只有 verdict 为 `sufficient` 且全剧地图确认后才能进入分集剧本。剧本写作按集号串行，提取和渲染可沿用现有受控并发。新增桥段必须绑定 `expansion_id`、`addition_basis`、`source_facts_unchanged: true` 和集尾状态变化；通用 AI 表达、重复反应和模板化钩子作为表达质量警告人工复核。
 
 直接读取 TXT/Markdown。PDF、DOCX 或扫描件使用对应文档读取能力，标准化文本写入 `01_原著解析/`，保留页码、章节或段落定位；无法可靠提取时停止并说明。
 
@@ -149,6 +152,7 @@ python3 <技能目录>/scripts/project_tool.py define-batch \
 - 批次大纲先登记 `awaiting_approval`，再生成精确绑定当前版本的 `batch_boundary_review`；边界报告通过后才能确认大纲并进入试写。
 - 将叙述、心理和作者评价转成可见动作、选择、阻力、反应、对白、VO或OS。
 - 每场必须形成“进入状态 → 当场任务 → 可见阻力 → 行动链 → 转折 → 离开状态”，不能只是对白之间插动作。
+- 所有文学剧本统一按 [human-script-format-template.md](references/human-script-format-template.md) 的对外格式输出：集标题使用 `第N集：标题`，场标题使用 `N-M 场景：地点 时间 / 内外`。
 - 按 [script-format-and-quality.md](references/script-format-and-quality.md) 写作并运行 `validate-script`。
 - 使用独立审核轮次核对试写的原著保真、动作因果、空间调度、对白、连续性与格式；返修后登记试写审核报告。
 - 完成第三道门禁：确认动作密度、场景调度、对白尺度、节奏与格式。
@@ -203,6 +207,7 @@ python3 <技能目录>/scripts/project_tool.py build-handoff <项目目录> --se
 
 - 按 [ai-video-production.md](references/ai-video-production.md) 执行：①建立或更新风格/角色/场景/道具四类锚点（带版本号的规范制品）；②生成模型无关的 `ai_shot_plan:E001`（含每单元通用中文提示词），登记 `awaiting_approval` 后先过 `ai_video_boundary_review:E001` 前置门禁。**通用分镜计划就是默认最终交付**，不区分 Seedance/可灵/Veo 等平台。
 - 仅当用户点名需要某平台的参数化任务包时，才建立该模型的 `model_capability_profile` 并编译 `ai_video_execution_plan:E001:<模型>`；语义审查绑定在分镜计划层，编译不重审。
+- 生成分镜计划前读取 [ai-shot-plan-generation.md](references/ai-shot-plan-generation.md)；脚手架只提供通用生成与校验逻辑，禁止针对具体项目硬编码人物、台词或事件 ID。
 - 分镜计划确认后运行 `project_tool.py render-storyboard <项目目录> <集号>` 生成 HTML 故事板供用户可视化检查（节奏时间轴、单元卡片、提示词复制、锚点资产表）；只读渲染，规范数据以 JSON 为准。相同输入版本与散列只实际渲染一次，AI执行包与逐集定稿位置通过项目内输入指纹缓存原子复制；输入变化必须重新渲染。
 - `delivery_target`为`ai_video`或`both`时，进入制作提取、台词提取、故事板规划或逐集交付前，当前确认的`source_event_index`必须为schema v2，并提供可校验`beats`和覆盖目标集的`episode_scopes`；否则立即报`ai_video_source_contract_not_ready`且不得创建下游任务。`human_team`项目不应用该提前门禁。
 - 只从当前已确认 `episode_script`、对应 `episode_boundary_review`、覆盖该集的制作提取数据和连续性台账生成，不覆盖文学剧本。`ai_video` 目标下提取表与锚点可按已确认批次滚动更新，绑定当前批次全部剧本版本即可交付该批次执行包。
@@ -212,7 +217,14 @@ python3 <技能目录>/scripts/project_tool.py build-handoff <项目目录> --se
 - 每个短单元记录场号、总时长、原著依据、进入/离开状态、连续链、镜头文字、台词 cue ID、声音和编译后的中文视频提示词。镜头内部不写 `0-3秒` 一类硬秒点。
 - 全部对白、VO、OS 必须按台词表逐条且仅一次覆盖；台词表使用 `contract_version: 2`，每条口述 cue 只保存原著文本、`source_unit_id` 与 `source_locator`，不得生成 `source_text`、改写理由、语义分数、人物语气判断或新增事实字段。参考素材模式只能绑定用户或项目已有素材，纯文本模式不得偷偷带素材。
 - 执行计划还要经过 `seedance_boundary_review:E001` 前置门禁。报告不是 `passed` 时计划不能确认；镜头表达不得改变人物选择、事件原因、结果、知情范围或结局性质。
-- 全剧完成后运行：
+- 通用模型无关分镜计划全剧完成后运行：
+
+```bash
+python3 <技能目录>/scripts/project_tool.py validate-ai-shot-plans \
+  <项目目录> --expected-episodes <集数>
+```
+
+- Seedance 专属执行计划全剧完成后运行：
 
 ```bash
 python3 <技能目录>/scripts/project_tool.py validate-seedance \
@@ -236,6 +248,20 @@ python3 <技能目录>/scripts/project_tool.py set-stage \
   <项目目录> <阶段> <阶段状态> --note <说明>
 ```
 
+批量确认多个制品（支持 `KEY@VERSION`，省略版本时用最新版）：
+
+```bash
+python3 <技能目录>/scripts/project_tool.py approve-artifacts \
+  <项目目录> ai_shot_plan:E001@1 ai_shot_plan:E002@1
+```
+
+批量渲染逐集正式交付（逐集仍走唯一标准入口）：
+
+```bash
+python3 <技能目录>/scripts/project_tool.py render-episode-deliveries \
+  <项目目录> E001 E002 E003
+```
+
 更新上游制品必须使用新版本；新版本必须使用新的文件路径（工具拒绝复用旧版本路径，命名如 `xxx_v2.json`）。每个制品登记精确的当前上游版本与剧集范围，工具会按实际依赖标记受影响下游制品。修改前先用依赖关系确认影响范围，优先局部返修；不得删除旧版本、伪造用户确认、反向依赖或绕过门禁。
 
 ## 对话规则
@@ -257,4 +283,4 @@ python3 <技能目录>/scripts/project_tool.py set-stage \
 
 ## 每集最终交付
 
-当某集文学剧本、边界报告、制作提取、人物锚点v2和AI分镜均为当前确认版本后，先确保生产预检仍为当前`execution_ready`，再运行 `render-episode-delivery`。该命令是唯一正式逐集生成入口：它冻结输入制品路径、版本和SHA-256，生成可编辑DOCX文学剧本与同版本HTML故事板，并登记`episode_delivery_manifest:<集号>`。随后必须运行`validate-episode-delivery <项目目录> <集号>`；只有返回`official_delivery: true`才能报告正式完成。直接调用renderer、手工复制文件或只有DOCX/HTML但缺少有效清单时均只算候选。本技能仍不生成图片或视频。
+当某集文学剧本、边界报告、制作提取、人物锚点v2和AI分镜均为当前确认版本后，先确保生产预检仍为当前`execution_ready`，再运行 `render-episode-delivery`。该命令是唯一正式逐集生成入口：它冻结输入制品路径、版本和SHA-256，生成可编辑DOCX文学剧本与同版本HTML故事板，并登记`episode_delivery_manifest:<集号>`。多集时可用 `render-episode-deliveries` 批量调用同一标准入口。随后必须运行`validate-episode-delivery <项目目录> <集号>`；只有返回`official_delivery: true`才能报告正式完成。直接调用renderer、手工复制文件或只有DOCX/HTML但缺少有效清单时均只算候选。本技能仍不生成图片或视频。

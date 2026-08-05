@@ -432,6 +432,18 @@ class ProjectToolTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertIn("episode_number_invalid", {item["code"] for item in result["errors"]})
 
+        nonstandard = self.root / "nonstandard-heading.md"
+        nonstandard.write_text(
+            GOOD_SCRIPT.replace("# 第1集：钥匙之争", "# 第1集 钥匙之争").replace(
+                "## 1-1 场景：院门 日 / 外", "## 1-1 院门 日 / 外"
+            ),
+            encoding="utf-8",
+        )
+        result = project_tool.validate_script_file(nonstandard)
+        self.assertFalse(result["valid"])
+        self.assertIn("episode_heading_format_invalid", {item["code"] for item in result["errors"]})
+        self.assertIn("scene_heading_format_invalid", {item["code"] for item in result["errors"]})
+
     def create_ready_project(self, expected_episodes: int = 1) -> None:
         self.init_project()
         project_id = self.state()["project_id"]
@@ -2303,6 +2315,55 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(payload["manifest_artifact_key"], "series_delivery_manifest")
         self.assertEqual(payload["artifact_key"], "final_package")
 
+    def test_series_handoff_manifest_and_package_approve_with_scoped_dependencies(
+        self,
+    ) -> None:
+        self.create_ready_batch(expected_episodes=1)
+        code, batch_payload = self.run_cli(
+            "build-handoff",
+            str(self.project),
+            "--batch",
+            "B01",
+            "--output-name",
+            "B01汇总输入",
+        )
+        self.assertEqual(code, 0, batch_payload)
+        self.approve_artifact(
+            "batch_delivery_manifest:B01",
+            batch_payload["manifest_artifact_version"],
+        )
+        self.approve_artifact("batch_package:B01", batch_payload["version"])
+        review_version = self.register_cross_batch_continuity_review()
+        self.approve_artifact("cross_batch_continuity_review", review_version)
+        code, payload = self.run_cli(
+            "build-handoff",
+            str(self.project),
+            "--series",
+            "--expected-episodes",
+            "1",
+            "--output-name",
+            "全剧批次汇总-可确认",
+        )
+        self.assertEqual(code, 0, payload)
+        self.approve_artifact(
+            "series_delivery_manifest",
+            payload["manifest_artifact_version"],
+        )
+        self.approve_artifact("final_package", payload["version"])
+        state = self.state()
+        self.assertEqual(
+            state["artifacts"]["series_delivery_manifest"][-1]["status"],
+            "confirmed",
+        )
+        self.assertEqual(
+            state["artifacts"]["final_package"][-1]["status"],
+            "confirmed",
+        )
+        code, stage_payload = self.run_cli(
+            "set-stage", str(self.project), "final_delivery", "completed"
+        )
+        self.assertEqual(code, 0, stage_payload)
+
     def test_series_handoff_rejects_missing_episode_coverage(self) -> None:
         self.create_ready_batch(expected_episodes=2)
         code, payload = self.run_cli(
@@ -3451,6 +3512,34 @@ class ProjectToolTests(unittest.TestCase):
             project_tool.validate_unit_prompt_executability(unit, cues, 1), []
         )
 
+    def test_prompt_executability_rejects_glued_sound_and_negative_segments(self) -> None:
+        prompt = (
+            "场景：院门外。现场人物：黑发少女，青布衫。"
+            "动作起点：阿宁站在门槛外。动作终点：阿宁藏好钥匙。"
+            "镜头运动：从阿宁上半身推近至藏钥匙的手。"
+            "声音：院外蝉鸣负面：不出现官差；无字幕。"
+        )
+        unit = {
+            "prompt_text": prompt,
+            "action_start": "阿宁站在门槛外",
+            "action_end": "阿宁藏好钥匙",
+            "characters_on_screen": [
+                {"character_id": "C001", "appearance_lock": "黑发少女，青布衫"}
+            ],
+            "sound_events": [{"description": "院外蝉鸣"}],
+            "shot_language": {
+                "camera_movement": {"description": "从阿宁上半身推近至藏钥匙的手。"}
+            },
+            "space_zones": [{"space_id": "courtyard-gate", "description": "院门外"}],
+            "negative_constraints": ["不出现官差", "无字幕"],
+            "dialogue": [],
+        }
+        codes = {
+            item["code"]
+            for item in project_tool.validate_unit_prompt_executability(unit, {}, 1)
+        }
+        self.assertIn("shotplan_prompt_sound_format_invalid", codes)
+
     def test_render_episode_delivery_outputs_exact_pair(self) -> None:
         self.prepare_episode_delivery_project()
         self.run_production_preflight()
@@ -3471,6 +3560,21 @@ class ProjectToolTests(unittest.TestCase):
         html_text = (output_dir / "E001_故事板.html").read_text(encoding="utf-8")
         self.assertIn("景别：", html_text)
         self.assertIn("镜头运动：", html_text)
+
+    def test_render_episode_deliveries_batch_reports_failures(self) -> None:
+        self.prepare_episode_delivery_project()
+        self.run_production_preflight()
+        code, payload = self.run_cli(
+            "render-episode-deliveries",
+            str(self.project),
+            "E001",
+            "E999",
+        )
+        self.assertEqual(code, 1, payload)
+        self.assertEqual(payload["rendered_count"], 1)
+        self.assertEqual(payload["failed_count"], 1)
+        self.assertTrue(payload["results"][0]["ok"])
+        self.assertFalse(payload["results"][1]["ok"])
 
     def test_episode_delivery_inputs_freeze_hashes_and_invalidate_fingerprint(
         self,
@@ -4084,10 +4188,84 @@ class ProjectToolTests(unittest.TestCase):
             ),
         )
 
+    def test_validate_ai_shot_plans_accepts_confirmed_plans(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan_version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划V1.json",
+            json.dumps(self.shot_plan_payload(), ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        self.approve_shot_plan_with_review(plan_version)
+        code, payload = self.run_cli(
+            "validate-ai-shot-plans",
+            str(self.project),
+            "--expected-episodes",
+            "1",
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertIs(payload["compatible"], True)
+        self.assertEqual(len(payload["plans"]), 1)
+        self.assertEqual(payload["plans"][0]["artifact_key"], "ai_shot_plan:E001")
+        self.assertEqual(
+            payload["plans"][0]["boundary_review"]["artifact_key"],
+            "ai_video_boundary_review:E001",
+        )
+
+    def test_validate_ai_shot_plans_rejects_unconfirmed_plan(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_分镜计划V1.json",
+            json.dumps(self.shot_plan_payload(), ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        code, payload = self.run_cli(
+            "validate-ai-shot-plans",
+            str(self.project),
+            "--expected-episodes",
+            "1",
+        )
+        self.assertEqual(code, 1, payload)
+        self.assertIn(
+            "ai_shot_plan_not_confirmed",
+            {item["code"] for item in payload["errors"]},
+        )
+
+    def test_approve_artifacts_batch_continues_on_invalid_ref(self) -> None:
+        self.create_ready_project()
+        profile_version = self.register_artifact(
+            "adaptation_profile",
+            "02_改编定位/定位V2.md",
+            "# 改编定位 v2\n",
+            ("project_spec@1", "story_facts@1"),
+        )
+        bible_version = self.register_artifact(
+            "adaptation_bible",
+            "03_改编圣经/圣经V2.md",
+            "# 改编圣经 v2\n",
+            (f"adaptation_profile@{profile_version}",),
+        )
+        code, payload = self.run_cli(
+            "approve-artifacts",
+            str(self.project),
+            f"adaptation_profile@{profile_version}",
+            f"adaptation_bible@{bible_version}",
+            "BAD_REF",
+        )
+        self.assertEqual(code, 1, payload)
+        self.assertEqual(payload["approved_count"], 2)
+        self.assertEqual(payload["failed_count"], 1)
+        self.assertTrue(all(item["ok"] for item in payload["results"][:2]))
+        self.assertFalse(payload["results"][2]["ok"])
+
     def test_ai_shot_plan_blocks_quality_violations(self) -> None:
         self.create_ready_project()
         self.register_ai_layer_prerequisites()
         plan = self.shot_plan_payload()
+        plan["units"][0]["narrative_task"] = "E001-2-1：管家：把钥匙交出来。"
         plan["units"][0]["dialogue"] = [
             {"cue_id": "Q001", "lip_sync": True},
             {"cue_id": "Q002", "lip_sync": True},
@@ -4110,6 +4288,7 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(code, 2, payload)
         for expected in (
+            "shotplan_scene_action_mismatch",
             "shotplan_multi_lip_sync",
             "shotplan_appearance_lock_missing",
             "shotplan_over_4s_rationale_missing",
@@ -4117,6 +4296,52 @@ class ProjectToolTests(unittest.TestCase):
             "shotplan_scene_anchor_invalid",
         ):
             self.assertIn(expected, payload["error"], expected)
+
+    def test_action_scene_id_uses_episode_and_scene_prefix(self) -> None:
+        self.assertEqual(
+            project_tool.action_scene_id_from_field("E001-2-1：管家：把钥匙交出来。"),
+            "1-2",
+        )
+
+    def test_ai_shot_plan_accepts_matching_action_scene_prefix(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        plan["units"][0]["narrative_task"] = "E001-1-2：管家：把钥匙交出来。"
+        self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_前缀正确分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        state = self.state()
+        record = project_tool.latest_record(state, "ai_shot_plan:E001")
+        errors = project_tool.validate_ai_shot_plan_payload(
+            self.project,
+            state,
+            "ai_shot_plan:E001",
+            record,
+            plan,
+        )
+        codes = {item["code"] for item in errors}
+        self.assertNotIn("shotplan_scene_action_mismatch", codes)
+
+    def test_ai_shot_plan_rejects_wrong_action_scene_prefix(self) -> None:
+        self.create_ready_project()
+        self.register_ai_layer_prerequisites()
+        plan = self.shot_plan_payload()
+        plan["units"][0]["narrative_task"] = "E001-2-1：管家：把钥匙交出来。"
+        version = self.register_artifact(
+            "ai_shot_plan:E001",
+            "10_AI视频执行包/E001_前缀错误分镜计划V1.json",
+            json.dumps(plan, ensure_ascii=False),
+            self.shot_plan_dependencies(),
+        )
+        code, payload = self.run_cli(
+            "approve", str(self.project), "ai_shot_plan:E001", "--version", str(version)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("shotplan_scene_action_mismatch", payload["error"])
 
     def test_ai_execution_plan_respects_model_profile(self) -> None:
         self.create_ready_project()
@@ -5703,6 +5928,31 @@ class ProjectToolTests(unittest.TestCase):
 
     def test_rolling_source_commands_write_only_requested_project_outputs(self) -> None:
         self.init_project()
+        project_id = self.state()["project_id"]
+        self.register_and_approve(
+            "project_spec",
+            "01_原著解析/rolling_command_spec_v2.json",
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "project_id": project_id,
+                    "scope_mode": "rolling_batch",
+                    "batch_size": 1,
+                    "initial_source_window_units": 2,
+                    "final_expected_episodes": None,
+                    "target_duration_seconds": 60,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        code, payload = self.run_cli(
+            "define-batch",
+            str(self.project),
+            "B01",
+            "E001",
+            "--confirmed-by-user",
+        )
+        self.assertEqual(code, 0, payload)
         corpus = self.write_json(
             "01_原著解析/rolling_corpus.json",
             {
@@ -5718,8 +5968,17 @@ class ProjectToolTests(unittest.TestCase):
             {"schema_version": 1, "records": []},
         )
         progress = self.write_json(
-            "01_原著解析/rolling_progress_v1.json",
-            {"schema_version": 1, "current_batch_id": "B01", "carryover_event_ids": [], "event_consumption": {}, "next_read_start": "SU001"},
+            "01_原著解析/rolling_progress_v2.json",
+            {
+                "schema_version": 2,
+                "current_batch_id": "B01",
+                "completed_window_count": 1,
+                "batch_readiness": "needs_more_source",
+                "source_gap_reasons": ["测试窗口尚未覆盖SU002"],
+                "carryover_event_ids": [],
+                "event_consumption": {},
+                "next_read_start": "SU002",
+            },
         )
         analysis = self.write_json("tmp/SU001_analysis.json", {"events": []})
         registry_v2 = self.project / "01_原著解析/chapter_registry_v2.json"
@@ -5738,6 +5997,189 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, payload)
         self.assertEqual(json.loads(plan.read_text())["new_analysis_source_unit_ids"], ["SU002"])
+
+    def rolling_window_v2_fixture(
+        self,
+        *,
+        define_batch: bool,
+        confirm_spec: bool = True,
+        readiness: str = "initial_window",
+        completed_window_count: int = 0,
+        registry_has_first_unit: bool = False,
+    ) -> tuple[Path, Path, Path]:
+        self.init_project()
+        project_id = self.state()["project_id"]
+        spec = {
+            "schema_version": 2,
+            "project_id": project_id,
+            "scope_mode": "rolling_batch",
+            "batch_size": 1,
+            "initial_source_window_units": 2,
+            "final_expected_episodes": None,
+            "target_duration_seconds": 60,
+        }
+        if confirm_spec:
+            self.register_and_approve(
+                "project_spec",
+                "01_原著解析/滚动项目规格V2.json",
+                json.dumps(spec, ensure_ascii=False),
+            )
+        if define_batch:
+            code, payload = self.run_cli(
+                "define-batch",
+                str(self.project),
+                "B01",
+                "E001",
+                "--confirmed-by-user",
+            )
+            self.assertEqual(code, 0, payload)
+        corpus = self.write_json(
+            "01_原著解析/rolling_gate_corpus.json",
+            {
+                "schema_version": 1,
+                "source_units": [
+                    {"source_unit_id": "SU001", "ordinal": 1, "estimated_tokens": 100, "complexity_points": 1, "content_sha256": "hash-1"},
+                    {"source_unit_id": "SU002", "ordinal": 2, "estimated_tokens": 100, "complexity_points": 1, "content_sha256": "hash-2"},
+                    {"source_unit_id": "SU003", "ordinal": 3, "estimated_tokens": 100, "complexity_points": 1, "content_sha256": "hash-3"},
+                ],
+            },
+        )
+        records = []
+        if registry_has_first_unit:
+            records.append(
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001.json",
+                    "analysis_sha256": "analysis-1",
+                    "idempotency_key": "SU001:hash-1:v1",
+                }
+            )
+        registry = self.write_json(
+            "01_原著解析/rolling_gate_registry.json",
+            {"schema_version": 1, "records": records},
+        )
+        source_gap_reasons = (
+            ["当前窗口只够支撑E001，B01仍缺少后续冲突结果"]
+            if readiness == "needs_more_source"
+            else []
+        )
+        progress = self.write_json(
+            "01_原著解析/rolling_gate_progress.json",
+            {
+                "schema_version": 2,
+                "current_batch_id": "B01",
+                "completed_window_count": completed_window_count,
+                "batch_readiness": readiness,
+                "source_gap_reasons": source_gap_reasons,
+                "carryover_event_ids": [],
+                "event_consumption": {},
+                "next_read_start": None if readiness == "ready_for_batch" else ("SU002" if completed_window_count else "SU001"),
+            },
+        )
+        return corpus, registry, progress
+
+    def test_rolling_window_requires_confirmed_rolling_project_spec(self) -> None:
+        corpus, registry, progress = self.rolling_window_v2_fixture(
+            define_batch=False,
+            confirm_spec=False,
+        )
+        output = self.project / "tmp/rolling_without_confirmed_spec.json"
+        code, payload = self.run_cli(
+            "plan-rolling-source-window",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--registry", str(registry),
+            "--progress", str(progress),
+            "--window-size", "2",
+            "--output", str(output),
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("rolling_batch", payload["error"])
+        self.assertIn("项目规格", payload["error"])
+        self.assertFalse(output.exists())
+
+    def test_rolling_window_requires_confirmed_project_batch(self) -> None:
+        corpus, registry, progress = self.rolling_window_v2_fixture(define_batch=False)
+        output = self.project / "tmp/rolling_without_batch.json"
+        code, payload = self.run_cli(
+            "plan-rolling-source-window",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--registry", str(registry),
+            "--progress", str(progress),
+            "--window-size", "2",
+            "--output", str(output),
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("B01", payload["error"])
+        self.assertIn("已确认批次", payload["error"])
+        self.assertFalse(output.exists())
+
+    def test_rolling_window_allows_initial_window_after_b01_confirmation(self) -> None:
+        corpus, registry, progress = self.rolling_window_v2_fixture(define_batch=True)
+        output = self.project / "tmp/rolling_b01_initial.json"
+        code, payload = self.run_cli(
+            "plan-rolling-source-window",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--registry", str(registry),
+            "--progress", str(progress),
+            "--window-size", "2",
+            "--output", str(output),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["batch_id"], "B01")
+        self.assertEqual(payload["planned_window_number"], 1)
+        self.assertTrue(payload["checkpoint_required_after_window"])
+        self.assertEqual(
+            json.loads(output.read_text(encoding="utf-8"))["new_analysis_source_unit_ids"],
+            ["SU001", "SU002"],
+        )
+
+    def test_rolling_window_blocks_next_window_when_b01_is_ready(self) -> None:
+        corpus, registry, progress = self.rolling_window_v2_fixture(
+            define_batch=True,
+            readiness="ready_for_batch",
+            completed_window_count=1,
+            registry_has_first_unit=True,
+        )
+        output = self.project / "tmp/rolling_b01_should_stop.json"
+        code, payload = self.run_cli(
+            "plan-rolling-source-window",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--registry", str(registry),
+            "--progress", str(progress),
+            "--window-size", "2",
+            "--output", str(output),
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("B01", payload["error"])
+        self.assertIn("转入", payload["error"])
+        self.assertFalse(output.exists())
+
+    def test_rolling_window_requires_checkpoint_after_registered_analysis(self) -> None:
+        corpus, registry, progress = self.rolling_window_v2_fixture(
+            define_batch=True,
+            registry_has_first_unit=True,
+        )
+        output = self.project / "tmp/rolling_b01_checkpoint_required.json"
+        code, payload = self.run_cli(
+            "plan-rolling-source-window",
+            str(self.project),
+            "--source-corpus", str(corpus),
+            "--registry", str(registry),
+            "--progress", str(progress),
+            "--window-size", "2",
+            "--output", str(output),
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("initial_window", payload["error"])
+        self.assertIn("ready_for_batch", payload["error"])
+        self.assertFalse(output.exists())
 
     def test_production_context_manifest_excludes_tests_and_development_plans(self) -> None:
         self.init_project()
@@ -7724,6 +8166,283 @@ class ProjectToolTests(unittest.TestCase):
         )
         self.assertEqual(code, 0, runtime)
         self.assertEqual(runtime["run"]["active_task_ids"], [second_plan["task_id"]])
+
+    def init_synopsis_project(self, episode_count: int) -> None:
+        code, payload = self.run_cli(
+            "init",
+            str(self.project),
+            "--name",
+            "简介项目",
+            "--source",
+            str(self.source),
+            "--source-kind",
+            "synopsis",
+            "--expected-episodes",
+            str(episode_count),
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["source_policy"]["source_kind"], "synopsis")
+        self.assertEqual(payload["expected_episodes_hint"], episode_count)
+
+    def synopsis_event_index_payload(self, episode_count: int, verdict: str = "sufficient") -> dict:
+        profile = {
+            "facts": [
+                {
+                    "fact_id": "F-CHAR-001",
+                    "fact_type": "character",
+                    "fact_text": "女主为弟弟女扮男装进入寄宿高中",
+                    "source_refs": ["SYNOPSIS"],
+                    "protection": "must_preserve",
+                },
+                {
+                    "fact_id": "F-REL-001",
+                    "fact_type": "relationship",
+                    "fact_text": "女主与校霸从针锋相对转向双向心动",
+                    "source_refs": ["SYNOPSIS"],
+                    "protection": "must_preserve",
+                },
+                {
+                    "fact_id": "F-SET-001",
+                    "fact_type": "setting",
+                    "fact_text": "故事主要发生在寄宿高中",
+                    "source_refs": ["SYNOPSIS"],
+                    "protection": "flexible",
+                },
+                {
+                    "fact_id": "F-EV-001",
+                    "fact_type": "event",
+                    "fact_text": "女主觉醒读心异能，听见校霸内心独白",
+                    "source_refs": ["SYNOPSIS"],
+                    "protection": "must_preserve",
+                },
+            ],
+            "unknowns": [],
+            "analysis": {
+                "conflict_nodes": [
+                    {"id": "CON-001", "label": "身份危机"},
+                    {"id": "CON-002", "label": "校园冲突"},
+                ],
+                "relationship_turns": [
+                    {"id": "REL-001", "label": "识破伪装"},
+                    {"id": "REL-002", "label": "双向心动"},
+                ],
+                "hook_candidates": [
+                    {"id": "HOOK-001", "label": "异能读到秘密"},
+                ],
+                "supporting_expansion_axes": [
+                    {"id": "EXP-001", "label": "校园生活"},
+                ],
+            },
+        }
+        slot_ids = ["CON-001", "CON-002", "REL-001", "REL-002", "HOOK-001", "EXP-001"]
+        slots = [
+            {
+                "episode_id": f"E{number:03d}",
+                "change_id": slot_ids[(number - 1) % len(slot_ids)],
+                "story_function": "推进",
+                "state_change": f"state-{number}",
+                "hook": f"钩子-{number}",
+            }
+            for number in range(1, episode_count + 1)
+        ]
+        return {
+            "source_mode": "synopsis",
+            "synopsis_profile": profile,
+            "synopsis_feasibility": {
+                "requested_episodes": episode_count,
+                "verdict": verdict,
+                "blocking_reasons": (
+                    []
+                    if verdict == "sufficient"
+                    else ["简介冲突节点不足，请补充简介或减少集数"]
+                ),
+                "warnings": [],
+                "episode_slots": slots if verdict == "sufficient" else [],
+            },
+        }
+
+    def test_synopsis_init_requires_expected_episodes(self) -> None:
+        code, payload = self.run_cli(
+            "init",
+            str(self.project),
+            "--source",
+            str(self.source),
+            "--source-kind",
+            "synopsis",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("必须提供 --expected-episodes", payload["error"])
+        self.assertFalse((self.project / project_tool.STATE_FILENAME).exists())
+
+    def test_synopsis_init_rejects_official_review(self) -> None:
+        code, payload = self.run_cli(
+            "init",
+            str(self.project),
+            "--source",
+            str(self.source),
+            "--source-kind",
+            "synopsis",
+            "--expected-episodes",
+            "20",
+            "--official-review",
+            "--official-url",
+            "https://example.com/novel",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("只有 published_novel", payload["error"])
+
+    def test_synopsis_init_accepts_20_30_40_and_show_summary(self) -> None:
+        for count in (20, 30, 40):
+            with self.subTest(count=count):
+                project = self.root / f"synopsis-{count}"
+                code, payload = self.run_cli(
+                    "init",
+                    str(project),
+                    "--source",
+                    str(self.source),
+                    "--source-kind",
+                    "synopsis",
+                    "--expected-episodes",
+                    str(count),
+                )
+                self.assertEqual(code, 0, payload)
+                code, summary = self.run_cli("show", str(project), "--summary")
+                self.assertEqual(code, 0, summary)
+                self.assertEqual(summary["source_kind"], "synopsis")
+                self.assertEqual(summary["synopsis"]["requested_episodes"], count)
+                self.assertEqual(summary["synopsis"]["duration_bounds"], [60, 90])
+                self.assertEqual(summary["synopsis"]["minimum_shot_units"], 21)
+
+    def test_validate_synopsis_accepts_sufficient_20_episode_fixture(self) -> None:
+        self.init_synopsis_project(20)
+        payload = self.synopsis_event_index_payload(20)
+        project_id = self.state()["project_id"]
+        project_spec = {
+            "schema_version": 1,
+            "project_id": project_id,
+            "expected_episodes": 20,
+        }
+        self.register_artifact(
+            "project_spec",
+            "01_原著解析/项目规格V1.json",
+            json.dumps(project_spec, ensure_ascii=False),
+        )
+        source_corpus = {
+            "schema_version": 1,
+            "project_id": project_id,
+            "generated_from": [],
+            "source_units": [],
+        }
+        self.register_artifact(
+            "source_corpus",
+            "01_原著解析/语料V1.json",
+            json.dumps(source_corpus, ensure_ascii=False),
+            ("project_spec@1",),
+        )
+        payload["schema_version"] = 2
+        payload["project_id"] = project_id
+        self.register_artifact(
+            "source_event_index",
+            "01_原著解析/简介事件索引V1.json",
+            json.dumps(payload, ensure_ascii=False),
+            ("source_corpus@1",),
+        )
+        code, result = self.run_cli("validate-synopsis", str(self.project))
+        self.assertEqual(code, 0, result)
+        self.assertEqual(result["feasibility"]["verdict"], "sufficient")
+        self.assertEqual(result["minimum_shot_units"], 21)
+        self.assertEqual(result["duration_bounds"], [60, 90])
+
+    def test_validate_synopsis_blocks_insufficient_40_episode_fixture(self) -> None:
+        self.init_synopsis_project(40)
+        payload = self.synopsis_event_index_payload(40, verdict="insufficient")
+        project_id = self.state()["project_id"]
+        project_spec = {
+            "schema_version": 1,
+            "project_id": project_id,
+            "expected_episodes": 40,
+        }
+        self.register_artifact(
+            "project_spec",
+            "01_原著解析/项目规格V1.json",
+            json.dumps(project_spec, ensure_ascii=False),
+        )
+        source_corpus = {
+            "schema_version": 1,
+            "project_id": project_id,
+            "generated_from": [],
+            "source_units": [],
+        }
+        self.register_artifact(
+            "source_corpus",
+            "01_原著解析/语料V1.json",
+            json.dumps(source_corpus, ensure_ascii=False),
+            ("project_spec@1",),
+        )
+        payload["schema_version"] = 2
+        payload["project_id"] = project_id
+        self.register_artifact(
+            "source_event_index",
+            "01_原著解析/简介事件索引V1.json",
+            json.dumps(payload, ensure_ascii=False),
+            ("source_corpus@1",),
+        )
+        code, result = self.run_cli("validate-synopsis", str(self.project))
+        self.assertEqual(code, 1)
+        self.assertEqual(result["feasibility"]["verdict"], "insufficient")
+
+    def test_synopsis_script_expression_check_warns_but_does_not_block(self) -> None:
+        script = self.root / "ai-smell.md"
+        script.write_text(
+            GOOD_SCRIPT.replace(
+                "△阿宁攥着钥匙退到门槛外。",
+                "△她眼底闪过一丝情绪，忍不住勾唇一笑。\n△她眼底闪过一丝情绪，忍不住勾唇一笑。",
+            ),
+            encoding="utf-8",
+        )
+        code, result = self.run_cli(
+            "validate-script",
+            str(script),
+            "--synopsis",
+        )
+        self.assertEqual(code, 0, result)
+        self.assertIn(
+            "synopsis_expression_quality",
+            {item["code"] for item in result["warnings"]},
+        )
+        self.assertGreaterEqual(result["summary"]["synopsis_expression_warning_count"], 3)
+
+    def test_synopsis_project_spec_gate_requires_expected_episodes_and_valid_policy(self) -> None:
+        self.init_synopsis_project(20)
+        project_id = self.state()["project_id"]
+        path = self.write_project_file(
+            "01_原著解析/简介项目规格V1.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "project_id": project_id,
+                    "synopsis_policy": {
+                        "duration_seconds": {"min": 60, "max": 90},
+                        "minimum_shot_units": 21,
+                        "composition_policy": "unrestricted",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+        code, payload = self.run_cli(
+            "register-artifact",
+            str(self.project),
+            "project_spec",
+            str(path),
+            "--status",
+            "awaiting_approval",
+        )
+        self.assertEqual(code, 0, payload)
+        code, payload = self.run_cli("approve", str(self.project), "project_spec")
+        self.assertEqual(code, 2)
+        self.assertIn("简介模式项目规格门禁未通过", payload["error"])
+        self.assertIn("synopsis_expected_episodes_invalid", payload["error"])
 
 
 if __name__ == "__main__":

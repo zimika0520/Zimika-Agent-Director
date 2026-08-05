@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -392,11 +393,95 @@ def validate_rolling_source_progress(
     progress: dict[str, Any]
 ) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
-    if not isinstance(progress, dict) or progress.get("schema_version") != 1:
-        return [issue("rolling_progress_schema_invalid", "滚动来源进度 schema_version 必须为1")]
+    if not isinstance(progress, dict) or progress.get("schema_version") not in {1, 2}:
+        return [
+            issue(
+                "rolling_progress_schema_invalid",
+                "滚动来源进度 schema_version 必须为1或2",
+            )
+        ]
+    schema_version = progress.get("schema_version")
     batch_id = progress.get("current_batch_id")
-    if not isinstance(batch_id, str) or not batch_id:
-        errors.append(issue("rolling_progress_batch_invalid", "滚动来源进度缺少 current_batch_id"))
+    if schema_version == 1 and (not isinstance(batch_id, str) or not batch_id):
+        errors.append(
+            issue(
+                "rolling_progress_batch_invalid",
+                "滚动来源进度缺少 current_batch_id",
+            )
+        )
+    if schema_version == 2 and (
+        not isinstance(batch_id, str) or not re.fullmatch(r"B\d{2,}", batch_id)
+    ):
+        errors.append(
+            issue(
+                "rolling_progress_batch_invalid",
+                "current_batch_id 必须是已定义的生产批次ID，如B01；SA01不是批次",
+            )
+        )
+    if schema_version == 2:
+        completed_window_count = progress.get("completed_window_count")
+        readiness = progress.get("batch_readiness")
+        gap_reasons = progress.get("source_gap_reasons")
+        if (
+            type(completed_window_count) is not int
+            or completed_window_count < 0
+        ):
+            errors.append(
+                issue(
+                    "rolling_progress_window_count_invalid",
+                    "completed_window_count 必须是非负整数",
+                )
+            )
+            completed_window_count = 0
+        if readiness not in {
+            "initial_window",
+            "needs_more_source",
+            "ready_for_batch",
+        }:
+            errors.append(
+                issue(
+                    "rolling_progress_readiness_invalid",
+                    "batch_readiness 必须为 initial_window/needs_more_source/ready_for_batch",
+                )
+            )
+        if not isinstance(gap_reasons, list) or not all(
+            isinstance(value, str) and value.strip() for value in gap_reasons
+        ):
+            errors.append(
+                issue(
+                    "rolling_progress_source_gap_invalid",
+                    "source_gap_reasons 必须是字符串数组",
+                )
+            )
+            gap_reasons = []
+        if readiness == "initial_window" and completed_window_count != 0:
+            errors.append(
+                issue(
+                    "rolling_progress_readiness_invalid",
+                    "initial_window 只允许 completed_window_count=0",
+                )
+            )
+        if readiness in {"needs_more_source", "ready_for_batch"} and completed_window_count < 1:
+            errors.append(
+                issue(
+                    "rolling_progress_readiness_invalid",
+                    "首窗完成后才能判断批次是否需要继续扩窗",
+                )
+            )
+        if readiness == "needs_more_source" and not gap_reasons:
+            errors.append(
+                issue(
+                    "rolling_progress_source_gap_missing",
+                    "继续扩窗必须记录当前B批次仍缺少的具体故事内容",
+                )
+            )
+        if readiness != "needs_more_source" and gap_reasons:
+            errors.append(
+                issue(
+                    "rolling_progress_source_gap_conflict",
+                    "只有 needs_more_source 可以填写 source_gap_reasons",
+                )
+            )
     carryover = progress.get("carryover_event_ids", [])
     if not isinstance(carryover, list) or not all(isinstance(value, str) and value for value in carryover):
         errors.append(issue("carryover_analysis_missing", "carryover_event_ids 必须是字符串数组"))
@@ -424,6 +509,22 @@ def validate_rolling_source_progress(
         not isinstance(next_read_start, str) or not next_read_start
     ):
         errors.append(issue("rolling_progress_next_read_invalid", "next_read_start 必须是字符串或null"))
+    if progress.get("schema_version") == 2:
+        readiness = progress.get("batch_readiness")
+        if readiness == "ready_for_batch" and next_read_start is not None:
+            errors.append(
+                issue(
+                    "rolling_progress_ready_next_read_conflict",
+                    "ready_for_batch 时 next_read_start 必须为null，禁止继续扩窗",
+                )
+            )
+        if readiness in {"initial_window", "needs_more_source"} and next_read_start is None:
+            errors.append(
+                issue(
+                    "rolling_progress_next_read_required",
+                    "仍需规划来源窗口时 next_read_start 不能为空",
+                )
+            )
     return errors
 
 
@@ -442,6 +543,10 @@ def build_rolling_source_plan(
     progress_errors = validate_rolling_source_progress(progress)
     if progress_errors:
         raise PartitionError("rolling_source_progress_invalid")
+    if progress.get("schema_version") != 2:
+        raise PartitionError("rolling_progress_schema_upgrade_required")
+    if progress.get("schema_version") == 2 and progress.get("batch_readiness") == "ready_for_batch":
+        raise PartitionError("rolling_batch_ready_for_delivery")
     ordered = _ordered_units(source_corpus)
     corpus_hashes = {
         unit["source_unit_id"]: unit.get("content_sha256") for unit in ordered
@@ -456,15 +561,29 @@ def build_rolling_source_plan(
     ordered_ids = [unit["source_unit_id"] for unit in ordered]
     start_id = progress.get("next_read_start") if isinstance(progress, dict) else None
     start_index = ordered_ids.index(start_id) if start_id in ordered_ids else 0
+    if (
+        progress.get("batch_readiness") == "initial_window"
+        and any(unit_id in analyzed for unit_id in ordered_ids[start_index:])
+    ):
+        raise PartitionError("rolling_window_checkpoint_required")
     new_units = [unit_id for unit_id in ordered_ids[start_index:] if unit_id not in analyzed][
         :window_size
     ]
     carryover = progress.get("carryover_event_ids", []) if isinstance(progress, dict) else []
     if not isinstance(carryover, list) or not all(isinstance(value, str) for value in carryover):
         raise PartitionError("carryover_analysis_missing")
+    completed_window_count = progress.get("completed_window_count", 0)
+    gap_reasons = progress.get("source_gap_reasons", [])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "current_batch_id": progress.get("current_batch_id") if isinstance(progress, dict) else None,
+        "planned_window_number": completed_window_count + 1,
+        "checkpoint_required_after_window": True,
+        "checkpoint_instruction": (
+            "窗口完成后必须先把batch_readiness更新为ready_for_batch或needs_more_source；"
+            "ready_for_batch时禁止规划下一窗口"
+        ),
+        "source_gap_reasons": list(gap_reasons) if isinstance(gap_reasons, list) else [],
         "carryover_event_ids": list(carryover),
         "reusable_analyzed_source_unit_ids": [unit_id for unit_id in ordered_ids if unit_id in analyzed],
         "new_analysis_source_unit_ids": new_units,

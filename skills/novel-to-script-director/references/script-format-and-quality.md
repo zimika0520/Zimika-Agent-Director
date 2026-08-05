@@ -1,5 +1,7 @@
 # 制作就绪文学剧本格式与质量规则
 
+所有新分集剧本统一使用 [human-script-format-template.md](human-script-format-template.md) 中的对外格式。集标题必须使用 `第N集：标题`，场标题必须使用 `N-M 场景：地点 时间 / 内外`；不得把 Markdown 集标题或省略“场景：”的场标题作为对外交付格式。
+
 ## 对外交付模板
 
 ```text

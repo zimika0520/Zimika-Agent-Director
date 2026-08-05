@@ -1,12 +1,13 @@
 # AI导演
 
-把小说、故事线或部分章节，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
+把小说、故事线或简介，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.8.92`
+当前版本：`0.9.0`
 
 ## 它能做什么
 
 - 上传来源默认直接建档，不自动检查缺章、乱码或完整度。
+- `source_kind: synopsis` 支持用户提供简介和任意正整数目标集数，先做简介事实索引与可行性判断，再进行受控扩写，不默认简介能支撑任意集数。
 - 已发表小说可由用户主动开启指定官网页面审核；审核不阻塞工作流。
 - 先生成覆盖全剧的轻量骨架，再按当前批次细化原著范围和事件。
 - 按批次生成大纲、分集剧本、角色/场景/道具/台词制作提取表。
@@ -21,6 +22,7 @@
 - 长任务由主任务直接调度不继承历史的一次性工作智能体；完整内容写入项目候选文件，不回流主上下文。
 - 任务规划具备幂等键、检查点和受控恢复；已完成结果不会重复生成，失联或失败最多尝试两次。
 - 独立任务可按可配置容量并发，串行任务和`project_state.json`写入保持互斥。
+- 滚动来源窗口必须绑定已确认B批次；每个窗口结束后先判断“够用/不足”，够用立即转入当前批次，禁止顺势扫描全书。
 - 生产任务与开发任务在启动时锁定模式；生产模式禁止修改源码、Skill、运行开发测试或重新做设计审核。
 - 生产预检按插件、运行时、Skill、入口和环境指纹只执行一次；版本/环境变化或实际执行失败后才重跑。
 - 用户的明确继续指令按项目、执行链、阶段、输入和目标复用；输入、目标、规则或阶段变化后自动失效。
@@ -30,6 +32,9 @@
 - 相同分镜输入只生成一次HTML，两个交付位置通过输入指纹缓存和原子复制保持一致。
 - 逐集DOCX/HTML只有经`render-episode-delivery`生成、登记来源清单并通过`validate-episode-delivery`后才是正式交付；直接renderer输出或手工复制文件只算候选。
 - `ai_video`和`both`项目在制作提取、台词提取、故事板或逐集交付前必须使用带`beats`和`episode_scopes`的schema v2事件索引；`human_team`不受该门禁影响。
+- 通用模型无关`ai_shot_plan:E###`支持全剧`validate-ai-shot-plans`覆盖校验，不再依赖Seedance专属执行计划才能批量验收。
+- `approve-artifacts`和`render-episode-deliveries`提供批量确认/渲染入口，逐集仍走既有标准门禁。
+- `series_delivery_manifest`只绑定合法上游，`final_delivery`阶段兼容新旧两条交付链。
 
 ## 工作流
 
@@ -143,9 +148,29 @@ python3 skills/novel-to-script-director/scripts/project_tool.py init \
 
 `--expected-episodes` 记入 `expected_episodes_hint`，只用于在 `project_spec` 确认前先定义批次；交付校验仍以已确认 `project_spec` 的 `expected_episodes` 为权威。
 
+### 简介模式
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py init \
+  /path/to/synopsis-project \
+  --name "简介项目" \
+  --source /path/to/synopsis.txt \
+  --source-kind synopsis \
+  --expected-episodes 20
+```
+
+简介模式默认单集 `60—90` 秒、单集至少 `21` 个 AI 分镜单元，并接受 `1/20/30/40` 等任意正整数集数。生成前先运行：
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py validate-synopsis \
+  /path/to/synopsis-project
+```
+
+只有可行性为 `sufficient` 且全剧分集地图确认后，才按集号串行生成剧本、分镜、DOCX 和 HTML 故事板。简介不足以支撑目标集数时，命令会阻断并要求补充简介或减少集数。
+
 ### 声明单集目标时长（可选）
 
-默认生成策略为单集约 60 秒、允许上下浮动 10%、建议约 15 个分镜单元。若项目需要其他时长，可在 `project_spec` JSON 中显式写入 `target_duration_seconds` 覆盖默认值：
+默认生成策略为单集约 60 秒、允许上下浮动 10%、建议约 15 个分镜单元；简介模式单独使用 `60—90` 秒和最低 `21` 个单元。若项目需要其他时长，可在 `project_spec` JSON 中显式写入 `target_duration_seconds` 覆盖默认值：
 
 ```json
 {
@@ -240,6 +265,15 @@ python3 skills/novel-to-script-director/scripts/project_tool.py merge-source-ana
 python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-delivery   <项目目录> E001
 
 python3 skills/novel-to-script-director/scripts/project_tool.py validate-episode-delivery   <项目目录> E001
+
+python3 skills/novel-to-script-director/scripts/project_tool.py validate-ai-shot-plans \
+  <项目目录> --expected-episodes 20
+
+python3 skills/novel-to-script-director/scripts/project_tool.py approve-artifacts \
+  <项目目录> ai_shot_plan:E001@1 ai_shot_plan:E002@1
+
+python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-deliveries \
+  <项目目录> E001 E002
 ```
 
 流程不按小说总字数切换；章节/事件优先，容量预算兜底。逐集命令输出 `E001_剧本.docx`、`E001_故事板.html`和项目运行时内的来源清单，不生成图片。文件存在不等于正式完成，必须以验收命令返回的`official_delivery`为准。
@@ -251,7 +285,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.8.92 新增15项正式交付与来源契约回归测试；编排、幂等、检查点、恢复、串并行和门禁相关定向测试46项通过；完整自动化测试221项通过。
+v0.9.0 新增全剧汇总依赖作用域、通用AI分镜校验和批量确认/渲染回归测试；完整自动化测试222项通过。
 
 ## 更新记录
 

@@ -1,5 +1,15 @@
 # 更新记录
 
+## v0.9.0 — 2026-08-05
+
+- 修复`series_delivery_manifest`依赖作用域：全剧汇总清单只绑定合法上游（项目规格、全剧地图/审核、批次清单/包/快照和跨批连续性审核），不再把`adaptation_profile`等非必需制品写入依赖，`build-handoff --series`产物可正常 approve。
+- `final_delivery`阶段完成校验兼容新旧两条交付链：有`final_package`且已确认`delivery_manifest`或`series_delivery_manifest`其一即可标记完成。
+- 新增`validate-ai-shot-plans`通用执行层校验：遍历`ai_shot_plan:E###`，要求已确认且绑定当前通过的`ai_video_boundary_review:E###`，复用结构制品校验，不再误报缺少Seedance执行计划。
+- 新增`approve-artifacts`批量确认入口，支持`KEY@VERSION`，单条失败继续执行并汇总结果。
+- 新增`render-episode-deliveries`批量渲染入口，逐集仍调用唯一标准生成入口并登记来源清单。
+- 新增`references/ai-shot-plan-generation.md`通用分镜生成脚手架，只提供可复用逻辑，不硬编码具体项目人物或台词。
+- 新增6项回归测试，覆盖汇总清单确认、阶段兼容、通用分镜校验和批量命令。
+
 ## v0.8.92 — 2026-08-04
 
 - 生产故事板和逐集交付统一要求当前`execution_ready`；直接renderer调用、手工复制或缺少来源清单的文件不能被认定为正式交付。
@@ -42,6 +52,15 @@
 - 默认并发为2并支持配置；只并行不同调度键的独立任务，串行任务、相邻集、连续性和项目状态写入保持互斥。
 - 429、流式断开和上下文超限分别进入限流退避、全新智能体重连和缩小上下文恢复策略。
 - 新增13项全局编排定向测试，覆盖初始化、候选验收、幂等复用、检查点恢复、串并行调度、状态锁和最小闭环。
+
+## v0.8.7 — 2026-07-30
+
+- 修复来源分析窗口`SA01/SA02`被误当成生产批次并连续扫描后续章节的问题。
+- `rolling_source_progress`新增schema v2：强制绑定已确认`B01/B02`，记录完成窗口数、批次就绪状态和具体来源缺口。
+- `plan-rolling-source-window`现在要求已确认的`rolling_batch`项目规格和当前B批次；没有B01时禁止开始滚动分析。
+- 当前批次标记`ready_for_batch`后，工具拒绝继续扩窗并明确要求转入该批次的大纲、剧本和交付流程。
+- 只有`needs_more_source`且记录非空`source_gap_reasons`时，才允许读取相邻新章节。
+- 新增10项滚动闭环回归测试；测试套件由168项增加到178项，本轮源码收尾未重新执行。
 
 ## v0.8.6 — 2026-07-30
 

@@ -157,8 +157,11 @@ class SourcePartitionTests(unittest.TestCase):
             ],
         }
         progress = {
-            "schema_version": 1,
+            "schema_version": 2,
             "current_batch_id": "B02",
+            "completed_window_count": 1,
+            "batch_readiness": "needs_more_source",
+            "source_gap_reasons": ["B02仍缺少后续冲突结果"],
             "carryover_event_ids": ["EV-OLD-1"],
             "event_consumption": {"EV-OLD-1": "unconsumed"},
             "next_read_start": "SU002",
@@ -169,6 +172,168 @@ class SourcePartitionTests(unittest.TestCase):
         self.assertEqual(plan["carryover_event_ids"], ["EV-OLD-1"])
         self.assertEqual(plan["reusable_analyzed_source_unit_ids"], ["SU001"])
         self.assertEqual(plan["new_analysis_source_unit_ids"], ["SU002", "SU003"])
+
+    def test_rolling_plan_rejects_analyzed_units_before_initial_checkpoint(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "records": [
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001.json",
+                    "analysis_sha256": "analysis-1",
+                    "idempotency_key": "SU001:hash-1:v1",
+                }
+            ],
+        }
+        progress = {
+            "schema_version": 2,
+            "current_batch_id": "B01",
+            "completed_window_count": 0,
+            "batch_readiness": "initial_window",
+            "source_gap_reasons": [],
+            "carryover_event_ids": [],
+            "event_consumption": {},
+            "next_read_start": "SU001",
+        }
+        with self.assertRaisesRegex(
+            source_partition.PartitionError, "rolling_window_checkpoint_required"
+        ):
+            source_partition.build_rolling_source_plan(
+                self.rolling_corpus(), registry, progress, window_size=2
+            )
+
+    def test_rolling_progress_rejects_analysis_window_id_as_batch_id(self) -> None:
+        errors = source_partition.validate_rolling_source_progress(
+            {
+                "schema_version": 2,
+                "current_batch_id": "SA02",
+                "completed_window_count": 1,
+                "batch_readiness": "needs_more_source",
+                "source_gap_reasons": ["当前事件尚未形成B01所需的完整转折"],
+                "carryover_event_ids": [],
+                "event_consumption": {},
+                "next_read_start": "SU002",
+            }
+        )
+        self.assertIn(
+            "rolling_progress_batch_invalid",
+            {item["code"] for item in errors},
+        )
+
+    def test_rolling_progress_v2_enforces_batch_readiness_invariants(self) -> None:
+        cases = (
+            (
+                {
+                    "schema_version": 2,
+                    "current_batch_id": "B01",
+                    "completed_window_count": 0,
+                    "batch_readiness": "needs_more_source",
+                    "source_gap_reasons": [],
+                    "carryover_event_ids": [],
+                    "event_consumption": {},
+                    "next_read_start": "SU001",
+                },
+                "rolling_progress_readiness_invalid",
+            ),
+            (
+                {
+                    "schema_version": 2,
+                    "current_batch_id": "B01",
+                    "completed_window_count": 1,
+                    "batch_readiness": "ready_for_batch",
+                    "source_gap_reasons": [],
+                    "carryover_event_ids": [],
+                    "event_consumption": {},
+                    "next_read_start": "SU002",
+                },
+                "rolling_progress_ready_next_read_conflict",
+            ),
+            (
+                {
+                    "schema_version": 2,
+                    "current_batch_id": "B01",
+                    "completed_window_count": 1,
+                    "batch_readiness": "needs_more_source",
+                    "source_gap_reasons": [],
+                    "carryover_event_ids": [],
+                    "event_consumption": {},
+                    "next_read_start": "SU002",
+                },
+                "rolling_progress_source_gap_missing",
+            ),
+        )
+        for payload, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                errors = source_partition.validate_rolling_source_progress(payload)
+                self.assertIn(expected_code, {item["code"] for item in errors})
+
+    def test_rolling_plan_stops_when_current_batch_is_ready(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "records": [
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001.json",
+                    "analysis_sha256": "analysis-1",
+                    "idempotency_key": "SU001:hash-1:v1",
+                }
+            ],
+        }
+        progress = {
+            "schema_version": 2,
+            "current_batch_id": "B01",
+            "completed_window_count": 1,
+            "batch_readiness": "ready_for_batch",
+            "source_gap_reasons": [],
+            "carryover_event_ids": [],
+            "event_consumption": {},
+            "next_read_start": None,
+        }
+        with self.assertRaisesRegex(
+            source_partition.PartitionError, "rolling_batch_ready_for_delivery"
+        ):
+            source_partition.build_rolling_source_plan(
+                self.rolling_corpus(), registry, progress, window_size=2
+            )
+
+    def test_rolling_plan_allows_next_window_only_with_source_gap(self) -> None:
+        registry = {
+            "schema_version": 1,
+            "records": [
+                {
+                    "source_unit_id": "SU001",
+                    "content_sha256": "hash-1",
+                    "analysis_contract_version": 1,
+                    "analysis_status": "analyzed",
+                    "analysis_path": "tmp/SU001.json",
+                    "analysis_sha256": "analysis-1",
+                    "idempotency_key": "SU001:hash-1:v1",
+                }
+            ],
+        }
+        progress = {
+            "schema_version": 2,
+            "current_batch_id": "B01",
+            "completed_window_count": 1,
+            "batch_readiness": "needs_more_source",
+            "source_gap_reasons": ["现有事件只够支撑E001，E002-E003仍缺少完整冲突结果"],
+            "carryover_event_ids": ["EV-OLD-1"],
+            "event_consumption": {"EV-OLD-1": "partially_consumed"},
+            "next_read_start": "SU002",
+        }
+        plan = source_partition.build_rolling_source_plan(
+            self.rolling_corpus(), registry, progress, window_size=2
+        )
+        self.assertEqual(plan["new_analysis_source_unit_ids"], ["SU002", "SU003"])
+        self.assertEqual(plan["planned_window_number"], 2)
+        self.assertTrue(plan["checkpoint_required_after_window"])
+        self.assertEqual(plan["source_gap_reasons"], progress["source_gap_reasons"])
 
     def test_record_chapter_analysis_rejects_same_unit_hash_and_contract_twice(self) -> None:
         registry = {"schema_version": 1, "records": []}
