@@ -19,7 +19,6 @@
 - `self_owned`：自营小说，上传文件直接作为依据。
 - `storyline`：故事线、梗概或大纲，上传内容是唯一依据。
 - `published_novel`：已发表小说，默认直接运行；只有用户主动开启时才能登记 HTTP/HTTPS `official_url`。
-- `synopsis`：用户提供的简介是唯一故事权威，必须在 `init` 时提供目标集数；只走受控扩写，不默认任何简介都足以支撑任意集数。
 
 `init` 和 `add-source` 不检查缺章、乱码、截断或完整度，也不生成入料体检。上传文件始终保留原样并以散列登记。
 
@@ -46,11 +45,10 @@
 - `granularity`：`unit_detail` 或 `chapter_summary`。旧索引缺少该字段和顶层 `upgrade_pending` 时按 `unit_detail` 兼容读取。
 - `unit_detail` 的 `events`：稳定 `event_id`、事件摘要、参与者、起因、行动、结果、状态变化与原著引用。
 - `chapter_summary` 的 `events`：稳定 `event_id`、事件摘要与原著引用；允许暂缺起因、行动、结果和状态变化。
+- 事件量必须如实提取：一个章节通常包含多个形成因果闭环的事件/戏剧单元，`events` 与 `beats` 应按原著内容逐项枚举，不得把“一章＝一个事件”当作完整提取。集数判定以事件量为准（`estimate-episodes` 优先统计 beats，缺失时退回 events），章节数量不参与集数判定。
 - `excluded` 必须提供 `exclusion_reason`；`failed` 必须提供 `error_reason`。
 
 `upgrade_pending` 必须无重复地精确列出全部 `chapter_summary` 单元，不能漏列或多列。事件索引只有在没有 `failed` 单元、没有缺失或重复单元，且所有 `excluded` 都有明确理由时才能确认。粗粒度只用于分阶段建索引，不能绕过 `SourceCorpus` 全覆盖；事件摘要不能替代后续读取原文。
-
-`synopsis` 项目的事件索引顶层必须增加 `source_mode: "synopsis"`、`synopsis_profile` 与 `synopsis_feasibility`。`synopsis_profile.facts` 逐条记录 `fact_id`、`fact_type`、`fact_text`、非空 `source_refs` 和 `protection`；`unknowns` 记录未解决事实。`synopsis_profile.analysis` 至少提供 `conflict_nodes`、`relationship_turns`、`hook_candidates` 和 `supporting_expansion_axes`。`synopsis_feasibility.requested_episodes` 必须与已确认项目规格一致，verdict 为 `sufficient` 时必须提供逐一覆盖 `E001...EN` 的 `episode_slots`，每个槽位绑定变化节点、故事功能、`state_change` 与集尾钩子；相同变化节点必须产生新的状态变化，不能重复同义槽位。
 
 ## 故事事实库
 
@@ -65,7 +63,8 @@
 - 目标用途与交付对象
 - 受众平台（如用户指定）
 - 总集数、单集目标时长或内容量。用户未指定时按单集约 60 秒、上下浮动 10%、约 15 个分镜单元规划；项目规格可用 `target_duration_seconds`（正整数秒）和 `duration_policy` 显式覆盖。
-- `synopsis` 项目可使用 `synopsis_policy` 覆盖默认生成策略：`duration_seconds: {min: 60, max: 90}`、`minimum_shot_units: 21`、`composition_policy: "unrestricted"`。范围/最低数必须为正整数且 `min <= max`；旧模式不读取该策略。
+- 集数依据 `episode_count_basis`（强制，项目已有确认的 `source_corpus`/`source_event_index` 时）：记录 `total_events`、`total_beats`、`counted_units`、`primary_count`、`units_per_episode`、`estimated_min_episodes`、`estimated_max_episodes`、`selected_episodes` 与 `user_override`。集数必须由原著事件量判定，禁止按上传章节数量推断；用户明确指定超出估算区间的集数时，登记 `user_override: true` 与 `user_confirmation` 说明。
+- AI 视频执行层默认两段式：`ai_video_phase` 取值 `after_script_storyboard_confirm`（默认）或 `auto`。`after_script_storyboard_confirm` 下先交付“剧本＋故事板”，取得用户继续 AI 视频的确认（确认 `ai_video_continuation_authorization`）后才允许登记/确认能力档案、模型参数化执行计划、Seedance 执行计划等生成侧制品；`auto` 下执行层默认直接生成。字段缺省按 `after_script_storyboard_confirm` 处理。
 - 改编尺度与来源说明
 - 可选 `rights_mode`：`owned`（默认，自有版权）、`licensed`（第三方授权，可用可选字符串 `rights_note` 记录授权范围）或 `unclear`。缺省字段按 `owned` 语义处理，旧规格不需要补字段。非法枚举值会被校验器拒绝确认；`unclear` 不阻塞，只在 `show`/`approve` 时提示用户确认权利状态一次。权利状态只登记用户声明，插件不联网检索正文、不外部核实、不等待授权。
 - 必须保留、允许调整、禁止改变
@@ -80,6 +79,10 @@
 - 主角、关系和基调模式
 - 优先强化、需要压缩和谨慎改写内容
 - 已确认改编边界
+
+## AI 视频继续执行授权记录 `AIVideoContinuationAuthorization`
+
+规范 JSON 制品键为 `ai_video_continuation_authorization`，依赖当前 `project_spec`。用于记录用户“剧本＋故事板交付后继续执行 AI 视频执行层”的明确确认；默认 `ai_video_phase: after_script_storyboard_confirm` 下，能力档案、模型参数化执行计划、Seedance 执行计划等生成侧制品必须先有已确认的授权记录（或项目规格 `ai_video_phase: auto`）才能登记/确认。必须包含：`project_id`、`scope`（确认范围，如“B01 全部集数剧本＋故事板交付后”）、`user_statement`（用户确认原文/要点）、`confirmed_at` 与 `generated_from`（绑定当前 `project_spec` 版本）。
 
 ## 改编变更授权记录 `ChangeAuthorization`
 
@@ -115,8 +118,6 @@
 
 核心原则是“可以增加表达，不得擅自增加故事事实”。自动允许项必须同时满足 `change_level: expression_only` 与 `source_fact_change: false`，并绑定可定位原著依据。`bridge_addition` 必须填写 `addition_basis`、`purpose` 和 `source_facts_unchanged: true`；如果找不到原著依据、承担新剧情功能或改变选择/原因/结果，就不再是自动桥接，必须先获用户授权。引用未知原著单元、越过项目禁改项、落点超出计划集数或缺少所需授权时不能确认。
 
-`synopsis` 项目的 `bridge_addition` 还必须填写唯一 `expansion_id`、`state_change`、`source_fact_ids` 和用途（校园/生活事件、配角或对手、中间冲突/误会/过渡、动作/对白/反应、场景衔接、群众/环境反应之一）。同一 `addition_basis + purpose + state_change` 不得重复；新主线、核心能力、结局性质等变化必须走 `approved_addition` 和 `ChangeAuthorization`，不能伪装成自动桥接。
-
 ## 全剧分集地图 `SeriesMap`
 
 最终交付以规范 JSON 为权威，顶层 `expected_episodes` 必须与项目规格一致，`episodes` 必须完整覆盖 `E001...EN`。顶层 `granularity` 使用 `full` 或 `backbone`；旧地图缺字段时按 `full` 读取。
@@ -136,8 +137,6 @@ v0.8 轻量 `backbone` 使用 `contract_version: 2`，每集只强制合法 `epi
 - 改编新增及用途
 
 全剧地图对改编决策的引用必须双向一致：台账写入某集的决策要出现在该集 `decision_ids`，地图不能引用不存在的决策。
-
-`synopsis` 项目的每集地图必须额外绑定 `fact_refs`、`decision_ids`、`expansion_ids`、`state_change` 和 `end_hook`。`fact_refs` 必须引用当前事件索引中的简介事实；桥接决策必须带 `expansion_id` 并覆盖本集；没有新状态变化时不得把同一变化节点重复用于后续集。地图仍要先过 `SeriesBoundaryReview` 和 `SeriesPlanReview`，确认后按集号串行生产。
 
 地图生成后先登记 `awaiting_approval`，不得直接确认。只有精确绑定当前地图版本的 `SeriesBoundaryReview` 结论为 `passed`，且其他规划审核也通过时，地图才可确认。
 

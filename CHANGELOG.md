@@ -1,3 +1,21 @@
+## v0.9.2 — 2026-08-06
+
+- AI 视频执行层改为默认两段式交付（`ai_video_phase`，默认 `after_script_storyboard_confirm`）：先交付“剧本＋故事板”（分集文学剧本 DOCX ＋ 同版本 HTML 故事板，含渲染故事板所需的通用分镜计划与人物锚点），交付完成后询问用户是否继续 AI 视频执行层；取得确认后才生成能力档案、模型参数化执行计划、Seedance 执行计划等生成侧制品。
+- 新增 `ai_video_continuation_authorization` 授权记录制品：默认两段式下，执行层生成侧制品必须先登记并确认该授权（或项目规格 `ai_video_phase: auto`），否则工具拒绝登记/确认（错误码 `ai_video_phase_not_confirmed`）。
+- `project_spec` 新增 `ai_video_phase` 字段（`after_script_storyboard_confirm`/`auto`，缺省为前者），确认规格时校验枚举。
+- 文档同步：SKILL.md、workflow.md、artifact-contracts.md、ai-video-production.md、README 明确“剧本＋故事板先行 → 用户确认 → AI 视频执行层”默认纪律。
+- 新增7项回归测试，覆盖两段式默认、auto 跳过、授权放行、剧本＋故事板制品不受门禁；完整自动化测试230项通过。
+
+# 更新记录
+
+## v0.9.1 — 2026-08-06
+
+- 集数判定机制改为“按原著事件量”：禁止仅凭上传章节数量推断集数；一章可拆多集、多章可合一集，章节数只界定来源范围。
+- 新增`estimate-episodes`命令：读取已登记的`source_event_index`（优先统计beats，缺失时退回events），按每集戏剧单元容量（默认4—8，可由项目规格`episode_count_policy.units_per_episode`或CLI参数覆盖）输出建议集数区间与推荐值，可`--register`登记为`episode_count_estimate`制品。
+- 新增项目规格集数依据门禁：项目已有确认的`source_corpus`/`source_event_index`时，确认`project_spec`必须携带`episode_count_basis`（或已确认`episode_count_estimate`制品），集数须落在事件量估算区间内，用户明确指定可登记`user_override`+`user_confirmation`；无内容索引的旧项目不阻塞。
+- 文档同步：SKILL.md、workflow.md、artifact-contracts.md、adaptation-playbook.md 明确“事件量定集数、章节数不参与”规则与`episode_count_basis`契约。
+- 统一插件版本号与代码常量（修复plugin.json与agent_runtime版本不一致导致的预检失败），版本升至`0.9.1`。
+
 # 更新记录
 
 ## v0.9.0 — 2026-08-05

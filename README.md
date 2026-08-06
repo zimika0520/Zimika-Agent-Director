@@ -1,40 +1,20 @@
 # AI导演
 
-把小说、故事线或简介，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
+把小说或故事线，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.9.0`
+当前版本：`0.9.2`
 
 ## 它能做什么
 
-- 上传来源默认直接建档，不自动检查缺章、乱码或完整度。
-- `source_kind: synopsis` 支持用户提供简介和任意正整数目标集数，先做简介事实索引与可行性判断，再进行受控扩写，不默认简介能支撑任意集数。
-- 已发表小说可由用户主动开启指定官网页面审核；审核不阻塞工作流。
-- 先生成覆盖全剧的轻量骨架，再按当前批次细化原著范围和事件。
-- 按批次生成大纲、分集剧本、角色/场景/道具/台词制作提取表。
-- 对原著追溯、内容边界、人物状态、伏笔和制作就绪程度执行门禁校验。
-- 每个批次独立打包；修改一个批次时，其他已确认批次包保持有效。
-- 全剧完成后执行跨批连续性终检，并复用批次包汇总最终交付。
-- 可选输出模型无关或 Seedance 2.0 的纯文字导演执行计划。
-- 只有有效确认的项目规格能改变运行权威；未确认新版本不会覆盖旧确认版本。
-- 章节分析按章节哈希和契约版本幂等登记，后续批次优先复用carryover。
-- `rolling_batch`允许最终总集数未知，并要求显式用户确认后才能扩展批次。
-- 文学剧本区分现场人物与非现场说话人，并识别电话声音、VO、OS和屏幕声音，防止口述cue被漏计。
-- 长任务由主任务直接调度不继承历史的一次性工作智能体；完整内容写入项目候选文件，不回流主上下文。
-- 任务规划具备幂等键、检查点和受控恢复；已完成结果不会重复生成，失联或失败最多尝试两次。
-- 独立任务可按可配置容量并发，串行任务和`project_state.json`写入保持互斥。
-- 滚动来源窗口必须绑定已确认B批次；每个窗口结束后先判断“够用/不足”，够用立即转入当前批次，禁止顺势扫描全书。
-- 生产任务与开发任务在启动时锁定模式；生产模式禁止修改源码、Skill、运行开发测试或重新做设计审核。
-- 生产预检按插件、运行时、Skill、入口和环境指纹只执行一次；版本/环境变化或实际执行失败后才重跑。
-- 用户的明确继续指令按项目、执行链、阶段、输入和目标复用；输入、目标、规则或阶段变化后自动失效。
-- 普通警告去重记录后继续；重大歧义、候选验收失败和连续失败立即阻断无关任务并从检查点恢复。
-- v0.8.8/v0.8.9运行时任务在首次预检时迁移，并在首次新规划时按真实阶段重绑定统一决策键；已完成且校验有效的结果不重新生成。
-- 单次校验命令共享依赖DAG结果、已加载状态和JSON payload；文件版本或散列变化会在新运行中重新校验。
-- 相同分镜输入只生成一次HTML，两个交付位置通过输入指纹缓存和原子复制保持一致。
-- 逐集DOCX/HTML只有经`render-episode-delivery`生成、登记来源清单并通过`validate-episode-delivery`后才是正式交付；直接renderer输出或手工复制文件只算候选。
-- `ai_video`和`both`项目在制作提取、台词提取、故事板或逐集交付前必须使用带`beats`和`episode_scopes`的schema v2事件索引；`human_team`不受该门禁影响。
-- 通用模型无关`ai_shot_plan:E###`支持全剧`validate-ai-shot-plans`覆盖校验，不再依赖Seedance专属执行计划才能批量验收。
-- `approve-artifacts`和`render-episode-deliveries`提供批量确认/渲染入口，逐集仍走既有标准门禁。
-- `series_delivery_manifest`只绑定合法上游，`final_delivery`阶段兼容新旧两条交付链。
+AI导演是一个运行在 Codex 中的长篇小说改编工作流，负责把长篇小说或故事线逐步改写成制作就绪的分集剧本，并输出可直接使用的交付物：
+
+- **按事件量判定集数**：先解析原著建立事件索引，再按每集可承载的戏剧单元容量估算集数。一章可以拆成多集，多章可以合成一集，绝不单纯按上传的章节数量推断集数。
+- **默认两段式交付**：先交付“剧本＋故事板”（分集文学剧本 DOCX ＋ 同版本 HTML 故事板），交付完成后询问你是否继续 AI 视频执行层；取得你的确认后，才生成能力档案、模型参数化执行计划、Seedance 执行计划等视频侧制品。
+- **全局骨架先行**：先生成覆盖全剧的轻量骨架，再按批次细化原著范围和事件，避免一次性硬切全书。
+- **逐批次推进**：按批次生成大纲、分集剧本、角色/场景/道具/台词制作提取表；每个批次独立打包，修改一个批次不影响其他已确认批次。
+- **内容边界与连续性门禁**：对原著追溯、内容边界、人物状态、伏笔和制作就绪程度执行校验；全剧完成后做跨批连续性终检。
+- **制作就绪输出**：文学剧本区分现场人物与非现场说话人（电话声音、VO、OS、屏幕声音），可直接用于导演拆镜，不需要再补剧情、动机或动作因果。
+- **生产模式保护**：正式制作任务锁定生产模式，禁止中途改源码、改 Skill 或重跑设计审核；长任务自动编排、断点恢复，已完成结果不会重复生成。
 
 ## 工作流
 
@@ -50,39 +30,6 @@ flowchart LR
     H --> I[跨批连续性终检]
     I --> J[全剧最终交付包]
 ```
-
-## 全局编排运行时
-
-正式处理小说时先锁定生产模式并运行一次预检，再由主任务直接创建、等待和关闭工作智能体：
-
-```bash
-python3 skills/novel-to-script-director/scripts/project_tool.py startup-preflight \
-  <项目目录> --mode production --run-id RUN-001
-python3 skills/novel-to-script-director/scripts/project_tool.py plan-agent-slice <项目目录> \
-  --task-type source_analysis --scope-json '{"source_unit_id":"SU001"}' \
-  --input-ref source_corpus@1=01_原著解析/原著语料V1.json \
-  --stage source_analysis --operation source_analysis \
-  --contract-version 1 --acceptance-command schema-only \
-  --output-schema-version 1 --coordinator-slice source_window \
-  --run-id RUN-001 --delegation-directive "继续执行"
-python3 skills/novel-to-script-director/scripts/project_tool.py accept-agent-result \
-  <项目目录> --task-id <任务ID> --result <项目内结果信封.json>
-python3 skills/novel-to-script-director/scripts/project_tool.py show-agent-runtime <项目目录>
-```
-
-工作智能体只能读取任务包允许路径，只能写入`.ai-director/runtime/candidates/`下的任务目录。CLI负责候选校验、制品登记、检查点和项目状态写入，不直接调用模型。
-
-`production`是小说生产默认模式。模式一经锁定不能在同一项目执行链中切换；只有明确的插件开发任务才能使用`--mode development --development-task-id <开发任务ID>`。生产任务包会拒绝`development_test`、`design_review`、`skill_edit`和`source_edit`操作。
-
-预检结果记录在现有`project_state.json -> agent_runtime.execution_control`中，不建立第二套状态文件。环境未变化且没有新的执行失败时复用`execution_ready`；插件、Skill、入口、Python/平台或显式环境版本变化后，下一次规划先报预检失效，重跑后再继续。
-
-统一决策幂等键包含项目身份、阶段、操作、输入散列、目标范围、规则版本、运行时/插件版本及输出契约/schema版本。已接受结果只有在文件存在、散列一致且基础校验通过时才复用；否则沿用原幂等键进入受控恢复。
-
-普通警告只记录一次并继续。重大歧义或候选验收失败会创建活动阻断、暂停无关任务并写检查点；修复后用`startup-preflight --resolve-blocker-id <阻断ID> --resolution-note <说明>`解除，原任务从检查点恢复。笼统的“继续执行”只授权当前执行动作，不能替代新增故事事实所需的具体`change_authorization`。
-
-校验缓存只存在于单次命令的内存中，不跨命令持久化；它按制品键、版本、文件散列和依赖闭包签名复用已完成的依赖结论。故事板缓存位于项目自己的`.ai-director/runtime/render-cache/storyboards/`，按分镜计划及相关锚点、台词表、项目规格的版本和散列生成指纹。输入变化后使用新指纹重新渲染，缓存目录不进入最终交付包。
-
-生产渲染必须使用当前`execution_ready`。`render-episode-delivery`会冻结当前确认制品的路径、版本和SHA-256，生成DOCX/HTML后登记`episode_delivery_manifest:<集号>`；只有`validate-episode-delivery`重新核对输入指纹、输出散列、DOCX结构和HTML标准renderer标记后，结果才返回`official_delivery: true`。
 
 ## 安装到 Codex
 
@@ -148,29 +95,18 @@ python3 skills/novel-to-script-director/scripts/project_tool.py init \
 
 `--expected-episodes` 记入 `expected_episodes_hint`，只用于在 `project_spec` 确认前先定义批次；交付校验仍以已确认 `project_spec` 的 `expected_episodes` 为权威。
 
-### 简介模式
+### 按事件量估算集数
 
 ```bash
-python3 skills/novel-to-script-director/scripts/project_tool.py init \
-  /path/to/synopsis-project \
-  --name "简介项目" \
-  --source /path/to/synopsis.txt \
-  --source-kind synopsis \
-  --expected-episodes 20
+python3 skills/novel-to-script-director/scripts/project_tool.py estimate-episodes \
+  /path/to/project
 ```
 
-简介模式默认单集 `60—90` 秒、单集至少 `21` 个 AI 分镜单元，并接受 `1/20/30/40` 等任意正整数集数。生成前先运行：
-
-```bash
-python3 skills/novel-to-script-director/scripts/project_tool.py validate-synopsis \
-  /path/to/synopsis-project
-```
-
-只有可行性为 `sufficient` 且全剧分集地图确认后，才按集号串行生成剧本、分镜、DOCX 和 HTML 故事板。简介不足以支撑目标集数时，命令会阻断并要求补充简介或减少集数。
+工具读取已登记的 `source_event_index`（优先统计 beats，缺失时退回 events），按每集戏剧单元容量输出建议集数区间与推荐值，可 `--register` 登记为 `episode_count_estimate` 制品。
 
 ### 声明单集目标时长（可选）
 
-默认生成策略为单集约 60 秒、允许上下浮动 10%、建议约 15 个分镜单元；简介模式单独使用 `60—90` 秒和最低 `21` 个单元。若项目需要其他时长，可在 `project_spec` JSON 中显式写入 `target_duration_seconds` 覆盖默认值：
+默认生成策略为单集约 60 秒、允许上下浮动 10%、建议约 15 个分镜单元。若项目需要其他时长，可在 `project_spec` JSON 中显式写入 `target_duration_seconds` 覆盖默认值：
 
 ```json
 {
@@ -181,23 +117,12 @@ python3 skills/novel-to-script-director/scripts/project_tool.py validate-synopsi
 }
 ```
 
-AI 分镜计划必须写出当前生效的目标时长（未显式声明时为默认 60 秒，显式声明时为项目值）；缺失或不符都会阻断确认。剧本校验也会按“中文配音约3.5—4.5字/秒”给出净对白秒数预警。可选 `duration_policy` 覆盖容差与推算参数，默认偏差容差为 ±10%，详见 `references/production-data-schemas.md`。
-
-单独校验某集剧本的时长预算：
-
-```bash
-python3 skills/novel-to-script-director/scripts/project_tool.py validate-script \
-  /path/to/E001.md --target-duration-seconds 90
-```
-
 ### 定义批次
 
 ```bash
 python3 skills/novel-to-script-director/scripts/project_tool.py define-batch \
   /path/to/project B01 E001 E002 E003 --confirmed-by-user
 ```
-
-`--confirmed-by-user`只对`scope_mode: rolling_batch`、`schema_version: 2`的新批次强制；固定全剧旧项目仍按`expected_episodes`校验。
 
 ### 滚动来源复用
 
@@ -232,6 +157,18 @@ python3 skills/novel-to-script-director/scripts/project_tool.py build-handoff \
   /path/to/project --series --expected-episodes 60
 ```
 
+### 渲染并验收逐集交付
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-delivery \
+  /path/to/project E001
+
+python3 skills/novel-to-script-director/scripts/project_tool.py validate-episode-delivery \
+  /path/to/project E001
+```
+
+逐集命令输出 `E001_剧本.docx`、`E001_故事板.html` 和项目运行时内的来源清单，不生成图片。文件存在不等于正式完成，必须以验收命令返回的 `official_delivery` 为准。
+
 ## 项目结构
 
 ```text
@@ -255,29 +192,6 @@ skills/novel-to-script-director/
 - 调用配音或剪辑接口；
 - 把未读取到的内容冒充原著事实。
 
-## 动态分批与逐集交付
-
-```bash
-python3 skills/novel-to-script-director/scripts/project_tool.py plan-source-partitions   <项目目录> --source-corpus <source_corpus.json> --policy <partition_policy.json>   --output <tmp/source-analysis/run-001/partition-plan.json>
-
-python3 skills/novel-to-script-director/scripts/project_tool.py merge-source-analysis-shards   <项目目录> --plan <partition-plan.json> --shard-dir <shards目录>   --output <source_event_index_candidate.json>
-
-python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-delivery   <项目目录> E001
-
-python3 skills/novel-to-script-director/scripts/project_tool.py validate-episode-delivery   <项目目录> E001
-
-python3 skills/novel-to-script-director/scripts/project_tool.py validate-ai-shot-plans \
-  <项目目录> --expected-episodes 20
-
-python3 skills/novel-to-script-director/scripts/project_tool.py approve-artifacts \
-  <项目目录> ai_shot_plan:E001@1 ai_shot_plan:E002@1
-
-python3 skills/novel-to-script-director/scripts/project_tool.py render-episode-deliveries \
-  <项目目录> E001 E002
-```
-
-流程不按小说总字数切换；章节/事件优先，容量预算兜底。逐集命令输出 `E001_剧本.docx`、`E001_故事板.html`和项目运行时内的来源清单，不生成图片。文件存在不等于正式完成，必须以验收命令返回的`official_delivery`为准。
-
 ## 验证
 
 ```bash
@@ -285,7 +199,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-v0.9.0 新增全剧汇总依赖作用域、通用AI分镜校验和批量确认/渲染回归测试；完整自动化测试222项通过。
+完整自动化测试 230 项通过（v0.9.2）。
 
 ## 更新记录
 

@@ -29,7 +29,6 @@ from typing import Any, Iterable, NamedTuple
 import source_partition
 import shot_contracts
 import agent_runtime
-import synopsis_contracts
 
 
 SCHEMA_VERSION = 1
@@ -55,9 +54,8 @@ RIGHTS_UNCLEAR_NOTICE = (
     "插件不联网检索正文，也不等待授权，按用户提供的来源继续推进。"
 )
 
-SOURCE_KINDS = ("self_owned", "storyline", "published_novel", "synopsis")
+SOURCE_KINDS = ("self_owned", "storyline", "published_novel")
 DEFAULT_SOURCE_KIND = "self_owned"
-SYNOPSIS_DEFAULT_POLICY = synopsis_contracts.SYNOPSIS_DEFAULT_POLICY
 
 # 默认生成策略：用户未明确指定时，按约 60 秒、±10%、约 15 个分镜单元规划。
 # project_spec 中的显式值优先于默认值。
@@ -69,6 +67,27 @@ DEFAULT_DIALOGUE_CHARS_PER_SECOND = (3.5, 4.5)
 # 单场时长比例带：单集目标时长 ÷ 场数 后允许的上下浮动，取自文档示例
 #（90 秒 3 场 → 每场约 20—45 秒，即均值 30 秒的 2/3 到 3/2）。
 SCENE_DURATION_BAND = (2 / 3, 3 / 2)
+
+# 集数事件量估算默认策略：集数必须由原著事件量判定，禁止按上传章节数推断。
+# 默认按一集约 60 秒、约 15 个分镜单元规划；每个戏剧单元（beat/事件）通常跨
+# 2—4 个分镜单元，故每集约 4—8 个戏剧单元。该区间是样本推算启发值，不是行业
+# 标准；项目规格 `episode_count_policy.units_per_episode: [min, max]` 可显式覆盖。
+DEFAULT_UNITS_PER_EPISODE = (4, 8)
+
+# AI 视频执行层默认采用两段式：先交付“剧本＋故事板”（分集文学剧本 DOCX ＋ 同版本
+# HTML 故事板，含渲染故事板所需的通用分镜计划与人物锚点），交付完成后先询问用户，
+# 取得明确确认（ai_video_continuation_authorization）后才进入 AI 视频执行层生成侧：
+# 能力档案、模型参数化执行计划、Seedance 执行计划等面向视频生成的制品。
+AI_VIDEO_PHASES = ("after_script_storyboard_confirm", "auto")
+DEFAULT_AI_VIDEO_PHASE = "after_script_storyboard_confirm"
+AI_VIDEO_EXECUTION_GATED_TYPES = frozenset(
+    {
+        "model_capability_profile",
+        "ai_video_execution_plan",
+        "seedance_execution_plan",
+        "seedance_boundary_review",
+    }
+)
 
 # 入料体检（init/add-source 时的来源体检卡）。体检只提示，不阻塞。
 INTAKE_CHECK_FILENAME = "入料体检.json"
@@ -177,8 +196,10 @@ ARTIFACT_TYPES = {
     "model_capability_profile": "模型能力档案",
     "ai_shot_plan": "AI分镜单元计划",
     "ai_video_boundary_review": "AI分镜内容边界报告",
+    "ai_video_continuation_authorization": "AI视频继续执行授权记录",
     "ai_video_execution_plan": "AI视频执行计划",
     "episode_delivery_manifest": "逐集正式交付来源清单",
+    "episode_count_estimate": "集数事件量估算",
     "batch_delivery_review": "批次交付审核报告",
     "batch_delivery_manifest": "批次交付清单",
     "batch_package": "批次制作就绪包",
@@ -215,8 +236,11 @@ DEPENDENCY_GRAPH = {
         "ai_shot_plan",
         "ai_video_boundary_review",
         "episode_delivery_manifest",
+        "episode_count_estimate",
         "batch_source_detail",
     },
+    "episode_count_estimate": set(),
+    "ai_video_continuation_authorization": set(),
     "story_facts": {
         "adaptation_profile",
         "genre_profile",
@@ -634,6 +658,8 @@ OPTIONAL_UPSTREAM_TYPES: dict[str, frozenset[str]] = {
         "scene_anchor",
         "prop_anchor",
     }),
+    "episode_count_estimate": frozenset({"source_event_index", "source_corpus"}),
+    "ai_video_continuation_authorization": frozenset({"project_spec"}),
 }
 OPTIONAL_UPSTREAM_TYPES["final_package"] = frozenset(
     set(ARTIFACT_TYPES) - {"final_package", "delivery_manifest", "series_delivery_manifest"}
@@ -661,6 +687,7 @@ ARTIFACT_STAGE = {
     "chapter_analysis_registry": "source_analysis",
     "rolling_source_progress": "source_analysis",
     "source_event_index": "source_analysis",
+    "episode_count_estimate": "source_analysis",
     "story_facts": "source_analysis",
     "adaptation_profile": "adaptation_positioning",
     "genre_profile": "adaptation_positioning",
@@ -693,6 +720,7 @@ ARTIFACT_STAGE = {
     "model_capability_profile": "final_delivery",
     "ai_shot_plan": "final_delivery",
     "ai_video_boundary_review": "final_delivery",
+    "ai_video_continuation_authorization": "final_delivery",
     "ai_video_execution_plan": "final_delivery",
     "episode_delivery_manifest": "final_delivery",
     "batch_delivery_review": "final_delivery",
@@ -1757,6 +1785,18 @@ def duration_policy_issues(payload: dict[str, Any]) -> list[str]:
         except ToolError as exc:
             problems.append(str(exc))
 
+    
+    for _field, _label in (("min_seconds_per_episode", "min"), ("max_seconds_per_episode", "max")):
+        _value = policy.get(_field)
+        if _value is None:
+            continue
+        if type(_value) is not int or _value <= 0:
+            problems.append(f"duration_policy.{_field} 必须是正整数")
+    _min_val = policy.get("min_seconds_per_episode")
+    _max_val = policy.get("max_seconds_per_episode")
+    if type(_min_val) is int and type(_max_val) is int and _min_val >= _max_val:
+        problems.append("duration_policy.min_seconds_per_episode 必须小于 max_seconds_per_episode")
+
     rate = policy.get("dialogue_chars_per_second")
     if rate is not None:
         if (
@@ -1778,38 +1818,272 @@ def validate_project_spec_duration(
     if payload is None:
         return
     problems = duration_policy_issues(payload)
-    synopsis_policy = payload.get("synopsis_policy")
-    if synopsis_policy is not None:
-        problems.extend(
-            item["message"]
-            for item in synopsis_contracts.validate_synopsis_policy(synopsis_policy)
-        )
     if problems:
         raise ToolError("项目规格时长契约非法：" + "；".join(problems))
 
 
-def validate_project_spec_synopsis(
-    state: dict[str, Any],
-    payload: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    """synopsis 项目规格门禁：目标集数必须是正整数，策略字段必须合法。"""
-    if project_source_kind(state) != "synopsis":
-        return []
+def episode_count_policy_units(
+    project_path: Path, state: dict[str, Any]
+) -> tuple[int, int] | None:
+    """项目规格 episode_count_policy.units_per_episode 显式覆盖；未声明返回 None。"""
+    payload = confirmed_project_spec_payload(project_path, state)
+    policy = payload.get("episode_count_policy") if isinstance(payload, dict) else None
+    if not isinstance(policy, dict):
+        return None
+    values = policy.get("units_per_episode")
+    if not isinstance(values, list) or len(values) != 2:
+        return None
+    low, high = values
+    if type(low) is not int or type(high) is not int or low <= 0 or high < low:
+        return None
+    return low, high
+
+
+def count_index_dramatic_units(index_payload: dict[str, Any]) -> dict[str, Any]:
+    """统计事件索引中的戏剧单元量：优先 beats，缺失时退回 events。
+
+    只统计有非空摘要的单元。结果用于集数事件量估算，不替代原文保真检查。
+    章节数量不参与集数判定；同一章可拆多集，多章也可合并为一集。
+    """
+    units = index_payload.get("units")
+    if not isinstance(units, list):
+        return {
+            "total_events": 0,
+            "total_beats": 0,
+            "primary_count": 0,
+            "counted_units": "none",
+            "unit_counts": [],
+        }
+    total_events = 0
+    total_beats = 0
+    unit_counts: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        events = unit.get("events")
+        events = events if isinstance(events, list) else []
+        event_count = sum(
+            1
+            for event in events
+            if isinstance(event, dict)
+            and isinstance(event.get("summary"), str)
+            and event["summary"].strip()
+        )
+        beat_count = 0
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            beats = event.get("beats")
+            if not isinstance(beats, list):
+                continue
+            beat_count += sum(
+                1
+                for beat in beats
+                if isinstance(beat, dict)
+                and isinstance(beat.get("summary"), str)
+                and beat["summary"].strip()
+            )
+        total_events += event_count
+        total_beats += beat_count
+        unit_counts.append(
+            {
+                "source_unit_id": unit.get("source_unit_id"),
+                "source_locator": unit.get("source_locator"),
+                "events": event_count,
+                "beats": beat_count,
+            }
+        )
+    counted_units = (
+        "beats" if total_beats > 0 else ("events" if total_events > 0 else "none")
+    )
+    primary_count = total_beats if total_beats > 0 else total_events
+    return {
+        "total_events": total_events,
+        "total_beats": total_beats,
+        "primary_count": primary_count,
+        "counted_units": counted_units,
+        "unit_counts": unit_counts,
+    }
+
+
+def estimate_episode_count_range(
+    primary_count: int, units_per_episode_min: int, units_per_episode_max: int
+) -> tuple[int, int]:
+    """按每集戏剧单元容量把事件量换算成建议集数区间（向上取整）。"""
+    if primary_count <= 0:
+        return 0, 0
+    estimated_min = math.ceil(primary_count / units_per_episode_max)
+    estimated_max = math.ceil(primary_count / units_per_episode_min)
+    return max(1, estimated_min), max(1, estimated_max)
+
+
+def recommended_episode_count(
+    primary_count: int,
+    estimated_min: int,
+    estimated_max: int,
+    units_per_episode_min: int,
+    units_per_episode_max: int,
+) -> int:
+    """推荐集数：取每集戏剧单元数最接近容量中位数的集数。"""
+    if primary_count <= 0:
+        return 0
+    midpoint = (units_per_episode_min + units_per_episode_max) / 2
+    candidate = round(primary_count / midpoint)
+    return max(estimated_min, min(estimated_max, candidate))
+
+
+def project_has_content_index(project_path: Path, state: dict[str, Any]) -> bool:
+    """项目是否已有确认过的原著语料或事件索引（用于集数依据门禁）。
+
+    只要内容制品已确认且文件仍在，就必须按事件量给出集数依据；不要求依赖链
+    相对待确认规格仍为最新，否则升级规格版本会绕过该门禁。
+    """
+    for key in ("source_event_index", "source_corpus"):
+        record = latest_record(state, key)
+        if record is None:
+            continue
+        if record.get("status") != "confirmed":
+            continue
+        path = path_from_record(project_path, record.get("path"))
+        if path is not None and path.is_file():
+            return True
+    return False
+
+
+def _validate_episode_estimate_value(expected: int, estimate: dict[str, Any]) -> None:
+    """校验事件量估算（episode_count_estimate 制品或规格内嵌 basis）与集数一致。"""
+    est_min = estimate.get("estimated_min_episodes")
+    est_max = estimate.get("estimated_max_episodes")
+    primary = estimate.get("primary_count")
+    if (
+        type(primary) is not int
+        or primary < 1
+        or type(est_min) is not int
+        or type(est_max) is not int
+        or est_min < 1
+        or est_max < est_min
+    ):
+        raise ToolError(
+            "集数事件量估算无效：必须包含大于0的 primary_count 与合法 estimated_min/max_episodes"
+        )
+    if est_min <= expected <= est_max:
+        return
+    if estimate.get("user_override") is True:
+        confirmation = estimate.get("user_confirmation")
+        if isinstance(confirmation, str) and confirmation.strip():
+            return
+        raise ToolError(
+            "集数事件量估算 user_override=true 时必须登记 user_confirmation 说明"
+        )
+    raise ToolError(
+        f"expected_episodes（{expected}）超出事件量估算区间 [{est_min}, {est_max}]；"
+        "若用户明确指定该集数，请在 episode_count_basis 中登记 user_override=true 与 user_confirmation"
+    )
+
+
+def load_confirmed_episode_count_estimate(
+    project_path: Path, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """返回已确认 episode_count_estimate 制品的 payload；无或失效返回 None。"""
+    record = latest_record(state, "episode_count_estimate")
+    if record is None or record.get("status") != "confirmed":
+        return None
+    if not confirmed_record_is_usable(
+        state, "episode_count_estimate", record, project_path
+    ):
+        return None
+    payload = load_json_artifact_payload(
+        project_path, "episode_count_estimate", record, []
+    )
+    return payload if isinstance(payload, dict) else None
+
+
+def validate_project_spec_episode_basis(
+    project_path: Path, state: dict[str, Any], record: dict[str, Any]
+) -> None:
+    """approve 前校验集数依据：expected_episodes 必须由原著事件量支撑。
+
+    项目已有原著语料/事件索引时，集数不能只按上传章节数量推断；规格必须携带
+    episode_count_basis（或已确认 episode_count_estimate 制品）且集数落在事件量
+    估算区间内，或持有用户显式覆盖确认。旧项目无内容索引时不阻塞。
+    """
+    payload = load_project_spec_payload(project_path, record)
     if payload is None:
-        return [issue("synopsis_project_spec_required", "synopsis 项目必须登记 JSON 项目规格")]
-    errors: list[dict[str, Any]] = []
+        return
     expected = payload.get("expected_episodes")
     if type(expected) is not int or expected < 1:
-        errors.append(
-            issue(
-                "synopsis_expected_episodes_invalid",
-                "synopsis 项目规格 expected_episodes 必须是正整数",
-            )
+        return
+    basis = payload.get("episode_count_basis")
+    if isinstance(basis, dict):
+        _validate_episode_estimate_value(expected, basis)
+        return
+    estimate = load_confirmed_episode_count_estimate(project_path, state)
+    if estimate is not None:
+        _validate_episode_estimate_value(expected, estimate)
+        return
+    if project_has_content_index(project_path, state):
+        raise ToolError(
+            "项目规格缺少 episode_count_basis：集数必须按原著章节内容与事件量判定，"
+            "禁止仅按上传章节数量推断；请先完成原著事件索引，运行 estimate-episodes "
+            "生成事件量估算并写入规格的 episode_count_basis（或登记并确认 episode_count_estimate）"
         )
-    policy = payload.get("synopsis_policy")
-    if policy is not None:
-        errors.extend(synopsis_contracts.validate_synopsis_policy(policy))
-    return errors
+
+
+def project_ai_video_phase(project_path: Path, state: dict[str, Any]) -> str:
+    """项目规格 ai_video_phase；未声明时按默认 after_script_storyboard_confirm 处理。"""
+    payload = confirmed_project_spec_payload(project_path, state)
+    value = payload.get("ai_video_phase") if isinstance(payload, dict) else None
+    return value if value in AI_VIDEO_PHASES else DEFAULT_AI_VIDEO_PHASE
+
+
+def validate_project_spec_ai_video_phase(
+    project_path: Path, record: dict[str, Any]
+) -> None:
+    """approve 前校验 ai_video_phase 枚举；字段缺省按 after_script_storyboard_confirm 处理。"""
+    payload = load_project_spec_payload(project_path, record)
+    if payload is None:
+        return
+    value = payload.get("ai_video_phase")
+    if value is None:
+        return
+    if value not in AI_VIDEO_PHASES:
+        raise ToolError(
+            f"项目规格 ai_video_phase 非法：{value!r}；"
+            f"只允许 {'/'.join(AI_VIDEO_PHASES)}，缺省按 {DEFAULT_AI_VIDEO_PHASE} 处理"
+        )
+
+
+def has_confirmed_ai_video_continuation_authorization(
+    project_path: Path, state: dict[str, Any]
+) -> bool:
+    """是否已登记并确认“继续 AI 视频执行层”的用户授权。"""
+    record = latest_record(state, "ai_video_continuation_authorization")
+    if record is None or record.get("status") != "confirmed":
+        return False
+    path = path_from_record(project_path, record.get("path"))
+    return path is not None and path.is_file()
+
+
+def ensure_ai_video_execution_allowed(
+    project_path: Path, state: dict[str, Any], artifact_kind: str
+) -> None:
+    """AI 视频执行层（生成侧）制品默认需用户确认。
+
+    默认只交付“剧本＋故事板”；能力档案、模型参数化执行计划、Seedance 执行计划
+    等制品，必须先登记并确认 ai_video_continuation_authorization，或把项目规格
+    ai_video_phase 显式设为 auto，否则拒绝登记/确认。
+    """
+    if artifact_kind not in AI_VIDEO_EXECUTION_GATED_TYPES:
+        return
+    if project_ai_video_phase(project_path, state) == "auto":
+        return
+    if has_confirmed_ai_video_continuation_authorization(project_path, state):
+        return
+    raise ToolError(
+        "ai_video_phase_not_confirmed：默认只交付剧本＋故事板；AI 视频执行层（能力档案、"
+        "模型参数化执行计划、Seedance 执行计划）需在剧本＋故事板交付后取得用户明确确认，"
+        "先登记并确认 ai_video_continuation_authorization，或把项目规格 ai_video_phase 设为 auto"
+    )
 
 
 def default_source_policy() -> dict[str, Any]:
@@ -2193,6 +2467,115 @@ def run_intake_check_safely(
         }
 
 
+def command_estimate_episodes(args: argparse.Namespace) -> int:
+    """按原著事件量估算建议集数区间；章节数量不参与集数判定。
+
+    依赖已登记/已确认的 source_event_index（优先 beats，缺失退回 events）。
+    估算只是建议区间，最终集数由用户确认后写入项目规格的 episode_count_basis。
+    """
+    project_path, state = load_state(args.project)
+    index_record = latest_record(state, "source_event_index")
+    index_payload = None
+    index_version = None
+    if index_record is not None:
+        index_payload = load_json_artifact_payload(
+            project_path, "source_event_index", index_record, []
+        )
+        index_version = index_record.get("version")
+    if not isinstance(index_payload, dict) or not isinstance(
+        index_payload.get("units"), list
+    ):
+        raise ToolError(
+            "尚未建立可统计的原著事件索引（source_event_index），无法按事件量估算集数；"
+            "请先完成 source_analysis 阶段的事件索引（含 events/beats）后再运行 estimate-episodes"
+        )
+    counts = count_index_dramatic_units(index_payload)
+    if counts["primary_count"] <= 0:
+        raise ToolError(
+            "事件索引未识别到有效事件/戏剧单元；请先按章节内容补充事件与 beats，"
+            "不能在没有事件量数据时推断集数"
+        )
+    units_min = (
+        args.units_per_episode_min
+        if args.units_per_episode_min is not None
+        else DEFAULT_UNITS_PER_EPISODE[0]
+    )
+    units_max = (
+        args.units_per_episode_max
+        if args.units_per_episode_max is not None
+        else DEFAULT_UNITS_PER_EPISODE[1]
+    )
+    if units_min < 1 or units_max < units_min:
+        raise ToolError(
+            "--units-per-episode-min 必须大于 0 且不大于 --units-per-episode-max"
+        )
+    estimated_min, estimated_max = estimate_episode_count_range(
+        counts["primary_count"], units_min, units_max
+    )
+    recommended = recommended_episode_count(
+        counts["primary_count"],
+        estimated_min,
+        estimated_max,
+        units_min,
+        units_max,
+    )
+    estimate = {
+        "schema_version": 1,
+        "project_id": state.get("project_id"),
+        "generated_from": [
+            {"artifact_key": "source_event_index", "version": index_version}
+        ],
+        "source_contract_version": index_payload.get("schema_version"),
+        "counted_from": "source_event_index",
+        "total_events": counts["total_events"],
+        "total_beats": counts["total_beats"],
+        "counted_units": counts["counted_units"],
+        "primary_count": counts["primary_count"],
+        "unit_counts": counts["unit_counts"],
+        "units_per_episode": {
+            "min": units_min,
+            "max": units_max,
+            "basis": "cli_default_or_override",
+        },
+        "estimated_min_episodes": estimated_min,
+        "estimated_max_episodes": estimated_max,
+        "recommended_episodes": recommended,
+        "note": (
+            "集数按原著事件量估算，章节数量不参与集数判定；估算为建议区间，"
+            "最终集数以用户确认的项目规格 expected_episodes 为准"
+        ),
+    }
+    if args.register:
+        directory = project_path / PROJECT_DIRECTORIES[1]
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "episode_count_estimate.json"
+        target.write_text(
+            json.dumps(estimate, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        depends_on = (
+            [f"source_event_index@{index_version}"]
+            if type(index_version) is int
+            else []
+        )
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            command_register_artifact(
+                argparse.Namespace(
+                    project=str(project_path),
+                    artifact_key="episode_count_estimate",
+                    path=str(target),
+                    status="awaiting_approval",
+                    depends_on=depends_on,
+                    note=args.note or "",
+                )
+            )
+        estimate["registered"] = True
+        estimate["registered_path"] = target.relative_to(project_path).as_posix()
+    print_json({"ok": True, "estimate": estimate})
+    return 0
+
+
 def command_init(args: argparse.Namespace) -> int:
     project_path = Path(args.project).expanduser().resolve()
     path = project_path / STATE_FILENAME
@@ -2200,11 +2583,6 @@ def command_init(args: argparse.Namespace) -> int:
         raise ToolError(f"项目已初始化，不会覆盖：{path}")
     if args.expected_episodes is not None and args.expected_episodes < 1:
         raise ToolError("--expected-episodes 必须是大于 0 的整数")
-    if args.source_kind == "synopsis" and args.expected_episodes is None:
-        raise ToolError(
-            "简介模式初始化必须提供 --expected-episodes；"
-            "简介是最低输入，不能默认任何简介都足以支撑任意集数"
-        )
     source_policy = build_source_policy(
         args.source_kind, args.official_review, args.official_url
     )
@@ -2365,15 +2743,6 @@ def command_show(args: argparse.Namespace) -> int:
             else None,
             "updated_at": state.get("updated_at"),
         }
-        if summary["source_kind"] == "synopsis":
-            summary["synopsis"] = {
-                "requested_episodes": (
-                    project_expected_episodes(project_path, state)
-                    or state_expected_episodes_hint(state)
-                ),
-                "duration_bounds": project_duration_bounds(project_path, state),
-                "minimum_shot_units": project_minimum_shot_units(project_path, state),
-            }
         time_totals = stage_time_totals(state)
         if time_totals is not None:
             summary["time_tracking"] = time_totals
@@ -2607,6 +2976,8 @@ def command_set_stage(args: argparse.Namespace) -> int:
 def command_register_artifact(args: argparse.Namespace) -> int:
     project_path, state = load_state(args.project)
     artifact_kind = artifact_type(args.artifact_key)
+    # AI 视频执行层（生成侧）制品默认需用户确认后才可登记。
+    ensure_ai_video_execution_allowed(project_path, state, artifact_kind)
     if args.status not in {"draft", "awaiting_approval"}:
         raise ToolError("登记状态只能是 draft 或 awaiting_approval；确认必须使用 approve")
     if artifact_kind in {
@@ -2655,6 +3026,24 @@ def command_register_artifact(args: argparse.Namespace) -> int:
     ):
         validate_dependency_shape(args.artifact_key, dependencies)
     registered_at = now_iso()
+    if getattr(args, "validate", None) == "ai_shot_plan" and artifact_kind == "ai_shot_plan":
+        _validation_payload = json.loads(artifact_path.read_text(encoding="utf-8-sig"))
+        _validation_record = {
+            "version": version,
+            "path": stored_path,
+            "status": args.status,
+            "depends_on": dependencies,
+        }
+        _validation_errors = validate_ai_shot_plan_payload(
+            project_path, state, args.artifact_key, _validation_record, _validation_payload
+        )
+        if _validation_errors:
+            raise ToolError(
+                "AI分镜计划校验未通过，不能注册：" + "、".join(
+                    e.get("code", "未知错误") for e in _validation_errors
+                )
+            )
+
     record: dict[str, Any] = {
         "version": version,
         "artifact_type": artifact_kind,
@@ -2734,6 +3123,8 @@ def command_approve(args: argparse.Namespace) -> int:
     if not isinstance(dependencies, list):
         raise ToolError("制品依赖结构无效，不能确认")
     selected_type = artifact_type(args.artifact_key)
+    # AI 视频执行层（生成侧）制品确认前再次校验用户确认/auto 模式。
+    ensure_ai_video_execution_allowed(project_path, state, selected_type)
     validate_dependency_shape(args.artifact_key, dependencies)
     review_target_type = BOUNDARY_TARGET_FOR_REVIEW.get(selected_type)
     for dependency in dependencies:
@@ -2774,7 +3165,6 @@ def command_approve(args: argparse.Namespace) -> int:
             chars_per_second=dialogue_chars_per_second(
                 project_duration_policy(project_path, state)
             ),
-            synopsis_mode=project_source_kind(state) == "synopsis",
         )
         if not script_result["valid"]:
             codes = "、".join(item["code"] for item in script_result["errors"])
@@ -2808,13 +3198,11 @@ def command_approve(args: argparse.Namespace) -> int:
             rights_notice = None
         # 时长契约字段非法时拒绝确认；字段缺省表示项目不做时长门禁。
         validate_project_spec_duration(project_path, selected)
-        synopsis_spec_errors = validate_project_spec_synopsis(
-            state,
-            load_project_spec_payload(project_path, selected),
-        )
-        if synopsis_spec_errors:
-            codes = "、".join(dict.fromkeys(item["code"] for item in synopsis_spec_errors))
-            raise ToolError(f"简介模式项目规格门禁未通过：{codes}")
+        # 集数依据门禁：已有原著语料/事件索引时，expected_episodes 必须由事件量支撑，
+        # 禁止仅按上传章节数量推断集数。
+        validate_project_spec_episode_basis(project_path, state, selected)
+        # AI 视频执行层默认两段式：ai_video_phase 枚举非法时拒绝确认。
+        validate_project_spec_ai_video_phase(project_path, selected)
     if selected_type == "series_map":
         series_map_payload = load_json_artifact_payload(
             project_path, args.artifact_key, selected, []
@@ -2827,15 +3215,6 @@ def command_approve(args: argparse.Namespace) -> int:
             raise ToolError(
                 "旧 backbone 地图可读取，但再次确认前必须升级为 contract_version=2"
             )
-        synopsis_map_errors = validate_synopsis_series_map_payload(
-            project_path,
-            state,
-            series_map_payload,
-            project_expected_episodes(project_path, state),
-        )
-        if synopsis_map_errors:
-            codes = "、".join(dict.fromkeys(item["code"] for item in synopsis_map_errors))
-            raise ToolError(f"简介模式全剧地图门禁未通过：{codes}")
     if selected_type == "batch_outline":
         source_errors = scoped_batch_outline_source_errors(
             state, args.artifact_key, selected
@@ -6811,47 +7190,6 @@ def project_source_kind(state: dict[str, Any]) -> str:
     return source_kind if isinstance(source_kind, str) and source_kind in SOURCE_KINDS else DEFAULT_SOURCE_KIND
 
 
-def project_synopsis_policy(
-    project_path: Path, state: dict[str, Any]
-) -> dict[str, Any] | None:
-    """synopsis 项目的有效生成策略；非 synopsis 项目返回 None。"""
-    if project_source_kind(state) != "synopsis":
-        return None
-    payload = confirmed_project_spec_payload(project_path, state)
-    policy = payload.get("synopsis_policy") if isinstance(payload, dict) else None
-    if isinstance(policy, dict):
-        return policy
-    return dict(SYNOPSIS_DEFAULT_POLICY)
-
-
-def project_duration_bounds(
-    project_path: Path, state: dict[str, Any]
-) -> tuple[int, int] | None:
-    """synopsis 模式返回显式时长区间；旧模式返回 None 并沿用现有目标/容差逻辑。"""
-    policy = project_synopsis_policy(project_path, state)
-    if policy is None:
-        return None
-    duration = policy.get("duration_seconds")
-    if not isinstance(duration, dict):
-        return None
-    minimum = duration.get("min")
-    maximum = duration.get("max")
-    if type(minimum) is not int or type(maximum) is not int or minimum < 1 or maximum < minimum:
-        return None
-    return minimum, maximum
-
-
-def project_minimum_shot_units(
-    project_path: Path, state: dict[str, Any]
-) -> int | None:
-    """synopsis 模式返回最低 AI 分镜单元数；旧模式保持建议而非硬门禁。"""
-    policy = project_synopsis_policy(project_path, state)
-    if policy is None:
-        return None
-    value = policy.get("minimum_shot_units")
-    return value if type(value) is int and value >= 1 else None
-
-
 def confirmed_project_spec_payload(
     project_path: Path, state: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -6888,9 +7226,6 @@ def project_target_duration_seconds(
     value = payload.get("target_duration_seconds") if isinstance(payload, dict) else None
     if type(value) is int and value > 0:
         return value
-    bounds = project_duration_bounds(project_path, state)
-    if bounds is not None:
-        return round((bounds[0] + bounds[1]) / 2)
     return DEFAULT_TARGET_DURATION_SECONDS
 
 
@@ -6899,8 +7234,6 @@ def project_duration_source(project_path: Path, state: dict[str, Any]) -> str:
     value = payload.get("target_duration_seconds") if isinstance(payload, dict) else None
     if type(value) is int and value > 0:
         return "explicit_project_spec"
-    if project_synopsis_policy(project_path, state) is not None:
-        return "synopsis_default_60_90_seconds"
     return "default_60_seconds"
 
 
@@ -6921,6 +7254,20 @@ def duration_tolerance_ratio(policy: dict[str, Any]) -> float:
     if not math.isfinite(value) or value < 0 or value > 1:
         return DEFAULT_DURATION_TOLERANCE_RATIO
     return float(value)
+
+
+def project_min_seconds_per_episode(project_path: Path, state: dict[str, Any]) -> int | None:
+    """返回项目规格 duration_policy 的单集最小时长；未声明返回 None。"""
+    policy = project_duration_policy(project_path, state)
+    value = policy.get("min_seconds_per_episode")
+    return value if type(value) is int and value > 0 else None
+
+
+def project_max_seconds_per_episode(project_path: Path, state: dict[str, Any]) -> int | None:
+    """返回项目规格 duration_policy 的单集最大时长；未声明返回 None。"""
+    policy = project_duration_policy(project_path, state)
+    value = policy.get("max_seconds_per_episode")
+    return value if type(value) is int and value > 0 else None
 
 
 def dialogue_chars_per_second(policy: dict[str, Any]) -> tuple[float, float]:
@@ -7051,104 +7398,6 @@ def series_map_payload_warnings(payload: dict[str, Any]) -> list[dict[str, Any]]
             )
         )
     return warnings
-
-
-def validate_synopsis_series_map_payload(
-    project_path: Path,
-    state: dict[str, Any],
-    payload: dict[str, Any] | None,
-    expected_episodes: int | None,
-) -> list[dict[str, Any]]:
-    """synopsis 全剧地图必须为每集绑定简介事实、受控扩写决策和状态变化。"""
-    if project_source_kind(state) != "synopsis":
-        return []
-    if not isinstance(payload, dict):
-        return [issue("synopsis_series_map_required", "synopsis 项目必须登记 JSON 全剧分集地图")]
-    event_index = latest_record(state, "source_event_index")
-    event_payload = (
-        load_json_artifact_payload(project_path, "source_event_index", event_index, [])
-        if isinstance(event_index, dict)
-        else None
-    )
-    profile = (
-        event_payload.get("synopsis_profile")
-        if isinstance(event_payload, dict)
-        else None
-    )
-    facts = profile.get("facts") if isinstance(profile, dict) else None
-    valid_fact_ids = {
-        item.get("fact_id")
-        for item in facts
-        if isinstance(item, dict) and isinstance(item.get("fact_id"), str)
-    } if isinstance(facts, list) else set()
-    ledger = latest_record(state, "adaptation_decision_ledger")
-    ledger_payload = (
-        load_json_artifact_payload(project_path, "adaptation_decision_ledger", ledger, [])
-        if isinstance(ledger, dict)
-        else None
-    )
-    decisions = ledger_payload.get("decisions") if isinstance(ledger_payload, dict) else None
-    decision_by_id = {
-        item.get("decision_id"): item
-        for item in decisions
-        if isinstance(item, dict) and isinstance(item.get("decision_id"), str)
-    } if isinstance(decisions, list) else {}
-    errors: list[dict[str, Any]] = []
-    episodes = payload.get("episodes")
-    if not isinstance(episodes, list):
-        return errors + [issue("synopsis_series_map_episodes_invalid", "全剧分集地图 episodes 必须是数组")]
-    expected_ids = {
-        f"E{number:03d}" for number in range(1, expected_episodes + 1)
-    } if isinstance(expected_episodes, int) and expected_episodes > 0 else set()
-    for index, episode in enumerate(episodes, 1):
-        if not isinstance(episode, dict):
-            errors.append(issue("synopsis_series_map_episode_invalid", "全剧分集地图条目必须是对象", episode_index=index))
-            continue
-        episode_id = episode.get("episode_id")
-        if expected_ids and not isinstance(episode_id, str):
-            errors.append(issue("synopsis_series_map_episode_id_missing", "全剧分集地图条目缺少 episode_id", episode_index=index))
-        fact_refs = episode.get("fact_refs")
-        if not isinstance(fact_refs, list) or not fact_refs or not all(
-            isinstance(value, str) and value.strip() for value in fact_refs
-        ):
-            errors.append(issue("synopsis_series_map_fact_refs_missing", "synopsis 每集地图必须绑定非空 fact_refs", episode_index=index, episode_id=episode_id))
-        else:
-            unknown = sorted(set(fact_refs) - valid_fact_ids)
-            if unknown:
-                errors.append(issue("synopsis_series_map_fact_unknown", "全剧分集地图引用了未知简介事实", episode_index=index, episode_id=episode_id, unknown=unknown))
-        expansion_ids = episode.get("expansion_ids")
-        if not isinstance(expansion_ids, list) or not expansion_ids or not all(
-            isinstance(value, str) and value.strip() for value in expansion_ids
-        ):
-            errors.append(issue("synopsis_series_map_expansion_ids_invalid", "synopsis 每集地图 expansion_ids 必须是非空字符串数组", episode_index=index, episode_id=episode_id))
-        decision_ids = episode.get("decision_ids")
-        if not isinstance(decision_ids, list) or not decision_ids or not all(
-            isinstance(value, str) and value.strip() for value in decision_ids
-        ):
-            errors.append(issue("synopsis_series_map_decisions_missing", "synopsis 每集地图必须绑定非空 decision_ids", episode_index=index, episode_id=episode_id))
-        else:
-            for decision_id in decision_ids:
-                decision = decision_by_id.get(decision_id)
-                if not isinstance(decision, dict):
-                    errors.append(issue("synopsis_series_map_decision_unknown", "全剧分集地图引用了未知改编决策", episode_index=index, episode_id=episode_id, decision_id=decision_id))
-                    continue
-                if decision.get("operation") == "bridge_addition":
-                    expansion_id = decision.get("expansion_id")
-                    if not isinstance(expansion_id, str) or expansion_id not in (expansion_ids or []):
-                        errors.append(issue("synopsis_series_map_expansion_missing", "桥接新增决策必须在同集 expansion_ids 中登记", episode_index=index, episode_id=episode_id, decision_id=decision_id, expansion_id=expansion_id))
-                target_ids = decision.get("target_episode_ids")
-                if (
-                    decision.get("operation") == "bridge_addition"
-                    and (
-                        not isinstance(target_ids, list)
-                        or episode_id not in target_ids
-                    )
-                ):
-                    errors.append(issue("synopsis_series_map_decision_scope_invalid", "桥接新增决策必须覆盖其绑定的集号", episode_index=index, episode_id=episode_id, decision_id=decision_id))
-        for field in ("state_change", "end_hook"):
-            if not isinstance(episode.get(field), str) or not episode[field].strip():
-                errors.append(issue("synopsis_series_map_field_missing", f"synopsis 每集地图缺少 {field}", episode_index=index, episode_id=episode_id, field=field))
-    return errors
 
 
 def dependency_record_of_type(
@@ -8874,16 +9123,6 @@ def validate_ai_shot_plan_payload(
     if not isinstance(units, list) or not units:
         errors.append(issue("shotplan_units_invalid", "units 必须是非空数组"))
         return errors
-    minimum_units = project_minimum_shot_units(project_path, state)
-    if minimum_units is not None and len(units) < minimum_units:
-        errors.append(
-            issue(
-                "shotplan_minimum_units_not_met",
-                f"synopsis 项目单集 AI 分镜单元数不得低于 {minimum_units}",
-                minimum=minimum_units,
-                actual=len(units),
-            )
-        )
 
     story_facts = dependency_payload_of_type(project_path, state, record, "story_facts")
     errors.extend(validate_shot_plan_source_contract(event_index, story_facts, payload, str(episode_id or scope)))
@@ -9109,7 +9348,6 @@ def validate_ai_shot_plan_payload(
     spec_duration = project_target_duration_seconds(project_path, state)
     policy = project_duration_policy(project_path, state)
     tolerance = duration_tolerance_ratio(policy)
-    duration_bounds = project_duration_bounds(project_path, state)
     target_duration = payload.get("target_duration_seconds")
     if target_duration is None and spec_duration is not None:
         # v0.8.1 及以前省略该字段即可整段跳过时长校验；项目已声明目标时长时必须声明。
@@ -9129,29 +9367,36 @@ def validate_ai_shot_plan_payload(
                     project_spec=spec_duration,
                     plan=target_duration,
                 ))
-            if duration_bounds is None:
-                deviation = abs(total_unit_duration - target_duration) / target_duration
-                if deviation > tolerance and (
-                    not isinstance(payload.get("duration_deviation_note"), str)
-                    or not payload["duration_deviation_note"].strip()
-                ):
-                    errors.append(issue(
-                        "shotplan_duration_deviation",
-                        f"单元合计时长偏离单集目标超过{round(tolerance * 100)}%，须提供 duration_deviation_note 或返修",
-                        total=round(total_unit_duration, 1),
-                        target=target_duration,
-                        tolerance_ratio=tolerance,
-                    ))
-            elif total_unit_duration < duration_bounds[0] or total_unit_duration > duration_bounds[1]:
-                errors.append(
-                    issue(
-                        "shotplan_duration_out_of_bounds",
-                        f"synopsis 单集总时长必须在 {duration_bounds[0]}—{duration_bounds[1]} 秒之间",
-                        total=round(total_unit_duration, 1),
-                        minimum=duration_bounds[0],
-                        maximum=duration_bounds[1],
-                    )
-                )
+            deviation = abs(total_unit_duration - target_duration) / target_duration
+            if deviation > tolerance and (
+                not isinstance(payload.get("duration_deviation_note"), str)
+                or not payload["duration_deviation_note"].strip()
+            ):
+                errors.append(issue(
+                    "shotplan_duration_deviation",
+                    f"单元合计时长偏离单集目标超过{round(tolerance * 100)}%，须提供 duration_deviation_note 或返修",
+                    total=round(total_unit_duration, 1),
+                    target=target_duration,
+                    tolerance_ratio=tolerance,
+                ))
+
+    
+    min_seconds = project_min_seconds_per_episode(project_path, state)
+    max_seconds = project_max_seconds_per_episode(project_path, state)
+    if min_seconds is not None and total_unit_duration < min_seconds:
+        errors.append(issue(
+            "shotplan_duration_below_min",
+            f"单元合计时长 {round(total_unit_duration, 1)}s 低于单集最小时长 {min_seconds}s",
+            total=round(total_unit_duration, 1),
+            min_seconds=min_seconds,
+        ))
+    if max_seconds is not None and total_unit_duration > max_seconds:
+        errors.append(issue(
+            "shotplan_duration_above_max",
+            f"单元合计时长 {round(total_unit_duration, 1)}s 超过单集最大时长 {max_seconds}s",
+            total=round(total_unit_duration, 1),
+            max_seconds=max_seconds,
+        ))
 
     max_scenes = budget.get("max_scene_anchors")
     if type(max_scenes) is int and len(used_scene_anchor_keys) > max_scenes and (
@@ -10451,14 +10696,6 @@ def validate_structured_development_artifact(
                     if scope.get("first_beat_id") != allowed_ids[0] or scope.get("last_beat_id") != allowed_ids[-1]:
                         errors.append(issue("event_episode_scope_bounds_mismatch", "episode_scope 首尾 beat 必须与 allowed_beat_ids 首尾一致", episode_id=episode_id))
 
-        if project_source_kind(state) == "synopsis":
-            errors.extend(
-                synopsis_contracts.validate_synopsis_event_index(
-                    payload,
-                    project_expected_episodes(project_path, state),
-                )
-            )
-
     elif artifact_kind == "change_authorization":
         authorizations = payload.get("authorizations")
         if not isinstance(authorizations, list) or not authorizations:
@@ -10625,19 +10862,6 @@ def validate_structured_development_artifact(
                     errors.append(issue("adaptation_confirmation_class_mismatch", "获批的故事事实变更必须明确标记 user_confirmation_required、story_fact_change 和 source_fact_change: true", decision_index=index))
             elif decision_status != "accepted":
                 errors.append(issue("adaptation_decision_unconfirmed", "自动允许的改编表达必须标记 accepted", decision_index=index))
-
-        if project_source_kind(state) == "synopsis":
-            profile_payload = (
-                event_index.get("synopsis_profile")
-                if isinstance(event_index, dict)
-                else None
-            )
-            errors.extend(
-                synopsis_contracts.validate_synopsis_expansion(
-                    payload,
-                    profile_payload,
-                )
-            )
 
     elif artifact_kind == "seedance_execution_plan":
         errors.extend(
@@ -11209,18 +11433,6 @@ def validate_state(
                 "expected_episodes_hint 必须是大于0的整数或 null",
             )
         )
-    if (
-        project_source_kind(state) == "synopsis"
-        and state_expected_episodes_hint(state) is None
-        and project_expected_episodes(project_path, state) is None
-    ):
-        errors.append(
-            issue(
-                "synopsis_expected_episodes_missing",
-                "synopsis 项目必须通过 init 或已确认 project_spec 提供目标集数",
-            )
-        )
-
     batches = state.get("batches", {})
     if not isinstance(batches, dict):
         errors.append(issue("batches_invalid", "batches 必须是对象"))
@@ -11401,18 +11613,6 @@ def validate_state(
                 )
             )
             warnings.extend(series_map_payload_warnings(payload))
-            errors.extend(
-                validate_synopsis_series_map_payload(
-                    project_path,
-                    state,
-                    payload,
-                    project_expected_episodes(project_path, state),
-                )
-            )
-
-    for key, record in latest_records_of_type(state, "project_spec"):
-        payload = load_project_spec_payload(project_path, record)
-        errors.extend(validate_project_spec_synopsis(state, payload))
 
     for key, record in latest_records_of_type(state, "batch_outline"):
         if record.get("status") not in {"awaiting_approval", "confirmed"}:
@@ -11434,7 +11634,6 @@ def validate_state(
             script_path,
             target_duration_seconds=handoff_target_duration,
             chars_per_second=handoff_chars_per_second,
-            synopsis_mode=project_source_kind(state) == "synopsis",
         )
         warnings.extend(
             {
@@ -11498,13 +11697,6 @@ def validate_state(
         "tolerance_ratio": duration_tolerance_ratio(project_duration_policy(project_path, state)),
         "recommended_shot_units": DEFAULT_RECOMMENDED_SHOT_UNITS,
     }
-    if project_source_kind(state) == "synopsis":
-        generation_policy.update(
-            {
-                "synopsis_duration_bounds": project_duration_bounds(project_path, state),
-                "synopsis_minimum_shot_units": project_minimum_shot_units(project_path, state),
-            }
-        )
     result = {
         "valid": not errors,
         "project": str(project_path),
@@ -11528,59 +11720,6 @@ def command_validate_project(args: argparse.Namespace) -> int:
     result = validate_state(project_path)
     print_json(result)
     return 0 if result["valid"] else 1
-
-
-def command_validate_synopsis(args: argparse.Namespace) -> int:
-    project_path, state = load_state(args.project)
-    if project_source_kind(state) != "synopsis":
-        raise ToolError("validate-synopsis 只适用于 source_kind=synopsis 的项目")
-    expected_episodes = (
-        project_expected_episodes(project_path, state)
-        or state_expected_episodes_hint(state)
-    )
-    record = latest_record(state, "source_event_index")
-    errors: list[dict[str, Any]] = []
-    payload = (
-        load_json_artifact_payload(project_path, "source_event_index", record, errors)
-        if isinstance(record, dict)
-        else None
-    )
-    if payload is None:
-        errors.append(issue("synopsis_event_index_missing", "尚无可用 source_event_index"))
-        feasibility = {"requested_episodes": expected_episodes, "verdict": "insufficient", "blocking_reasons": ["缺少简介事实索引"]}
-    else:
-        feasibility = synopsis_contracts.evaluate_synopsis_feasibility(
-            payload,
-            expected_episodes,
-        )
-        errors.extend(feasibility["errors"])
-        if feasibility.get("verdict") != "sufficient":
-            errors.append(
-                issue(
-                    "synopsis_feasibility_blocked",
-                    "简介不足以支撑目标集数；请补充简介、明确用户授权或减少集数",
-                    verdict=feasibility.get("verdict"),
-                )
-            )
-    result = {
-        "ok": not errors,
-        "project": str(project_path),
-        "source_kind": "synopsis",
-        "expected_episodes": expected_episodes,
-        "synopsis_policy": project_synopsis_policy(project_path, state),
-        "duration_bounds": project_duration_bounds(project_path, state),
-        "minimum_shot_units": project_minimum_shot_units(project_path, state),
-        "feasibility": feasibility,
-        "errors": errors,
-        "summary": {
-            "error_count": len(errors),
-            "warning_count": len(feasibility.get("warnings", []))
-            if isinstance(feasibility, dict)
-            else 0,
-        },
-    }
-    print_json(result)
-    return 0 if result["ok"] else 1
 
 
 def latest_records_of_type(
@@ -13182,7 +13321,6 @@ def validate_script_file(
     fragment: bool = False,
     target_duration_seconds: int | None = None,
     chars_per_second: tuple[float, float] | None = None,
-    synopsis_mode: bool = False,
 ) -> dict[str, Any]:
     """校验单集文学剧本结构。
 
@@ -13562,22 +13700,6 @@ def validate_script_file(
     if len(scenes) == 1:
         warnings.append(issue("single_scene", "本集只有一场，请人工确认节奏与内容量"))
 
-    synopsis_expression_warning_count = 0
-    if synopsis_mode:
-        for expression in synopsis_contracts.synopsis_expression_issues(text):
-            synopsis_expression_warning_count += 1
-            warnings.append(
-                issue(
-                    "synopsis_expression_quality",
-                    expression.get("message", "检测到疑似通用 AI 表达，请人工复核"),
-                    **{
-                        key: value
-                        for key, value in expression.items()
-                        if key not in {"code", "message"}
-                    },
-                )
-            )
-
     # 时长预算：只在项目规格声明了单集目标时长时推算，且一律只预警不阻断。
     # 字数推算不能冒充配音实读结果，故只报“最快语速下已超时”这一无歧义方向；
     # 偏短需要动作与转场余量才能判断，项目未给出该参数，只输出数据交人工判断。
@@ -13648,7 +13770,6 @@ def validate_script_file(
             "scene_end_state_count": scene_end_state_count,
             "unused_prop_count": unused_prop_count,
             "long_dialogue_run_count": long_dialogue_run_count,
-            "synopsis_expression_warning_count": synopsis_expression_warning_count,
         },
         "scenes": [
             {
@@ -14611,7 +14732,6 @@ def command_validate_script(args: argparse.Namespace) -> int:
         script_path,
         fragment=args.fragment,
         target_duration_seconds=target_duration,
-        synopsis_mode=bool(getattr(args, "synopsis", False)),
     )
     print_json(result)
     return 0 if result["valid"] else 1
@@ -14873,11 +14993,81 @@ def command_validate_ai_shot_plans(args: argparse.Namespace) -> int:
     return 0 if result["compatible"] else 1
 
 
+def command_validate_ai_shot_plan(args: argparse.Namespace) -> int:
+    """校验单个 AI 分镜计划文件，无需在项目状态中注册。"""
+    project_path = Path(args.project).expanduser().resolve()
+    payload_path = Path(args.file).expanduser()
+    if not payload_path.is_file():
+        print_json({"ok": False, "error": f"文件不存在：{payload_path}"})
+        return 2
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print_json({"ok": False, "error": f"无法读取或解析 JSON：{exc}"})
+        return 2
+    if not isinstance(payload, dict):
+        print_json({"ok": False, "error": "文件内容必须是 JSON 对象"})
+        return 2
+    try:
+        _, state = load_state(project_path)
+    except ToolError as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 2
+    episode_id = payload.get("episode_id", "")
+    artifact_key = f"ai_shot_plan:{episode_id}"
+    record = {
+        "version": 0,
+        "path": str(payload_path),
+        "status": "draft",
+        "depends_on": [
+            {
+                "artifact_key": entry.get("artifact_key"),
+                "version": entry.get("version"),
+            }
+            for entry in payload.get("generated_from", [])
+            if isinstance(entry, dict)
+            and isinstance(entry.get("artifact_key"), str)
+            and type(entry.get("version")) is int
+        ],
+    }
+    errors = validate_ai_shot_plan_payload(project_path, state, artifact_key, record, payload)
+    if errors:
+        print_json({"ok": False, "file": str(payload_path), "errors": errors})
+        return 1
+    print_json({"ok": True, "file": str(payload_path), "errors": []})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="管理小说改编漫剧的本地项目状态与制品"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    estimate_parser = subparsers.add_parser(
+        "estimate-episodes",
+        help="按原著事件量估算建议集数区间（章节数量不参与集数判定）",
+    )
+    estimate_parser.add_argument("project", help="项目目录")
+    estimate_parser.add_argument(
+        "--units-per-episode-min",
+        type=int,
+        default=None,
+        help="每集戏剧单元数下限（默认 4，可由项目规格 episode_count_policy 覆盖）",
+    )
+    estimate_parser.add_argument(
+        "--units-per-episode-max",
+        type=int,
+        default=None,
+        help="每集戏剧单元数上限（默认 8，可由项目规格 episode_count_policy 覆盖）",
+    )
+    estimate_parser.add_argument(
+        "--register",
+        action="store_true",
+        help="把估算写入 01_原著解析/episode_count_estimate.json 并登记制品",
+    )
+    estimate_parser.add_argument("--note", default="", help="登记说明")
+    estimate_parser.set_defaults(handler=command_estimate_episodes)
 
     init_parser = subparsers.add_parser("init", help="初始化项目并安全复制原始内容")
     init_parser.add_argument("project", help="项目目录")
@@ -14890,7 +15080,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help=(
             "目标集数提示，记入 expected_episodes_hint，供 project_spec 确认前定义批次使用；"
-            "不用于检查上传文件完整度，交付门禁仍以已确认 project_spec 为权威"
+            "禁止按上传章节数量推断集数，权威值以事件量估算后的已确认 project_spec 为准"
         ),
     )
     init_parser.add_argument(
@@ -14969,6 +15159,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="上游制品，可重复传入；省略版本时使用最新版",
     )
     register_parser.add_argument("--note", help="备注")
+    register_parser.add_argument(
+        "--validate",
+        choices=("ai_shot_plan",),
+        help="注册前执行校验（当前仅支持 ai_shot_plan）",
+    )
     register_parser.set_defaults(handler=command_register_artifact)
 
     approve_parser = subparsers.add_parser("approve", help="人工确认制品的最新版本")
@@ -15250,12 +15445,6 @@ def build_parser() -> argparse.ArgumentParser:
     validate_project_parser.add_argument("project", help="项目目录")
     validate_project_parser.set_defaults(handler=command_validate_project)
 
-    validate_synopsis_parser = subparsers.add_parser(
-        "validate-synopsis", help="校验简介事实索引、动态可行性、受控扩写与表达质量"
-    )
-    validate_synopsis_parser.add_argument("project", help="项目目录")
-    validate_synopsis_parser.set_defaults(handler=command_validate_synopsis)
-
     validate_handoff_parser = subparsers.add_parser(
         "validate-handoff", help="校验制作就绪剧本包的制品、状态与剧集覆盖"
     )
@@ -15324,11 +15513,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="单集目标时长（秒）；提供后按字数推算净对白秒数并给出预警，省略则不做时长推算",
     )
-    validate_script_parser.add_argument(
-        "--synopsis",
-        action="store_true",
-        help="按简介模式附加降AI表达质量检查",
-    )
     validate_script_parser.set_defaults(handler=command_validate_script)
 
     validate_seedance_parser = subparsers.add_parser(
@@ -15356,6 +15540,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="预期总集数；要求 E001...EN 均有当前确认 AI 分镜计划",
     )
     validate_ai_shot_plans_parser.set_defaults(handler=command_validate_ai_shot_plans)
+    validate_ai_shot_plan_parser = subparsers.add_parser(
+        "validate-ai-shot-plan",
+        help="校验单个AI分镜计划JSON文件，无需注册（快速自检入口）",
+    )
+    validate_ai_shot_plan_parser.add_argument("project", help="项目目录")
+    validate_ai_shot_plan_parser.add_argument("file", help="AI分镜计划JSON文件路径")
+    validate_ai_shot_plan_parser.set_defaults(handler=command_validate_ai_shot_plan)
 
     approve_many_parser = subparsers.add_parser(
         "approve-artifacts",

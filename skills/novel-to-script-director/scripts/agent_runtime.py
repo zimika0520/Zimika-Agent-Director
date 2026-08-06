@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - Windows fallback
 
 SCHEMA_VERSION = 1
 RUNTIME_VERSION = "2"
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.2"
 RULE_VERSION = "production-control-v1"
 EXECUTION_CONTROL_SCHEMA_VERSION = 1
 DEFAULT_MAX_PARALLEL_TASKS = 2
@@ -43,7 +43,6 @@ SUPPORTED_ACCEPTANCE_COMMANDS = {
     "none",
     "schema-only",
     "validate-script",
-    "validate-synopsis",
 }
 SUPPORTED_SCHEDULING_MODES = {"serial", "independent"}
 SUPPORTED_EXECUTION_MODES = {"production", "development"}
@@ -90,10 +89,6 @@ INDEPENDENT_TASK_TYPES = {
     "storyboard_render",
 }
 SERIAL_TASK_TYPES = {
-    "synopsis_fact_extraction",
-    "synopsis_feasibility",
-    "synopsis_map",
-    "synopsis_expression_review",
     "episode_script",
     "episode_boundary_review",
     "global_id_normalization",

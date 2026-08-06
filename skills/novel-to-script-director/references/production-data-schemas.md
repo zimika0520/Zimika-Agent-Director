@@ -90,8 +90,6 @@
 
 `status` 只能为 `ready`、`excluded` 或 `failed`。`excluded` 必须提供 `exclusion_reason`，`failed` 必须提供 `error_reason`；存在 `failed` 时不能确认。`source_unit_id` 与 `event_id` 各自唯一。
 
-`synopsis` 项目在事件索引顶层增加 `source_mode: "synopsis"`、`synopsis_profile` 和 `synopsis_feasibility`。`synopsis_profile.facts[]` 每项必须包含 `fact_id`、`fact_type`、`fact_text`、非空 `source_refs` 和 `protection`；`synopsis_profile.analysis` 至少包含 `conflict_nodes`、`relationship_turns`、`hook_candidates` 与 `supporting_expansion_axes`。`synopsis_feasibility.verdict` 只能为 `sufficient / needs_user_input / insufficient`；`sufficient` 必须提供覆盖全部 `E001...EN` 的 `episode_slots`，每槽包含 `episode_id`、`change_id`、`story_function`、`state_change` 与 `hook`。
-
 ## 改编变更授权记录
 
 只有需要用户确认的主要新增或故事事实改动才创建：
@@ -259,8 +257,6 @@
 固定全剧项目的`expected_episodes`必须是大于0的整数。`rolling_batch` schema v2使用`final_expected_episodes`，允许为`null`；批次范围以用户显式确认的`project_state.batches`为权威。
 
 `target_duration_seconds` 是可选的单集目标时长覆盖值，必须是大于 0 的整数秒。未声明时旧模式使用默认 60 秒；声明后以项目值为权威。AI 分镜计划必须写出当前生效值，剧本校验也据此给出对白秒数预警。默认建议约 15 个分镜单元，该数量仅用于规划提示，不作为机械阻断门禁。
-
-`synopsis` 项目可使用 `synopsis_policy` 覆盖默认值：`duration_seconds: {min: 60, max: 90}`、`minimum_shot_units: 21`、`composition_policy: "unrestricted"`。该策略只作用于 synopsis 项目；`validate-script` 附加降 AI 感警告，`ai_shot_plan` 对总时长区间和最低单元数执行机械门禁。
 
 `duration_policy` 可选，用于覆盖推算参数，缺省值见下；非法值会被拒绝确认。
 

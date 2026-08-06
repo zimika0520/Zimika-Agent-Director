@@ -453,6 +453,8 @@ class ProjectToolTests(unittest.TestCase):
             "expected_episodes": expected_episodes,
             "target_runtime": "按项目实读复核",
             "handoff_target": "可直接进入导演拆镜",
+            # 该 helper 被 AI 视频执行层测试复用，显式允许执行层自动生成。
+            "ai_video_phase": "auto",
         }
         self.register_and_approve(
             "project_spec",
@@ -4563,6 +4565,473 @@ class ProjectToolTests(unittest.TestCase):
                 self.assertIn("时长契约非法", payload["error"])
                 self.assertIn(expected, payload["error"])
 
+    def register_spec_with_episode_count(self, expected_episodes: int, basis, file_tag: str) -> int:
+        spec: dict = {
+            "schema_version": 1,
+            "project_id": self.state()["project_id"],
+            "expected_episodes": expected_episodes,
+        }
+        if basis is not None:
+            spec["episode_count_basis"] = basis
+        return self.register_artifact(
+            "project_spec",
+            f"01_原著解析/项目规格_{file_tag}.json",
+            json.dumps(spec, ensure_ascii=False),
+        )
+
+    def register_and_approve_content_index(self, spec_version: int = 1, expected_episodes: int = 1) -> None:
+        """登记并确认原著语料与事件索引（依赖已确认项目规格）。"""
+        project_id = self.state()["project_id"]
+        normalized_source = self.write_project_file(
+            "01_原著解析/标准化正文_第001章.txt",
+            "测验员公布萧炎斗之力三段。\n萧薰儿测出九段。\n萧炎离开测验广场。\n",
+        )
+        source_corpus = {
+            "schema_version": 1,
+            "project_id": project_id,
+            "generated_from": [{"artifact_key": "project_spec", "version": spec_version}],
+            "source_units": [
+                {
+                    "source_unit_id": "SRC-CH001",
+                    "source_id": self.state()["sources"][0]["source_id"],
+                    "source_locator": "第1章",
+                    "ordinal": 1,
+                    "content_path": normalized_source.relative_to(self.project).as_posix(),
+                    "content_sha256": project_tool.sha256_file(normalized_source),
+                }
+            ],
+        }
+        self.register_and_approve(
+            "source_corpus",
+            "01_原著解析/原著语料V1.json",
+            json.dumps(source_corpus, ensure_ascii=False),
+            (f"project_spec@{spec_version}",),
+        )
+        source_event_index = {
+            "schema_version": 2,
+            "content_contract_version": 1,
+            "project_id": project_id,
+            "generated_from": [{"artifact_key": "source_corpus", "version": 1}],
+            "entities": [
+                {"entity_id": "C001", "entity_type": "character", "canonical_name": "萧炎", "aliases": []},
+                {"entity_id": "C002", "entity_type": "character", "canonical_name": "测验员", "aliases": []},
+                {"entity_id": "C003", "entity_type": "character", "canonical_name": "萧薰儿", "aliases": []},
+            ],
+            "fact_definitions": [],
+            "temporal_constraints": [],
+            "units": [
+                {
+                    "source_unit_id": "SRC-CH001",
+                    "source_locator": "第1章",
+                    "granularity": "unit_detail",
+                    "status": "ready",
+                    "events": [
+                        {
+                            "event_id": "EV001",
+                            "ordinal": 1,
+                            "summary": "测验广场事件",
+                            "participants": ["C001", "C002", "C003"],
+                            "cause": "年度测验",
+                            "action": "公布成绩",
+                            "outcome": "萧炎离场",
+                            "state_change": "萧炎被孤立",
+                            "source_refs": ["SRC-CH001"],
+                            "beats": [
+                                {
+                                    "beat_id": "B001",
+                                    "ordinal": 1,
+                                    "summary": "公布三段",
+                                    "source_refs": ["SRC-CH001", "第1章"],
+                                    "protected_fact_ids": [],
+                                    "required_fact_ids": [],
+                                    "content_atoms": [
+                                        {
+                                            "atom_id": "SA-B001-001",
+                                            "kind": "action",
+                                            "text": "测验员公布萧炎斗之力三段。",
+                                            "source_unit_id": "SRC-CH001",
+                                            "source_locator": "第1章",
+                                            "source_excerpt": "测验员公布萧炎斗之力三段。",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "beat_id": "B002",
+                                    "ordinal": 2,
+                                    "summary": "萧薰儿九段",
+                                    "source_refs": ["SRC-CH001", "第1章"],
+                                    "protected_fact_ids": [],
+                                    "required_fact_ids": [],
+                                    "content_atoms": [
+                                        {
+                                            "atom_id": "SA-B002-001",
+                                            "kind": "action",
+                                            "text": "萧薰儿测出九段。",
+                                            "source_unit_id": "SRC-CH001",
+                                            "source_locator": "第1章",
+                                            "source_excerpt": "萧薰儿测出九段。",
+                                        }
+                                    ],
+                                },
+                                {
+                                    "beat_id": "B003",
+                                    "ordinal": 3,
+                                    "summary": "萧炎离开",
+                                    "source_refs": ["SRC-CH001", "第1章"],
+                                    "protected_fact_ids": [],
+                                    "required_fact_ids": [],
+                                    "content_atoms": [
+                                        {
+                                            "atom_id": "SA-B003-001",
+                                            "kind": "action",
+                                            "text": "萧炎离开测验广场。",
+                                            "source_unit_id": "SRC-CH001",
+                                            "source_locator": "第1章",
+                                            "source_excerpt": "萧炎离开测验广场。",
+                                        }
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "episode_scopes": {
+                f"E{number:03d}": {
+                    "allowed_beat_ids": ["B001", "B002", "B003"],
+                    "first_beat_id": "B001",
+                    "last_beat_id": "B003",
+                }
+                for number in range(1, expected_episodes + 1)
+            },
+            "upgrade_pending": [],
+        }
+        self.register_and_approve(
+            "source_event_index",
+            "01_原著解析/事件索引V1.json",
+            json.dumps(source_event_index, ensure_ascii=False),
+            ("source_corpus@1",),
+        )
+
+    def test_estimate_episodes_requires_event_index(self) -> None:
+        self.init_project()
+        code, payload = self.run_cli(
+            "estimate-episodes", str(self.project)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("尚未建立可统计的原著事件索引", payload["error"])
+
+    def test_estimate_episodes_counts_beats_and_returns_range(self) -> None:
+        self.init_project()
+        basis = {
+            "total_events": 1,
+            "total_beats": 3,
+            "counted_units": "beats",
+            "primary_count": 3,
+            "units_per_episode": {"min": 4, "max": 8},
+            "estimated_min_episodes": 1,
+            "estimated_max_episodes": 1,
+            "selected_episodes": 1,
+            "user_override": False,
+        }
+        spec_version = self.register_spec_with_episode_count(1, basis, "估算前")
+        self.approve_artifact("project_spec", spec_version)
+        self.register_and_approve_content_index(spec_version, expected_episodes=1)
+        code, payload = self.run_cli(
+            "estimate-episodes", str(self.project)
+        )
+        self.assertEqual(code, 0, payload)
+        estimate = payload["estimate"]
+        self.assertEqual(estimate["total_events"], 1)
+        self.assertEqual(estimate["total_beats"], 3)
+        self.assertEqual(estimate["counted_units"], "beats")
+        self.assertEqual(estimate["primary_count"], 3)
+        # 3 个戏剧单元，每集 4-8 个 → 建议 1 集；章节数量不参与判定
+        self.assertEqual(estimate["estimated_min_episodes"], 1)
+        self.assertEqual(estimate["estimated_max_episodes"], 1)
+        self.assertEqual(estimate["recommended_episodes"], 1)
+        self.assertNotIn("registered", estimate)
+
+    def test_estimate_episodes_register_artifact(self) -> None:
+        self.init_project()
+        basis = {
+            "total_events": 1,
+            "total_beats": 3,
+            "counted_units": "beats",
+            "primary_count": 3,
+            "units_per_episode": {"min": 4, "max": 8},
+            "estimated_min_episodes": 1,
+            "estimated_max_episodes": 1,
+            "selected_episodes": 1,
+            "user_override": False,
+        }
+        spec_version = self.register_spec_with_episode_count(1, basis, "登记前")
+        self.approve_artifact("project_spec", spec_version)
+        self.register_and_approve_content_index(spec_version, expected_episodes=1)
+        code, payload = self.run_cli(
+            "estimate-episodes", str(self.project), "--register"
+        )
+        self.assertEqual(code, 0, payload)
+        estimate = payload["estimate"]
+        self.assertTrue(estimate["registered"])
+        records = self.state()["artifacts"]["episode_count_estimate"]
+        self.assertEqual(records[-1]["status"], "awaiting_approval")
+        self.assertTrue(
+            (self.project / records[-1]["path"]).is_file()
+        )
+
+    def test_project_spec_approve_without_content_allows_legacy_flow(self) -> None:
+        """尚未有原著语料/事件索引时，旧流程允许先确认规格（不阻塞）。"""
+        self.init_project()
+        version = self.register_spec_with_episode_count(2, None, "无内容")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(version)
+        )
+        self.assertEqual(code, 0, payload)
+
+    def test_project_spec_approve_requires_episode_count_basis_when_content_exists(self) -> None:
+        """已有原著事件索引却无事件量依据时，禁止按章节数确认集数。"""
+        self.init_project()
+        first = self.register_spec_with_episode_count(2, None, "初版")
+        self.approve_artifact("project_spec", first)
+        self.register_and_approve_content_index(first, expected_episodes=1)
+        second = self.register_spec_with_episode_count(2, None, "缺依据")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(second)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("episode_count_basis", payload["error"])
+        self.assertIn("事件量", payload["error"])
+
+    def test_project_spec_approve_accepts_basis_within_estimate(self) -> None:
+        self.init_project()
+        basis = {
+            "total_events": 1,
+            "total_beats": 3,
+            "counted_units": "beats",
+            "primary_count": 3,
+            "units_per_episode": {"min": 4, "max": 8},
+            "estimated_min_episodes": 1,
+            "estimated_max_episodes": 1,
+            "selected_episodes": 1,
+            "user_override": False,
+            "note": "按事件量估算",
+        }
+        first = self.register_spec_with_episode_count(1, basis, "初版")
+        self.approve_artifact("project_spec", first)
+        self.register_and_approve_content_index(first, expected_episodes=1)
+        second = self.register_spec_with_episode_count(1, basis, "有依据")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(second)
+        )
+        self.assertEqual(code, 0, payload)
+
+    def test_project_spec_approve_rejects_episode_count_outside_estimate(self) -> None:
+        self.init_project()
+        basis = {
+            "total_events": 1,
+            "total_beats": 3,
+            "counted_units": "beats",
+            "primary_count": 3,
+            "units_per_episode": {"min": 4, "max": 8},
+            "estimated_min_episodes": 1,
+            "estimated_max_episodes": 1,
+            "selected_episodes": 2,
+            "user_override": False,
+        }
+        first = self.register_spec_with_episode_count(1, basis, "初版")
+        self.approve_artifact("project_spec", first)
+        self.register_and_approve_content_index(first, expected_episodes=1)
+        second = self.register_spec_with_episode_count(2, basis, "超区间")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(second)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("超出事件量估算区间", payload["error"])
+
+    def test_project_spec_approve_accepts_user_override_with_confirmation(self) -> None:
+        self.init_project()
+        basis = {
+            "total_events": 1,
+            "total_beats": 3,
+            "counted_units": "beats",
+            "primary_count": 3,
+            "units_per_episode": {"min": 4, "max": 8},
+            "estimated_min_episodes": 1,
+            "estimated_max_episodes": 1,
+            "selected_episodes": 3,
+            "user_override": True,
+            "user_confirmation": "用户明确要求压缩为3集",
+        }
+        first = self.register_spec_with_episode_count(1, basis, "初版")
+        self.approve_artifact("project_spec", first)
+        self.register_and_approve_content_index(first, expected_episodes=1)
+        second = self.register_spec_with_episode_count(3, basis, "用户覆盖")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(second)
+        )
+        self.assertEqual(code, 0, payload)
+
+    def register_spec_with_ai_video_phase(self, phase, file_tag: str) -> int:
+        spec: dict = {
+            "schema_version": 1,
+            "project_id": self.state()["project_id"],
+            "expected_episodes": 1,
+        }
+        if phase is not None:
+            spec["ai_video_phase"] = phase
+        return self.register_artifact(
+            "project_spec",
+            f"01_原著解析/项目规格_{file_tag}.json",
+            json.dumps(spec, ensure_ascii=False),
+        )
+
+    def register_model_capability_profile(self, file_tag: str) -> int:
+        profile = {
+            "schema_version": 1,
+            "project_id": self.state()["project_id"],
+            "generated_from": [{"artifact_key": "project_spec", "version": 1}],
+            "model_family": "Seedance 2.0",
+            "provider_model_id": "doubao-seedance-2-0-test",
+            "capability_snapshot": {
+                "status": "user_confirmed",
+                "checked_at": "2026-08-06",
+                "source_urls": ["https://example.invalid/seedance2_0"],
+            },
+            "capabilities": {
+                "task_duration_seconds": {"min": 4, "max": 15},
+                "ratios": ["16:9"],
+                "resolutions": ["1080p"],
+                "generate_audio": True,
+                "lip_sync": True,
+                "max_reference_images": 4,
+                "supports_first_frame": True,
+                "supports_first_last_frame": None,
+                "supports_continuation": True,
+                "max_clear_speakers": 1,
+                "input_modes": ["text_to_video", "first_frame", "continuation"],
+            },
+        }
+        return self.register_artifact(
+            "model_capability_profile:seedance-2-0",
+            f"10_AI视频执行包/模型能力档案_{file_tag}.json",
+            json.dumps(profile, ensure_ascii=False),
+            ("project_spec@1",),
+        )
+
+    def test_project_spec_rejects_invalid_ai_video_phase(self) -> None:
+        self.init_project()
+        version = self.register_spec_with_ai_video_phase("always", "非法")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(version)
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("ai_video_phase 非法", payload["error"])
+
+    def test_project_spec_accepts_valid_ai_video_phase(self) -> None:
+        self.init_project()
+        for phase in ("after_script_storyboard_confirm", "auto"):
+            self.tearDown()
+            self.setUp()
+            self.init_project()
+            version = self.register_spec_with_ai_video_phase(phase, phase)
+            code, payload = self.run_cli(
+                "approve", str(self.project), "project_spec", "--version", str(version)
+            )
+            self.assertEqual(code, 0, payload)
+            self.assertEqual(
+                project_tool.project_ai_video_phase(self.project, self.state()), phase
+            )
+
+    def test_default_ai_video_phase_is_after_script_storyboard_confirm(self) -> None:
+        """未声明 ai_video_phase 时，默认先交付剧本＋故事板，执行层需用户确认。"""
+        self.init_project()
+        version = self.register_spec_with_ai_video_phase(None, "缺省")
+        code, payload = self.run_cli(
+            "approve", str(self.project), "project_spec", "--version", str(version)
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(
+            project_tool.project_ai_video_phase(self.project, self.state()),
+            "after_script_storyboard_confirm",
+        )
+
+    def test_ai_video_execution_plan_requires_continuation_confirmation_by_default(self) -> None:
+        """默认两段式：未取得用户确认时，AI 视频执行层制品不能登记。"""
+        self.init_project()
+        spec_version = self.register_spec_with_ai_video_phase(None, "缺省")
+        self.approve_artifact("project_spec", spec_version)
+        code, payload = self.run_cli(
+            "register-artifact",
+            str(self.project),
+            "model_capability_profile:seedance-2-0",
+            str(
+                self.write_project_file(
+                    "10_AI视频执行包/模型能力档案_缺省.json",
+                    "{}",
+                )
+            ),
+            "--status",
+            "awaiting_approval",
+            "--depends-on",
+            "project_spec@1",
+        )
+        self.assertEqual(code, 2, payload)
+        self.assertIn("ai_video_phase_not_confirmed", payload["error"])
+        self.assertNotIn("model_capability_profile", self.state()["artifacts"])
+
+    def test_ai_video_execution_plan_allowed_with_auto_phase(self) -> None:
+        """显式 ai_video_phase=auto 时，执行层制品可正常登记。"""
+        self.init_project()
+        spec_version = self.register_spec_with_ai_video_phase("auto", "auto")
+        self.approve_artifact("project_spec", spec_version)
+        version = self.register_model_capability_profile("auto")
+        records = self.state()["artifacts"]["model_capability_profile:seedance-2-0"]
+        self.assertEqual(records[-1]["version"], version)
+
+    def test_ai_video_execution_plan_allowed_with_authorization(self) -> None:
+        """默认两段式下，登记并确认 ai_video_continuation_authorization 后允许执行层制品。"""
+        self.init_project()
+        spec_version = self.register_spec_with_ai_video_phase(None, "缺省")
+        self.approve_artifact("project_spec", spec_version)
+        authorization = {
+            "schema_version": 1,
+            "project_id": self.state()["project_id"],
+            "generated_from": [{"artifact_key": "project_spec", "version": spec_version}],
+            "scope": "剧本＋故事板交付后用户确认继续 AI 视频执行层",
+            "user_statement": "用户确认继续执行 AI 视频相关工作",
+            "confirmed_at": "2026-08-06",
+        }
+        self.register_and_approve(
+            "ai_video_continuation_authorization",
+            "09_定稿交付/AI视频继续授权V1.json",
+            json.dumps(authorization, ensure_ascii=False),
+            (f"project_spec@{spec_version}",),
+        )
+        version = self.register_model_capability_profile("授权后")
+        records = self.state()["artifacts"]["model_capability_profile:seedance-2-0"]
+        self.assertEqual(records[-1]["version"], version)
+
+    def test_script_storyboard_artifacts_not_gated_by_default(self) -> None:
+        """剧本＋故事板路径制品（分镜计划、分镜边界、锚点、逐集交付）不受执行层门禁影响。"""
+        self.init_project()
+        spec_version = self.register_spec_with_ai_video_phase(None, "缺省")
+        self.approve_artifact("project_spec", spec_version)
+        for kind in (
+            "ai_shot_plan",
+            "ai_video_boundary_review",
+            "character_anchor",
+            "scene_anchor",
+            "prop_anchor",
+            "style_anchor",
+            "episode_delivery_manifest",
+        ):
+            with self.subTest(kind=kind):
+                # 不应触发执行层确认门禁
+                project_tool.ensure_ai_video_execution_allowed(
+                    self.project, self.state(), kind
+                )
+
     def test_project_spec_without_duration_uses_default_generation_policy(self) -> None:
         """项目规格未声明时长时，统一使用 60 秒默认值。"""
         self.init_project()
@@ -8167,282 +8636,6 @@ class ProjectToolTests(unittest.TestCase):
         self.assertEqual(code, 0, runtime)
         self.assertEqual(runtime["run"]["active_task_ids"], [second_plan["task_id"]])
 
-    def init_synopsis_project(self, episode_count: int) -> None:
-        code, payload = self.run_cli(
-            "init",
-            str(self.project),
-            "--name",
-            "简介项目",
-            "--source",
-            str(self.source),
-            "--source-kind",
-            "synopsis",
-            "--expected-episodes",
-            str(episode_count),
-        )
-        self.assertEqual(code, 0, payload)
-        self.assertEqual(payload["source_policy"]["source_kind"], "synopsis")
-        self.assertEqual(payload["expected_episodes_hint"], episode_count)
-
-    def synopsis_event_index_payload(self, episode_count: int, verdict: str = "sufficient") -> dict:
-        profile = {
-            "facts": [
-                {
-                    "fact_id": "F-CHAR-001",
-                    "fact_type": "character",
-                    "fact_text": "女主为弟弟女扮男装进入寄宿高中",
-                    "source_refs": ["SYNOPSIS"],
-                    "protection": "must_preserve",
-                },
-                {
-                    "fact_id": "F-REL-001",
-                    "fact_type": "relationship",
-                    "fact_text": "女主与校霸从针锋相对转向双向心动",
-                    "source_refs": ["SYNOPSIS"],
-                    "protection": "must_preserve",
-                },
-                {
-                    "fact_id": "F-SET-001",
-                    "fact_type": "setting",
-                    "fact_text": "故事主要发生在寄宿高中",
-                    "source_refs": ["SYNOPSIS"],
-                    "protection": "flexible",
-                },
-                {
-                    "fact_id": "F-EV-001",
-                    "fact_type": "event",
-                    "fact_text": "女主觉醒读心异能，听见校霸内心独白",
-                    "source_refs": ["SYNOPSIS"],
-                    "protection": "must_preserve",
-                },
-            ],
-            "unknowns": [],
-            "analysis": {
-                "conflict_nodes": [
-                    {"id": "CON-001", "label": "身份危机"},
-                    {"id": "CON-002", "label": "校园冲突"},
-                ],
-                "relationship_turns": [
-                    {"id": "REL-001", "label": "识破伪装"},
-                    {"id": "REL-002", "label": "双向心动"},
-                ],
-                "hook_candidates": [
-                    {"id": "HOOK-001", "label": "异能读到秘密"},
-                ],
-                "supporting_expansion_axes": [
-                    {"id": "EXP-001", "label": "校园生活"},
-                ],
-            },
-        }
-        slot_ids = ["CON-001", "CON-002", "REL-001", "REL-002", "HOOK-001", "EXP-001"]
-        slots = [
-            {
-                "episode_id": f"E{number:03d}",
-                "change_id": slot_ids[(number - 1) % len(slot_ids)],
-                "story_function": "推进",
-                "state_change": f"state-{number}",
-                "hook": f"钩子-{number}",
-            }
-            for number in range(1, episode_count + 1)
-        ]
-        return {
-            "source_mode": "synopsis",
-            "synopsis_profile": profile,
-            "synopsis_feasibility": {
-                "requested_episodes": episode_count,
-                "verdict": verdict,
-                "blocking_reasons": (
-                    []
-                    if verdict == "sufficient"
-                    else ["简介冲突节点不足，请补充简介或减少集数"]
-                ),
-                "warnings": [],
-                "episode_slots": slots if verdict == "sufficient" else [],
-            },
-        }
-
-    def test_synopsis_init_requires_expected_episodes(self) -> None:
-        code, payload = self.run_cli(
-            "init",
-            str(self.project),
-            "--source",
-            str(self.source),
-            "--source-kind",
-            "synopsis",
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("必须提供 --expected-episodes", payload["error"])
-        self.assertFalse((self.project / project_tool.STATE_FILENAME).exists())
-
-    def test_synopsis_init_rejects_official_review(self) -> None:
-        code, payload = self.run_cli(
-            "init",
-            str(self.project),
-            "--source",
-            str(self.source),
-            "--source-kind",
-            "synopsis",
-            "--expected-episodes",
-            "20",
-            "--official-review",
-            "--official-url",
-            "https://example.com/novel",
-        )
-        self.assertEqual(code, 2)
-        self.assertIn("只有 published_novel", payload["error"])
-
-    def test_synopsis_init_accepts_20_30_40_and_show_summary(self) -> None:
-        for count in (20, 30, 40):
-            with self.subTest(count=count):
-                project = self.root / f"synopsis-{count}"
-                code, payload = self.run_cli(
-                    "init",
-                    str(project),
-                    "--source",
-                    str(self.source),
-                    "--source-kind",
-                    "synopsis",
-                    "--expected-episodes",
-                    str(count),
-                )
-                self.assertEqual(code, 0, payload)
-                code, summary = self.run_cli("show", str(project), "--summary")
-                self.assertEqual(code, 0, summary)
-                self.assertEqual(summary["source_kind"], "synopsis")
-                self.assertEqual(summary["synopsis"]["requested_episodes"], count)
-                self.assertEqual(summary["synopsis"]["duration_bounds"], [60, 90])
-                self.assertEqual(summary["synopsis"]["minimum_shot_units"], 21)
-
-    def test_validate_synopsis_accepts_sufficient_20_episode_fixture(self) -> None:
-        self.init_synopsis_project(20)
-        payload = self.synopsis_event_index_payload(20)
-        project_id = self.state()["project_id"]
-        project_spec = {
-            "schema_version": 1,
-            "project_id": project_id,
-            "expected_episodes": 20,
-        }
-        self.register_artifact(
-            "project_spec",
-            "01_原著解析/项目规格V1.json",
-            json.dumps(project_spec, ensure_ascii=False),
-        )
-        source_corpus = {
-            "schema_version": 1,
-            "project_id": project_id,
-            "generated_from": [],
-            "source_units": [],
-        }
-        self.register_artifact(
-            "source_corpus",
-            "01_原著解析/语料V1.json",
-            json.dumps(source_corpus, ensure_ascii=False),
-            ("project_spec@1",),
-        )
-        payload["schema_version"] = 2
-        payload["project_id"] = project_id
-        self.register_artifact(
-            "source_event_index",
-            "01_原著解析/简介事件索引V1.json",
-            json.dumps(payload, ensure_ascii=False),
-            ("source_corpus@1",),
-        )
-        code, result = self.run_cli("validate-synopsis", str(self.project))
-        self.assertEqual(code, 0, result)
-        self.assertEqual(result["feasibility"]["verdict"], "sufficient")
-        self.assertEqual(result["minimum_shot_units"], 21)
-        self.assertEqual(result["duration_bounds"], [60, 90])
-
-    def test_validate_synopsis_blocks_insufficient_40_episode_fixture(self) -> None:
-        self.init_synopsis_project(40)
-        payload = self.synopsis_event_index_payload(40, verdict="insufficient")
-        project_id = self.state()["project_id"]
-        project_spec = {
-            "schema_version": 1,
-            "project_id": project_id,
-            "expected_episodes": 40,
-        }
-        self.register_artifact(
-            "project_spec",
-            "01_原著解析/项目规格V1.json",
-            json.dumps(project_spec, ensure_ascii=False),
-        )
-        source_corpus = {
-            "schema_version": 1,
-            "project_id": project_id,
-            "generated_from": [],
-            "source_units": [],
-        }
-        self.register_artifact(
-            "source_corpus",
-            "01_原著解析/语料V1.json",
-            json.dumps(source_corpus, ensure_ascii=False),
-            ("project_spec@1",),
-        )
-        payload["schema_version"] = 2
-        payload["project_id"] = project_id
-        self.register_artifact(
-            "source_event_index",
-            "01_原著解析/简介事件索引V1.json",
-            json.dumps(payload, ensure_ascii=False),
-            ("source_corpus@1",),
-        )
-        code, result = self.run_cli("validate-synopsis", str(self.project))
-        self.assertEqual(code, 1)
-        self.assertEqual(result["feasibility"]["verdict"], "insufficient")
-
-    def test_synopsis_script_expression_check_warns_but_does_not_block(self) -> None:
-        script = self.root / "ai-smell.md"
-        script.write_text(
-            GOOD_SCRIPT.replace(
-                "△阿宁攥着钥匙退到门槛外。",
-                "△她眼底闪过一丝情绪，忍不住勾唇一笑。\n△她眼底闪过一丝情绪，忍不住勾唇一笑。",
-            ),
-            encoding="utf-8",
-        )
-        code, result = self.run_cli(
-            "validate-script",
-            str(script),
-            "--synopsis",
-        )
-        self.assertEqual(code, 0, result)
-        self.assertIn(
-            "synopsis_expression_quality",
-            {item["code"] for item in result["warnings"]},
-        )
-        self.assertGreaterEqual(result["summary"]["synopsis_expression_warning_count"], 3)
-
-    def test_synopsis_project_spec_gate_requires_expected_episodes_and_valid_policy(self) -> None:
-        self.init_synopsis_project(20)
-        project_id = self.state()["project_id"]
-        path = self.write_project_file(
-            "01_原著解析/简介项目规格V1.json",
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "project_id": project_id,
-                    "synopsis_policy": {
-                        "duration_seconds": {"min": 60, "max": 90},
-                        "minimum_shot_units": 21,
-                        "composition_policy": "unrestricted",
-                    },
-                },
-                ensure_ascii=False,
-            ),
-        )
-        code, payload = self.run_cli(
-            "register-artifact",
-            str(self.project),
-            "project_spec",
-            str(path),
-            "--status",
-            "awaiting_approval",
-        )
-        self.assertEqual(code, 0, payload)
-        code, payload = self.run_cli("approve", str(self.project), "project_spec")
-        self.assertEqual(code, 2)
-        self.assertIn("简介模式项目规格门禁未通过", payload["error"])
-        self.assertIn("synopsis_expected_episodes_invalid", payload["error"])
 
 
 if __name__ == "__main__":

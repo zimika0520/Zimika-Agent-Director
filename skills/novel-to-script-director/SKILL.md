@@ -11,28 +11,27 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 项目规格必须锁定 `delivery_target`，它决定交付范围与默认纪律：
 
-- `ai_video`（默认）：最终消费者是 AI 视频模型。AI 视频执行包是一等交付物，按集解锁；资产预算、节奏纪律和表演词汇纪律从圣经与大纲阶段就生效，见 [ai-video-production.md](references/ai-video-production.md)。
+- `ai_video`（默认）：最终消费者是 AI 视频模型，但执行采用两段式默认纪律（`ai_video_phase`，默认 `after_script_storyboard_confirm`）：第一段默认交付“剧本＋故事板”（分集文学剧本 DOCX ＋ 同版本 HTML 故事板，含渲染故事板所需的通用分镜计划与人物锚点）；剧本＋故事板交付完成后，先询问用户是否继续 AI 视频执行层，取得明确确认（登记并确认 `ai_video_continuation_authorization`）后才进入第二段——能力档案、模型参数化执行计划、Seedance 执行计划等面向视频生成的制品。资产预算、节奏纪律和表演词汇纪律从圣经与大纲阶段就生效，见 [ai-video-production.md](references/ai-video-production.md)。
 - `human_team`：交付制作就绪文学剧本包给人类团队，执行层仅在用户要求时生成。
-- `both`：两者并行，文学剧本仍不混入镜头语言。
+- `both`：两者并行，文学剧本仍不混入镜头语言；同样默认先交付剧本＋故事板，AI 视频执行层需用户确认。
 
 流程模式：
 
 - `standard`：完整四道门禁，适合长剧集与多人协作。
 - `express`（单人快速通道）：门禁合并为两道——①项目规格＋改编定位＋改编圣经＋全剧地图一次性确认；②首集试写＋首集执行包一次性确认，此后按批次滚动交付。express 下首集剧本即试写稿：同一文件先登记为 `pilot_scripts` 并完成试写审核，通过后复登记为 `episode_script:E001`，不必另写一份试写。三层内容边界报告照常生成并保持前置；`blocked` 与 `suspected_overreach` 的拦截规则不变，express 只减少确认次数，不放松内容边界。
-- `synopsis`（简介受控扩写）：不复制第二套状态机，仍走现有四道门禁。新增简介事实索引、动态可行性、全剧地图确认、串行分集生产和降 AI 感表达质量检查。默认单集 `60—90` 秒、单集至少 `21` 个 AI 分镜单元；目标集数支持任意正整数。可行性不足时必须先停止，让用户补充简介、减少集数或提供明确授权，不得静默扩写。
 
 ## 交付边界
 
-- `ai_video` 目标的最终交付是“分集AI视频执行包”及其上游依据：全剧规划、改编决策台账、分集分场剧本、四类提取表、连续性台账、四类锚点、分集执行计划与质检报告。`human_team` 目标交付“制作就绪剧本包”，至少包括：全剧规划、改编决策台账、分集分场剧本、角色提取表、场景提取表、道具服装台账、台词声音表、连续性台账、质检报告和交付清单。
+- `ai_video` 目标的最终交付分两段：第一段默认交付“剧本＋故事板”（分集文学剧本 DOCX、同版本 HTML 故事板及全部上游依据：全剧规划、改编决策台账、分集分场剧本、四类提取表、连续性台账、通用分镜计划与人物锚点）；第二段在用户确认后追加 AI 视频执行层（能力档案、模型参数化执行计划、Seedance 执行计划与质检报告）。`human_team` 目标交付“制作就绪剧本包”，至少包括：全剧规划、改编决策台账、分集分场剧本、角色提取表、场景提取表、道具服装台账、台词声音表、连续性台账、质检报告和交付清单。
 - 分集剧本必须写清集标题、场次、地点、日夜、内外景、现场人物、必要的非现场人物、有效道具、连续可见动作、走位、反应、对白、必要的 VO/OS/电话/屏幕声音信息、场尾变化和集尾钩子。现场人物写入`人物：`；只发声但不在现场空间出镜的角色写入独立`非现场人物：`，并可用`角色名 电话声音：`、`角色名 VO：`、`角色名 OS：`标记交付方式，禁止为了通过校验把非现场角色重复塞进现场人物。
 - 制作团队拿到后可以拆角色、场景、道具、台词并进入导演拆镜，不需要重新补剧情、人物动机或动作因果。
-- 制作就绪文学剧本不混入镜号、景别、机位、运镜、焦段、单镜时长或生成提示词。镜头语言只存在于独立的 AI 视频执行层制品中；`delivery_target` 含 `ai_video` 时执行层默认生成，`human_team` 时仅在用户要求时生成。`validate-script` 对“景别：特写”这类填表式混入报 `director_field_forbidden` 错误并阻断；对“镜头推近”“俯拍全景”“切黑后淡入”这类散文式镜头语言报 `shot_language_suspected` 警告，须人工确认改写为可见动作，台词原文与场次标题不参与该判断。
+- 制作就绪文学剧本不混入镜号、景别、机位、运镜、焦段、单镜时长或生成提示词。镜头语言只存在于独立的 AI 视频执行层制品中；`delivery_target` 含 `ai_video` 时，执行层默认**不**自动生成（`ai_video_phase` 默认 `after_script_storyboard_confirm`），需先交付剧本＋故事板、取得用户继续 AI 视频的确认（`ai_video_continuation_authorization`）后才生成；显式 `ai_video_phase: auto` 或 `human_team` 用户要求时才直接生成。`validate-script` 对“景别：特写”这类填表式混入报 `director_field_forbidden` 错误并阻断；对“镜头推近”“俯拍全景”“切黑后淡入”这类散文式镜头语言报 `shot_language_suspected` 警告，须人工确认改写为可见动作，台词原文与场次标题不参与该判断。
 - AI 视频执行层可以输出锚点、文字导演分镜、短生成单元和结构化视频提示词，但固定 `generate_images: false`、`submit_video_requests: false`；不调用生图、视频、配音或剪辑接口，不嵌入 Base64/data URI，也不把参考素材需求当作已生成资产。
-- 执行层按集解锁：某集剧本通过对应 `episode_boundary_review` 且该集依赖的提取数据与锚点就绪后，即可交付该集执行包，不必等全剧完稿。
+- 执行层按集解锁：`ai_video_phase: auto` 模式下，某集剧本通过对应 `episode_boundary_review` 且该集依赖的提取数据与锚点就绪后，即可交付该集执行包，不必等全剧完稿。默认两段式下，先交付剧本＋故事板并获用户确认后才进入执行层。
 - 图片、故事板图片、角色/场景生图和影音成品不属于本技能。用户提供的既有参考素材只能登记路径、URL或资产 ID，不能由本技能生成。
 - 不把“3场/集”“前3集”“每批3—5集”冒充行业标准；它们只能作为项目可调参数。
 - 不声称忠于未读到的原著。来源缺失、损坏或无法核验时明确写“不清楚”，不得补造。
-- 原著来源只来自用户提供。上传文件默认直接建档，不自动检查缺章、乱码、截断或完整度。来源类型使用 `self_owned`、`storyline`、`published_novel` 或 `synopsis`；只有用户明确选择已发表小说、主动开启官网审核并提供官网或正版页面时，才读取该指定页面生成非阻塞 `source_review`，不自行全网搜索、不下载官网正文、不覆盖上传文件。`synopsis` 只接受用户提供的简介，并必须在初始化时提供目标集数。
+- 原著来源只来自用户提供。上传文件默认直接建档，不自动检查缺章、乱码、截断或完整度。来源类型使用 `self_owned`、`storyline`、`published_novel`；只有用户明确选择已发表小说、主动开启官网审核并提供官网或正版页面时，才读取该指定页面生成非阻塞 `source_review`，不自行全网搜索、不下载官网正文、不覆盖上传文件。
 - 项目规格的 `rights_mode`（owned/licensed/unclear，缺省按 owned 处理）只登记用户声明的权利状态：`owned` 与 `licensed` 不讨论版权照常推进（licensed 可用 `rights_note` 记录授权范围）；`unclear` 时仅提示用户确认权利状态一次（提示不是错误），不阻塞任何流程。
 
 ## 内容边界总则
@@ -92,18 +91,16 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 ```bash
 python3 <技能目录>/scripts/project_tool.py init \
   <项目目录> --name <项目名> --source <原始文件> \
-  [--source-kind self_owned|storyline|published_novel|synopsis] \
+  [--source-kind self_owned|storyline|published_novel] \
   [--official-review --official-url <指定页面>] \
   [--expected-episodes <目标集数>]
 ```
 
 必须至少提供一份 `--source`，可重复提供。脚本复制原文件并记录散列，不修改原文件。用户粘贴内容时先保存为来源文件再注册。
 
-`--expected-episodes`记入状态的`expected_episodes_hint`，只用于固定全剧规格确认前的规划提示。运行时只读取有效确认的`project_spec`；更高版本仍为draft或awaiting_approval时不能覆盖上一份有效确认规格。`rolling_batch` schema v2允许`final_expected_episodes: null`，批次范围以显式用户确认的`project_state.batches`为权威。
+`--expected-episodes`记入状态的`expected_episodes_hint`，只用于固定全剧规格确认前的规划提示，**不得按上传章节数量推断**。运行时只读取有效确认的`project_spec`；更高版本仍为draft或awaiting_approval时不能覆盖上一份有效确认规格。`rolling_batch` schema v2允许`final_expected_episodes: null`，批次范围以显式用户确认的`project_state.batches`为权威。
 
-完整小说、部分章节、TXT、Markdown、Word 或其他可读取文档都直接登记。`self_owned` 与 `storyline` 不询问官网审核；`published_novel` 再询问用户是否审核，默认关闭。`synopsis` 也必须以文件方式登记，粘贴内容先由宿主写入 `00_原始内容/` 再走同一来源路径。用户主动开启时必须提供 HTTP/HTTPS 页面，审核结论只展示，不阻塞原著解析。`--garble-threshold` 仅为旧命令兼容保留，当前版本不触发正文检查。
-
-`synopsis` 项目初始化必须提供 `--expected-episodes`，但该值只表示用户目标。正式生成前先建立 `source_mode: synopsis` 的事件索引和 `synopsis_feasibility`，逐集给出可核验的 `episode_slots`；只有 verdict 为 `sufficient` 且全剧地图确认后才能进入分集剧本。剧本写作按集号串行，提取和渲染可沿用现有受控并发。新增桥段必须绑定 `expansion_id`、`addition_basis`、`source_facts_unchanged: true` 和集尾状态变化；通用 AI 表达、重复反应和模板化钩子作为表达质量警告人工复核。
+完整小说、部分章节、TXT、Markdown、Word 或其他可读取文档都直接登记。`self_owned` 与 `storyline` 不询问官网审核；`published_novel` 再询问用户是否审核，默认关闭。用户主动开启时必须提供 HTTP/HTTPS 页面，审核结论只展示，不阻塞原著解析。`--garble-threshold` 仅为旧命令兼容保留，当前版本不触发正文检查。
 
 直接读取 TXT/Markdown。PDF、DOCX 或扫描件使用对应文档读取能力，标准化文本写入 `01_原著解析/`，保留页码、章节或段落定位；无法可靠提取时停止并说明。
 
@@ -112,6 +109,7 @@ python3 <技能目录>/scripts/project_tool.py init \
 ### 1. 项目规格、原著解析与事件索引
 
 - 锁定用途、受众平台、`delivery_target`、流程模式、总集数、单集目标时长、改编尺度、`rights_mode`（用户声明即可，不外部核实）、必须保留、允许调整和禁止改变项。用户未明确指定时，按单集约 60 秒、上下浮动 10%、约 15 个分镜单元规划；项目规格可用 `target_duration_seconds`（正整数秒）和 `duration_policy` 显式覆盖。
+- **集数判定规则（强制）**：集数必须按原著章节内容与事件量判定，**禁止仅按上传章节数量推断集数**。章节数量只界定来源范围，一章可拆多集、多章可合一集。流程如下：①完成原著语料与事件索引（`SourceEventIndex` schema v2，事件需包含事件量，章节粒度允许 `chapter_summary`，但一个章节通常包含多个事件/戏剧单元，不得把“一章＝一个事件”当作完整提取）；②运行 `estimate-episodes <项目目录> [--register]` 按事件量输出建议集数区间与推荐值；③把估算结果（或用户确认的集数）写入项目规格的 `expected_episodes` 与 `episode_count_basis`（记录事件量统计、估算区间、最终集数，用户显式指定超区间集数时登记 `user_override`＋`user_confirmation`）。
 - 将“可直接进入导演拆镜”写入交付要求，不把“可商用”当成没有验收条件的形容词。
 - 建立稳定来源 ID、人物、关系、地点、时间线、事件、因果和异常；事实、推断、未知和改编新增分栏。
 - 逐个可定位原著单元生成全局 `SourceEventIndex`：允许整本使用 `chapter_summary`，仍须逐单元覆盖 `SourceCorpus` 并维护 `upgrade_pending`。当前批次不反复改写全局索引，而是用 `batch_source_scope:B01` 确定所需原著单元，再用 `batch_source_detail:B01` 对这些单元建立完整 `unit_detail`；缺单元、仍为粗粒度或绑定旧版本时不能确认批次大纲。
@@ -133,6 +131,7 @@ python3 <技能目录>/scripts/project_tool.py init \
 - `delivery_target` 含 `ai_video` 时，圣经同时登记 `asset_budget`（主场景数、核心角色数、单集出场上限、群演策略、高成本要素与降级替代），全剧地图逐集标注复用与新增资产；规则见 [ai-video-production.md](references/ai-video-production.md)。
 - 建立规范 `AdaptationDecisionLedger`，逐项登记保留、压缩、合并、调序、删除和桥接新增；绑定原著单元、目标集、理由、受保护事实与连续性影响。
 - 全剧地图使用 `granularity: full | backbone`。v0.8 的轻量 `backbone` 使用 `contract_version: 2`，每集只强制合法 `episode_id` 与非空 `summary`，仍须完整覆盖 `E001...EN`；`goal`、`core_conflict`、`source_hint`、`end_hook` 仅为推荐字段，缺少时警告但不阻塞。详细原著映射、冲突、钩子和场景节拍下沉到当前批次。
+- 全剧地图的 `expected_episodes` 必须等于已确认项目规格的 `expected_episodes`，且逐集必须绑定原著事件量（`source_hint`/事件范围）；禁止把“每章一集”当作地图依据。
 - 全剧地图登记 `awaiting_approval` 后，先生成精确绑定当前地图版本的 `series_boundary_review`；存在 `blocked` 或 `suspected_overreach` 时不能确认地图。
 - 内容边界通过后，使用与起草分开的审核轮次生成全剧规划审核报告；审核只提出带证据的问题，不直接改稿。阻断问题关闭后，完成第二道门禁。用户确认前不写整集成稿；内容事实越界不能用普通质检豁免绕过，必须绑定用户变更授权。
 
@@ -203,10 +202,11 @@ python3 <技能目录>/scripts/project_tool.py build-handoff <项目目录> --se
 - 旧 `build-handoff --expected-episodes` 全剧直接打包仅作兼容并返回弃用提示；v0.8 新项目使用 `--batch` 与 `--series` 两级交付。全剧汇总必须明确 `--expected-episodes`。
 - 对外交付稿隐藏内部来源 ID、审批元数据和工作备注；内部制品继续保留。
 
-### 8. AI 视频文字执行层（`ai_video`/`both` 默认，`human_team` 可选）
+### 8. AI 视频文字执行层（`ai_video`/`both` 默认两段式，`human_team` 可选）
 
-- 按 [ai-video-production.md](references/ai-video-production.md) 执行：①建立或更新风格/角色/场景/道具四类锚点（带版本号的规范制品）；②生成模型无关的 `ai_shot_plan:E001`（含每单元通用中文提示词），登记 `awaiting_approval` 后先过 `ai_video_boundary_review:E001` 前置门禁。**通用分镜计划就是默认最终交付**，不区分 Seedance/可灵/Veo 等平台。
-- 仅当用户点名需要某平台的参数化任务包时，才建立该模型的 `model_capability_profile` 并编译 `ai_video_execution_plan:E001:<模型>`；语义审查绑定在分镜计划层，编译不重审。
+- **默认两段式**：先交付“剧本＋故事板”（分集文学剧本 DOCX ＋ 同版本 HTML 故事板，含渲染故事板所需的通用分镜计划 `ai_shot_plan`、分镜边界 `ai_video_boundary_review` 与人物锚点）；交付完成后，询问用户“是否继续执行 AI 视频相关工作？”，用户确认后登记并确认 `ai_video_continuation_authorization`，之后才能进入执行层生成侧（能力档案、模型参数化执行计划、Seedance 执行计划）。默认 `ai_video_phase: after_script_storyboard_confirm`；显式 `ai_video_phase: auto` 可跳过该确认。
+- 按 [ai-video-production.md](references/ai-video-production.md) 执行：①建立或更新风格/角色/场景/道具四类锚点（带版本号的规范制品）；②生成模型无关的 `ai_shot_plan:E001`（含每单元通用中文提示词），登记 `awaiting_approval` 后先过 `ai_video_boundary_review:E001` 前置门禁。**通用分镜计划是渲染故事板与默认交付的基础**，不区分 Seedance/可灵/Veo 等平台。
+- 仅当用户点名需要某平台的参数化任务包时，才建立该模型的 `model_capability_profile` 并编译 `ai_video_execution_plan:E001:<模型>`；语义审查绑定在分镜计划层，编译不重审。这些生成侧制品必须先有 `ai_video_continuation_authorization`（或 `ai_video_phase: auto`），否则工具拒绝登记/确认。
 - 生成分镜计划前读取 [ai-shot-plan-generation.md](references/ai-shot-plan-generation.md)；脚手架只提供通用生成与校验逻辑，禁止针对具体项目硬编码人物、台词或事件 ID。
 - 分镜计划确认后运行 `project_tool.py render-storyboard <项目目录> <集号>` 生成 HTML 故事板供用户可视化检查（节奏时间轴、单元卡片、提示词复制、锚点资产表）；只读渲染，规范数据以 JSON 为准。相同输入版本与散列只实际渲染一次，AI执行包与逐集定稿位置通过项目内输入指纹缓存原子复制；输入变化必须重新渲染。
 - `delivery_target`为`ai_video`或`both`时，进入制作提取、台词提取、故事板规划或逐集交付前，当前确认的`source_event_index`必须为schema v2，并提供可校验`beats`和覆盖目标集的`episode_scopes`；否则立即报`ai_video_source_contract_not_ready`且不得创建下游任务。`human_team`项目不应用该提前门禁。
@@ -255,6 +255,16 @@ python3 <技能目录>/scripts/project_tool.py approve-artifacts \
   <项目目录> ai_shot_plan:E001@1 ai_shot_plan:E002@1
 ```
 
+用户确认继续 AI 视频执行层时，登记并确认授权记录：
+
+```bash
+python3 <技能目录>/scripts/project_tool.py register-artifact \
+  <项目目录> ai_video_continuation_authorization <文件> --status awaiting_approval
+
+python3 <技能目录>/scripts/project_tool.py approve \
+  <项目目录> ai_video_continuation_authorization
+```
+
 批量渲染逐集正式交付（逐集仍走唯一标准入口）：
 
 ```bash
@@ -267,6 +277,7 @@ python3 <技能目录>/scripts/project_tool.py render-episode-deliveries \
 ## 对话规则
 
 - 每次只询问会改变全局结果或阻塞当前门禁的事项；其余先从原著推断再让用户确认。
+- 默认两段式：完成目标范围全部集数的剧本＋故事板交付后，先询问“是否继续执行 AI 视频相关工作？”，未获明确确认不生成 AI 视频执行层（能力档案/模型参数化执行计划/Seedance 执行计划）。
 - 门禁提供：`确认继续 / 提出修改 / 查看依据 / 退回上一步`。
 - 用户说“继续”时从本地状态恢复，不重复已确认工作。
 - 用户纠正原著事实时，先修事实库，再标记全部受影响制品。

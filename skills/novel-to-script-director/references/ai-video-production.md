@@ -3,7 +3,7 @@
 本文件是模型无关的 AI 视频适配总规则。整体采用三层结构:
 
 1. **原著忠实层**:事件索引、故事事实、决策台账、分集剧本——不受任何视频模型影响。
-2. **AI剧本层**:`ai_shot_plan:E001`(AI分镜单元计划)+ 四类锚点——把剧本拆成视觉单元、动作起止状态、台词绑定、状态链、负面约束和每单元通用中文提示词,模型无关。**这一层是默认最终交付**;语义审查(`ai_video_boundary_review`)绑定在这一层。
+2. **AI剧本层**:`ai_shot_plan:E001`(AI分镜单元计划)+ 四类锚点——把剧本拆成视觉单元、动作起止状态、台词绑定、状态链、负面约束和每单元通用中文提示词,模型无关。**这一层是默认交付“剧本＋故事板”的基础**(HTML 故事板由 `ai_shot_plan` 确定性渲染);语义审查(`ai_video_boundary_review`)绑定在这一层。
 3. **模型适配层(可选)**:仅当用户点名需要某平台的参数化任务包时启用——`model_capability_profile:<模型>` + `ai_video_execution_plan:E001:<模型>` 把已确认分镜单元按该模型能力打包并按平台格式编译;编译不重审语义。默认不生成任何模型专属产物。
 
 Seedance 2.0 的接口事实见 [seedance-compatibility.md](seedance-compatibility.md);其他模型建立各自的能力档案,复用本文件全部纪律。
@@ -12,8 +12,8 @@ Seedance 2.0 的接口事实见 [seedance-compatibility.md](seedance-compatibili
 
 ## 定位与解锁条件
 
-- AI 视频执行层是**一等交付物**,不是全剧文学交付后的附件。项目规格 `delivery_target` 为 `ai_video` 或 `both` 时,它进入默认交付范围。
-- 按集解锁:某集剧本通过对应 `episode_boundary_review` 且该集台词声音表、涉及角色/场景的锚点已就绪,即可生成该集执行包;不必等全剧完稿。
+- 默认两段式交付(`ai_video_phase: after_script_storyboard_confirm`):第一段默认交付“剧本＋故事板”——分集文学剧本 DOCX ＋ 同版本 HTML 故事板(故事板由 `ai_shot_plan` 渲染,属 AI 剧本层,是默认交付的一部分);第二段为 AI 视频执行层生成侧(能力档案、模型参数化执行计划、Seedance 执行计划),需在剧本＋故事板交付后取得用户确认(`ai_video_continuation_authorization`)才生成。
+- `ai_video_phase: auto` 时,AI 视频执行层作为一等交付物进入默认交付范围,按集解锁:某集剧本通过对应 `episode_boundary_review` 且该集台词声音表、涉及角色/场景的锚点已就绪,即可生成该集执行包;不必等全剧完稿。
 - 执行层仍然只做下游适配:不得改变人物、事件、因果、关系、知情范围、世界规则或结局;不生成图片、不提交视频任务。
 
 ## 上游资产预算(在改编圣经与全剧地图阶段执行)
