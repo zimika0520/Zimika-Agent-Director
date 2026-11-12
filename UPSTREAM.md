@@ -8,7 +8,7 @@ modified by work in this repository.
 - Upstream commit used: `70661b950c04394f9bbcad4fe84e483330282b58`
 - Upstream release: `v0.9.2`
 - Upstream license: MIT, preserved in `LICENSE`
-- Zimika package version: `0.10.0-zimika.1`
+- Zimika package version: `0.11.0-zimika.1`
 
 The MIT license permits use, modification, distribution, sublicensing, and sale provided the original copyright and permission notice are retained. This repository does not claim authorship of the upstream implementation.
 

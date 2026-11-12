@@ -8504,6 +8504,71 @@ class ProjectToolTests(unittest.TestCase):
             with project_tool.agent_runtime.project_state_write_lock(self.project):
                 self.assertTrue((self.project / project_tool.STATE_FILENAME).is_file())
 
+    def test_operator_brief_recommends_continuing_a_clean_project(self) -> None:
+        self.init_project()
+        code, payload = self.run_cli(
+            "operator-brief", str(self.project)
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertTrue(payload["readiness"]["state_valid"])
+        self.assertFalse(payload["readiness"]["execution_blocked"])
+        self.assertEqual(
+            payload["recommended_action"]["kind"],
+            "continue_current_stage",
+        )
+        self.assertEqual(payload["current_stage"]["key"], "project_setup")
+        self.assertEqual(payload["counts"]["source_count"], 1)
+        self.assertEqual(payload["counts"]["artifact_key_count"], 0)
+
+    def test_operator_brief_prioritizes_stale_and_approval_attention(self) -> None:
+        self.init_project()
+        brief_file = self.write_project_file(
+            "01_原著解析/project_spec_candidate.json",
+            json.dumps({"expected_episodes": 1}, ensure_ascii=False),
+        )
+        code, registered = self.run_cli(
+            "register-artifact",
+            str(self.project),
+            "project_spec",
+            str(brief_file),
+            "--status",
+            "awaiting_approval",
+        )
+        self.assertEqual(code, 0, registered)
+
+        code, brief = self.run_cli("operator-brief", str(self.project))
+        self.assertEqual(code, 0, brief)
+        self.assertEqual(
+            brief["recommended_action"]["kind"], "review_artifact"
+        )
+        self.assertEqual(
+            brief["recommended_action"]["target"], "project_spec"
+        )
+        self.assertEqual(
+            brief["attention"]["awaiting_approval"][0]["version"], 1
+        )
+        self.assertTrue(brief["readiness"]["human_decision_required"])
+
+        code, stale = self.run_cli(
+            "mark-stale",
+            str(self.project),
+            "project_spec",
+            "--reason",
+            "上游需求发生变化",
+        )
+        self.assertEqual(code, 0, stale)
+        code, brief = self.run_cli("operator-brief", str(self.project))
+        self.assertEqual(code, 0, brief)
+        self.assertEqual(
+            brief["recommended_action"]["kind"],
+            "refresh_stale_artifact",
+        )
+        self.assertEqual(brief["attention"]["stale_artifacts"][0]["version"], 1)
+        self.assertEqual(
+            brief["counts"]["artifact_statuses"]["stale"], 1
+        )
+
     def test_isolated_minimum_workflow_closure_and_runtime_resume(self) -> None:
         self.create_ready_project()
         project_root = self.project.resolve()

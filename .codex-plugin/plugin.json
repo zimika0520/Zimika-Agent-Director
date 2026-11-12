@@ -1,7 +1,7 @@
 {
   "name": "zimika-agent-director",
-  "version": "0.10.0-zimika.1",
-  "description": "Zimika's secondary development of a stateful AI screenwriting workflow with checkpointed recovery, scoped delegation, and deterministic delivery.",
+  "version": "0.11.0-zimika.1",
+  "description": "Zimika's stateful AI screenwriting workflow with checkpointed recovery, scoped delegation, operator briefs, and deterministic delivery.",
   "author": {
     "name": "Zimika",
     "url": "https://github.com/zimika0520"

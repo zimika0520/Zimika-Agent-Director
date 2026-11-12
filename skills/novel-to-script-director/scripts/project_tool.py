@@ -5738,6 +5738,273 @@ def command_show_agent_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_operator_brief(
+    project_path: Path,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a read-only handoff brief for the next human or agent operator."""
+
+    validation = validate_state(project_path)
+    artifacts = state.get("artifacts")
+    artifacts = artifacts if isinstance(artifacts, dict) else {}
+    status_counts: Counter[str] = Counter()
+    artifact_versions = 0
+    awaiting_approval: list[dict[str, Any]] = []
+    stale_artifacts: list[dict[str, Any]] = []
+    draft_artifacts: list[dict[str, Any]] = []
+    for artifact_key in sorted(artifacts):
+        records = artifacts.get(artifact_key)
+        if not isinstance(records, list):
+            continue
+        artifact_versions += sum(
+            1 for record in records if isinstance(record, dict)
+        )
+        record = latest_record(state, artifact_key)
+        if record is None:
+            continue
+        status = record.get("status")
+        status_key = status if isinstance(status, str) else "unknown"
+        status_counts[status_key] += 1
+        try:
+            artifact_kind_value = artifact_type(artifact_key)
+        except ToolError:
+            artifact_kind_value = "unknown"
+        item = {
+            "artifact_key": artifact_key,
+            "artifact_type": artifact_kind_value,
+            "version": record.get("version"),
+            "status": status_key,
+            "path": record.get("path"),
+        }
+        if status_key == "awaiting_approval":
+            awaiting_approval.append(item)
+        elif status_key == "stale":
+            stale_artifacts.append(item)
+        elif status_key == "draft":
+            draft_artifacts.append(item)
+
+    runtime = agent_runtime_state(state)
+    control = agent_runtime.ensure_execution_control(runtime)
+    active_blocker = control.get("active_blocker")
+    if (
+        not isinstance(active_blocker, dict)
+        or active_blocker.get("status") != "active"
+    ):
+        active_blocker = None
+
+    task_dir = agent_runtime.runtime_paths(project_path)["tasks"]
+    tasks: list[dict[str, Any]] = []
+    if task_dir.is_dir():
+        for task_path in sorted(task_dir.glob("*.json")):
+            try:
+                tasks.append(agent_runtime.read_json(task_path))
+            except agent_runtime.AgentRuntimeError:
+                continue
+    latest_tasks: dict[str, dict[str, Any]] = {}
+    for task in tasks:
+        identity = task.get("idempotency_key") or task.get("task_id")
+        if not isinstance(identity, str) or not identity:
+            continue
+        current = latest_tasks.get(identity)
+        if current is None or str(task.get("updated_at") or "") >= str(
+            current.get("updated_at") or ""
+        ):
+            latest_tasks[identity] = task
+    active_tasks = [
+        task
+        for task in latest_tasks.values()
+        if task.get("status") in {"planned", "running"}
+    ]
+    recovery_tasks = [
+        task
+        for task in latest_tasks.values()
+        if task.get("status")
+        in {"abandoned", "blocked", "failed", "invalidated", "paused"}
+        or task.get("recovery_state") in {"blocked", "recovery_required"}
+    ]
+    active_task_payload = [
+        {
+            "task_id": task.get("task_id"),
+            "task_type": task.get("task_type"),
+            "attempt": task.get("attempt"),
+            "status": task.get("status"),
+            "host_task_id": task.get("host_task_id"),
+            "host_task_status": task.get("host_task_status"),
+            "recovery_state": task.get("recovery_state"),
+            "activity_lease_expires_at": task.get("activity_lease_expires_at"),
+            "last_checkpoint_path": task.get("last_checkpoint_path"),
+        }
+        for task in sorted(
+            active_tasks,
+            key=lambda task: str(task.get("updated_at") or ""),
+            reverse=True,
+        )
+    ]
+    recovery_task_payload = [
+        {
+            "task_id": task.get("task_id"),
+            "task_type": task.get("task_type"),
+            "attempt": task.get("attempt"),
+            "status": task.get("status"),
+            "recovery_state": task.get("recovery_state"),
+            "last_checkpoint_path": task.get("last_checkpoint_path"),
+        }
+        for task in sorted(
+            recovery_tasks,
+            key=lambda task: str(task.get("updated_at") or ""),
+            reverse=True,
+        )
+    ]
+
+    checkpoint_dir = agent_runtime.runtime_paths(project_path)["checkpoints"]
+    latest_checkpoint: dict[str, Any] | None = None
+    if checkpoint_dir.is_dir():
+        checkpoints = sorted(
+            checkpoint_dir.glob("*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for checkpoint_path in checkpoints:
+            try:
+                latest_checkpoint = agent_runtime.read_json(checkpoint_path)
+                break
+            except agent_runtime.AgentRuntimeError:
+                continue
+
+    stages = state.get("stages")
+    current_stage_key = state.get("current_stage")
+    current_stage_record = (
+        stages.get(current_stage_key)
+        if isinstance(stages, dict) and isinstance(current_stage_key, str)
+        else None
+    )
+    current_stage_record = (
+        current_stage_record
+        if isinstance(current_stage_record, dict)
+        else {}
+    )
+    validation_errors = validation.get("errors", [])
+    validation_warnings = validation.get("warnings", [])
+
+    if validation_errors:
+        recommended_action = {
+            "kind": "repair_project_state",
+            "summary": "先修复项目状态、路径或制品散列错误，再进行审批、派发或交付。",
+            "target": None,
+            "blocked": True,
+            "requires_human": True,
+        }
+    elif active_blocker is not None:
+        recommended_action = {
+            "kind": "resolve_blocker",
+            "summary": "先处理当前全局阻断；解除后从原任务包和检查点恢复。",
+            "target": active_blocker.get("blocker_id"),
+            "blocked": True,
+            "requires_human": True,
+        }
+    elif recovery_task_payload:
+        recommended_action = {
+            "kind": "recover_task",
+            "summary": "检查失败或失联任务的最新检查点，使用相同幂等键进行受控恢复。",
+            "target": recovery_task_payload[0].get("task_id"),
+            "blocked": True,
+            "requires_human": True,
+        }
+    elif stale_artifacts:
+        recommended_action = {
+            "kind": "refresh_stale_artifact",
+            "summary": "上游输入已经变化，先重新生成或复核失效制品，禁止继续使用旧版本。",
+            "target": stale_artifacts[0]["artifact_key"],
+            "blocked": True,
+            "requires_human": False,
+        }
+    elif awaiting_approval:
+        recommended_action = {
+            "kind": "review_artifact",
+            "summary": "存在等待人工确认的最新制品，先检查依据与内容边界再批准。",
+            "target": awaiting_approval[0]["artifact_key"],
+            "blocked": False,
+            "requires_human": True,
+        }
+    elif active_task_payload:
+        recommended_action = {
+            "kind": "monitor_active_task",
+            "summary": "已有活动任务，继续观察租约、宿主和结果，不要重复规划同一幂等任务。",
+            "target": active_task_payload[0].get("task_id"),
+            "blocked": False,
+            "requires_human": False,
+        }
+    elif current_stage_record.get("status") == "blocked":
+        recommended_action = {
+            "kind": "unblock_stage",
+            "summary": "当前阶段被标记为阻断，先解决阶段阻塞并将状态恢复为 in_progress。",
+            "target": current_stage_key,
+            "blocked": True,
+            "requires_human": True,
+        }
+    else:
+        recommended_action = {
+            "kind": "continue_current_stage",
+            "summary": "当前没有失效、待审批或失联任务，可以继续当前阶段的下一项工作。",
+            "target": current_stage_key,
+            "blocked": False,
+            "requires_human": False,
+        }
+
+    return {
+        "ok": True,
+        "schema_version": 1,
+        "product": "Zimika Agent Director",
+        "product_version": agent_runtime.PLUGIN_VERSION,
+        "generated_at": now_iso(),
+        "project": str(project_path),
+        "project_id": state.get("project_id"),
+        "name": state.get("name"),
+        "updated_at": state.get("updated_at"),
+        "current_stage": {
+            "key": current_stage_key,
+            "label": current_stage_record.get("label"),
+            "status": current_stage_record.get("status"),
+            "note": current_stage_record.get("note"),
+        },
+        "readiness": {
+            "state_valid": bool(validation.get("valid")),
+            "execution_blocked": recommended_action["blocked"],
+            "human_decision_required": recommended_action["requires_human"],
+        },
+        "recommended_action": recommended_action,
+        "counts": {
+            "source_count": len(state.get("sources", []))
+            if isinstance(state.get("sources"), list)
+            else 0,
+            "artifact_key_count": len(artifacts),
+            "artifact_version_count": artifact_versions,
+            "artifact_statuses": dict(sorted(status_counts.items())),
+            "active_task_count": len(active_task_payload),
+            "recovery_task_count": len(recovery_task_payload),
+            "validation_error_count": len(validation_errors),
+            "validation_warning_count": len(validation_warnings),
+        },
+        "attention": {
+            "validation_errors": validation_errors[:10],
+            "validation_warnings": validation_warnings[:10],
+            "awaiting_approval": awaiting_approval[:10],
+            "stale_artifacts": stale_artifacts[:10],
+            "draft_artifacts": draft_artifacts[:10],
+            "recovery_tasks": recovery_task_payload[:10],
+            "active_tasks": active_task_payload[:10],
+            "active_blocker": active_blocker,
+            "latest_checkpoint": latest_checkpoint,
+        },
+    }
+
+
+def command_operator_brief(args: argparse.Namespace) -> int:
+    project_path, state = load_state(args.project)
+    print_json(build_operator_brief(project_path, state))
+    return 0
+
+
 def command_startup_preflight(args: argparse.Namespace) -> int:
     project_path, state = load_state(args.project)
     runtime = agent_runtime_state(state)
@@ -15107,6 +15374,13 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("project", help="项目目录")
     show_parser.add_argument("--summary", action="store_true", help="只显示摘要")
     show_parser.set_defaults(handler=command_show)
+
+    operator_brief_parser = subparsers.add_parser(
+        "operator-brief",
+        help="只读汇总项目健康、待审批制品、活动任务、检查点和下一步安全动作",
+    )
+    operator_brief_parser.add_argument("project", help="项目目录")
+    operator_brief_parser.set_defaults(handler=command_operator_brief)
 
     define_batch_parser = subparsers.add_parser(
         "define-batch", help="定义不可重叠的批次集号范围"

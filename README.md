@@ -2,7 +2,7 @@
 
 把小说或故事线，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.10.0-zimika.1`
+当前版本：`0.11.0-zimika.1`
 
 GitHub: https://github.com/zimika0520/Zimika-Agent-Director
 
@@ -19,6 +19,7 @@ Zimika Agent Director 是一个运行在 Codex 中的长篇小说改编工作流
 - **内容边界与连续性门禁**：对原著追溯、内容边界、人物状态、伏笔和制作就绪程度执行校验；全剧完成后做跨批连续性终检。
 - **制作就绪输出**：文学剧本区分现场人物与非现场说话人（电话声音、VO、OS、屏幕声音），可直接用于导演拆镜，不需要再补剧情、动机或动作因果。
 - **生产模式保护**：正式制作任务锁定生产模式，禁止中途改源码、改 Skill 或重跑设计审核；长任务自动编排、断点恢复，已完成结果不会重复生成。
+- **Operator Brief 运行总览**：一条只读命令汇总项目健康、失效制品、待审批制品、活动任务、恢复任务、最新检查点和下一步安全动作，便于人工或新 Agent 中断后快速接手。
 
 ## 工作流
 
@@ -85,6 +86,15 @@ codex plugin add zimika-agent-director@zimika-agent-director-local
 安装后请新建一个 Codex 任务，让新任务加载最新版 Skill。
 
 ## 使用示例
+
+### 查看当前运行总览
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py operator-brief \
+  /path/to/project
+```
+
+输出中的 `recommended_action.kind` 会优先指出需要先处理的状态错误、全局阻断、恢复任务、失效制品或人工审批。该命令不修改项目状态、不续租、不派发任务。
 
 ### 创建项目
 
@@ -203,7 +213,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-完整自动化测试 230 项通过（Zimika 基线版本）。
+完整自动化测试 232 项通过（Zimika 0.11.0 基线）。
 
 ## 更新记录
 
@@ -212,9 +222,10 @@ python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ## Zimika 的工程整理
 
 - 统一项目名称、插件展示名和学习入口。
+- 新增只读 `operator-brief`，将状态健康、制品注意力、Agent 运行信息与下一步安全动作汇总为稳定 JSON 契约。
 - 增加 `LEARNING_GUIDE.md`，按架构、状态机、检查点、测试和面试表达拆分学习路径。
 - 保留上游代码身份与许可证，明确区分原项目和 Zimika 的二次开发部分。
-- 保留完整自动化测试，当前基线为 230 项通过。
+- 保留完整自动化测试，当前基线为 232 项通过。
 
 ## License
 

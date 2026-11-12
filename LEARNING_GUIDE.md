@@ -18,7 +18,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 
 - 项目入口在哪里？
 - 插件清单为什么必须能被 JSON 解析？
-- 230 项测试主要覆盖什么？
+- 232 项测试主要覆盖什么？
 
 ## 第 2 天：读主流程
 
@@ -26,10 +26,19 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 
 1. `skills/novel-to-script-director/SKILL.md`
 2. `skills/novel-to-script-director/references/workflow.md`
-3. `skills/novel-to-script-director/scripts/project_tool.py`
+3. 在 `project_tool.py` 搜索 `build_operator_brief`，先读 Zimika 新增的运行总览
 4. `skills/novel-to-script-director/scripts/agent_runtime.py`
 
 重点找四个词：`task`、`attempt`、`lease`、`checkpoint`。不要一开始逐行读 6000 多行，先用搜索定位函数，再顺着调用关系读。
+
+运行：
+
+```bash
+python3 skills/novel-to-script-director/scripts/project_tool.py \
+  operator-brief /path/to/project
+```
+
+你要能解释：它为什么先报状态错误和全局阻断，再报失效制品和待审批制品；为什么它必须是只读命令。
 
 ## 第 3 天：理解可靠性设计
 
@@ -59,6 +68,7 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 2. 架构方案：主任务负责规划与验收，Worker 独立执行，文件化交接。
 3. 可靠性：幂等键、租约、检查点、有限重试、版本绑定。
 4. 质量门禁：结构化产物、哈希、前置条件、人工确认。
-5. 验证结果：230 项自动化测试通过。
+5. Zimika 扩展：新增只读 Operator Brief，把状态、阻断、恢复任务、检查点和下一步安全动作汇总成稳定 JSON。
+6. 验证结果：232 项自动化测试通过。
 
 必须明确说这是基于开源项目的二次开发，不要声称从零实现全部上游代码。你的优势应该落在“能读懂、能运行、能定位、能继续改”。

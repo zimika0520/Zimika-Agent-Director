@@ -63,9 +63,10 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 2. 新项目没有原始内容时，要求用户上传文件或粘贴内容；已经提供时不要重复索要。用户只上传部分章节时照常建项目：剧本只写到已上传内容截断点，后续用 `add-source` 增量补传，工具自动标脏来源依赖链。
 3. 完整读取 [workflow.md](references/workflow.md)，按阶段和人工门禁继续。
 4. 运行 `scripts/project_tool.py show <项目目录> --summary`，以本地状态为准。
-5. 优先处理失效或阻断制品；只加载当前阶段需要的原著片段和制品。
-6. 展示进度卡：`当前阶段 / 已完成 / 待确认或阻塞 / 下一步`。
-7. `delivery_target` 含 `ai_video`，或用户要求执行层时，完整读取 [ai-video-production.md](references/ai-video-production.md)；涉及 Seedance 具体接口时再读 [seedance-compatibility.md](references/seedance-compatibility.md)，先核对模型能力快照，再处理文字执行层。
+5. 恢复或接手长任务时运行 `scripts/project_tool.py operator-brief <项目目录>`。该命令只读，按“状态错误 → 全局阻断 → 恢复任务 → 失效制品 → 人工审批 → 活动任务 → 当前阶段”返回首要安全动作；不得把该建议当成对内容边界或人工授权的替代。
+6. 优先处理失效或阻断制品；只加载当前阶段需要的原著片段和制品。
+7. 展示进度卡：`当前阶段 / 已完成 / 待确认或阻塞 / 下一步`。
+8. `delivery_target` 含 `ai_video`，或用户要求执行层时，完整读取 [ai-video-production.md](references/ai-video-production.md)；涉及 Seedance 具体接口时再读 [seedance-compatibility.md](references/seedance-compatibility.md)，先核对模型能力快照，再处理文字执行层。
 
 ## 生产执行与开发隔离
 
