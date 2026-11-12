@@ -4,6 +4,8 @@
 
 当前版本：`0.10.0-zimika.1`
 
+GitHub: https://github.com/zimika0520/Zimika-Agent-Director
+
 > Zimika 二次开发作品。核心思路来自 [ai-director](https://github.com/Shinchan-crayon/ai-director)，在原项目基础上完成品牌整理、工程说明、学习路径和可复现验证。原作者与许可证信息见 [UPSTREAM.md](UPSTREAM.md)。
 
 ## 它能做什么

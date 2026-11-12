@@ -9,7 +9,7 @@
 ## 第 1 天：跑通和定位
 
 ```bash
-cd /Users/pinganye/Documents/Codex/jianli/Zimika-Agent-Director
+cd Zimika-Agent-Director
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 python3 skills/novel-to-script-director/scripts/test_project_tool.py
 ```
