@@ -3,7 +3,7 @@ name: novel-to-script-director
 description: Guide a stateful, checkpointed adaptation of a novel, story outline, or other long-form narrative into a production-ready episodic manhua-drama script package and, when the delivery target includes AI video, per-episode text-only AI video execution packages (anchors, shot units, structured prompts) for models such as Seedance 2.0. Use when a user asks to start, continue, revise, inspect, validate, or export a 小说改剧本、漫剧剧本、短剧文学剧本、分集分场台本、制作就绪剧本、AI视频执行包 project, or asks to turn an already confirmed script into AI-video-ready textual shot units. Covers source parsing, adaptation decisions, asset budgeting, episodic writing, extraction, fidelity, continuity, shot-unit pacing, prompt contracts, handoff validation, and resumable state. The AI video layer produces structured text and prompt plans only; it never generates images, submits video jobs, or performs audiovisual production.
 ---
 
-# AI导演：小说改制作就绪漫剧剧本与AI视频文字执行层
+# Zimika Agent Director：小说改制作就绪漫剧剧本与 AI 视频文字执行层
 
 把长篇故事分阶段转换成可直接进入生产的分集剧本包。先建立全局事实与改编方案，再写局部成稿；保存每阶段制品、确认状态和原著依据，禁止用后续制作环节替编剧补戏。
 
@@ -86,7 +86,7 @@ description: Guide a stateful, checkpointed adaptation of a novel, story outline
 
 ## 建立本地项目
 
-默认在工作区创建 `AI导演项目/<安全项目名>/`，不得覆盖已有项目：
+默认在工作区创建 `Zimika Agent Director 项目/<安全项目名>/`，不得覆盖已有项目：
 
 ```bash
 python3 <技能目录>/scripts/project_tool.py init \

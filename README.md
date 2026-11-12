@@ -1,12 +1,14 @@
-# AI导演
+# Zimika Agent Director
 
 把小说或故事线，转换为**可追溯、可分批推进、可直接进入导演拆镜的制作就绪剧本包**。
 
-当前版本：`0.9.2`
+当前版本：`0.10.0-zimika.1`
+
+> Zimika 二次开发作品。核心思路来自 [ai-director](https://github.com/Shinchan-crayon/ai-director)，在原项目基础上完成品牌整理、工程说明、学习路径和可复现验证。原作者与许可证信息见 [UPSTREAM.md](UPSTREAM.md)。
 
 ## 它能做什么
 
-AI导演是一个运行在 Codex 中的长篇小说改编工作流，负责把长篇小说或故事线逐步改写成制作就绪的分集剧本，并输出可直接使用的交付物：
+Zimika Agent Director 是一个运行在 Codex 中的长篇小说改编工作流，负责把长篇小说或故事线逐步改写成制作就绪的分集剧本，并输出可直接使用的交付物：
 
 - **按事件量判定集数**：先解析原著建立事件索引，再按每集可承载的戏剧单元容量估算集数。一章可以拆成多集，多章可以合成一集，绝不单纯按上传的章节数量推断集数。
 - **默认两段式交付**：先交付“剧本＋故事板”（分集文学剧本 DOCX ＋ 同版本 HTML 故事板），交付完成后询问你是否继续 AI 视频执行层；取得你的确认后，才生成能力档案、模型参数化执行计划、Seedance 执行计划等视频侧制品。
@@ -36,29 +38,29 @@ flowchart LR
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/Shinchan-crayon/ai-director.git
-cd ai-director
+git clone https://github.com/zimika0520/Zimika-Agent-Director.git
+cd Zimika-Agent-Director
 ```
 
 ### 2. 建立本地 Marketplace
 
 ```bash
-MARKET="$HOME/.codex/local-marketplaces/ai-director-local"
+MARKET="$HOME/.codex/local-marketplaces/zimika-agent-director-local"
 mkdir -p "$MARKET/.agents/plugins" "$MARKET/plugins"
-ln -sfn "$PWD" "$MARKET/plugins/ai-director"
+ln -sfn "$PWD" "$MARKET/plugins/zimika-agent-director"
 
 cat > "$MARKET/.agents/plugins/marketplace.json" <<'JSON'
 {
-  "name": "ai-director-local",
+  "name": "zimika-agent-director-local",
   "interface": {
-    "displayName": "AI Director Local"
+    "displayName": "Zimika Agent Director Local"
   },
   "plugins": [
     {
-      "name": "ai-director",
+      "name": "zimika-agent-director",
       "source": {
         "source": "local",
-        "path": "./plugins/ai-director"
+        "path": "./plugins/zimika-agent-director"
       },
       "policy": {
         "installation": "AVAILABLE",
@@ -75,7 +77,7 @@ JSON
 
 ```bash
 codex plugin marketplace add "$MARKET"
-codex plugin add ai-director@ai-director-local
+codex plugin add zimika-agent-director@zimika-agent-director-local
 ```
 
 安装后请新建一个 Codex 任务，让新任务加载最新版 Skill。
@@ -199,12 +201,19 @@ python3 skills/novel-to-script-director/scripts/test_project_tool.py
 python3 -m json.tool .codex-plugin/plugin.json >/dev/null
 ```
 
-完整自动化测试 230 项通过（v0.9.2）。
+完整自动化测试 230 项通过（Zimika 基线版本）。
 
 ## 更新记录
 
 见 [CHANGELOG.md](CHANGELOG.md)。
 
+## Zimika 的工程整理
+
+- 统一项目名称、插件展示名和学习入口。
+- 增加 `LEARNING_GUIDE.md`，按架构、状态机、检查点、测试和面试表达拆分学习路径。
+- 保留上游代码身份与许可证，明确区分原项目和 Zimika 的二次开发部分。
+- 保留完整自动化测试，当前基线为 230 项通过。
+
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE)。原始版权归 Shinchan-crayon 所有；Zimika 的二次开发说明见 [UPSTREAM.md](UPSTREAM.md)。

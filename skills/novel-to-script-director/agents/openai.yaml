@@ -1,4 +1,4 @@
 interface:
-  display_name: "AI导演 · 剧本与Seedance文字适配"
+  display_name: "Zimika Agent Director · 剧本与 AI 视频执行层"
   short_description: "把小说改成制作就绪剧本，并可输出不生图的Seedance文字执行层"
   default_prompt: "使用 $novel-to-script-director 将我上传的小说改编为有原著追溯和人工门禁的制作就绪分集剧本包；如我指定 Seedance，再输出独立纯文字执行计划，始终不生成图片或提交视频任务。"
